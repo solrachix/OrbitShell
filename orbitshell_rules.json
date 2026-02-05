@@ -1,0 +1,6 @@
+{
+  "skip_dirs": [".git", "node_modules", "target", "dist", ".next"],
+  "skip_files": [],
+  "max_file_kb": 512,
+  "search_limit": 200
+}
