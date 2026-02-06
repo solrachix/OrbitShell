@@ -3,20 +3,13 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub mod buffer;
-pub mod parser;
-
 pub struct TerminalPty {
-    master: Box<dyn MasterPty + Send>,
+    _master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     _child: Box<dyn Child + Send + Sync>,
 }
 
 impl TerminalPty {
-    pub fn new(cols: u16, rows: u16) -> Result<(Self, Box<dyn Read + Send>)> {
-        Self::new_in_path(cols, rows, None)
-    }
-
     pub fn new_in_path(
         cols: u16,
         rows: u16,
@@ -52,7 +45,7 @@ impl TerminalPty {
 
         Ok((
             Self {
-                master,
+                _master: master,
                 writer,
                 _child: child,
             },
@@ -62,17 +55,6 @@ impl TerminalPty {
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         self.writer.write_all(data)?;
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
         Ok(())
     }
 }

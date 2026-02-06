@@ -1,17 +1,17 @@
-use gpui::InteractiveElement;
-use gpui::Styled;
 use gpui::*;
 use lucide_icons::Icon;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use serde::Deserialize;
-use futures::channel::mpsc;
 use futures::StreamExt;
+use futures::channel::mpsc;
+use serde::Deserialize;
 use std::io::Seek;
 
 enum SearchMessage {
@@ -21,6 +21,7 @@ enum SearchMessage {
 
 use crate::git::{GitChange, GitStatus, get_git_changes, get_git_status};
 use crate::ui::icons::lucide_icon;
+use crate::ui::text_edit::TextEditState;
 
 const ACCENT: u32 = 0x6b9eff;
 const ACCENT_BG: u32 = 0x6b9eff22;
@@ -79,6 +80,7 @@ pub struct SidebarView {
     current_path: PathBuf,
     expanded_folders: HashSet<PathBuf>,
     entries: Vec<FileEntry>,
+    entries_cache: HashMap<PathBuf, Vec<FileEntry>>,
 
     mode: SidebarMode,
     focus_handle: FocusHandle,
@@ -89,6 +91,7 @@ pub struct SidebarView {
     search_anchor: Option<usize>,
     search_results: Vec<SearchResult>,
     search_generation: u64,
+    search_cancel: Arc<AtomicU64>,
     search_pending: bool,
     search_expanded_files: HashSet<PathBuf>,
     search_user_toggled: bool,
@@ -113,6 +116,7 @@ impl SidebarView {
             current_path,
             expanded_folders: HashSet::new(),
             entries,
+            entries_cache: HashMap::new(),
             mode: SidebarMode::Explorer,
             focus_handle: cx.focus_handle(),
             search_query: String::new(),
@@ -121,6 +125,7 @@ impl SidebarView {
             search_anchor: None,
             search_results: Vec::new(),
             search_generation: 0,
+            search_cancel: Arc::new(AtomicU64::new(0)),
             search_pending: false,
             search_expanded_files: HashSet::new(),
             search_user_toggled: false,
@@ -137,6 +142,7 @@ impl SidebarView {
         self.current_path = path;
         self.expanded_folders.clear();
         self.entries = Self::read_entries(&self.current_path, &self.rules);
+        self.entries_cache.clear();
         self.git_status = get_git_status(&self.current_path);
         self.git_changes = get_git_changes(&self.current_path);
     }
@@ -144,8 +150,7 @@ impl SidebarView {
     fn set_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
         self.mode = mode;
         if mode == SidebarMode::Search {
-            self.search_anchor = None;
-            self.search_selection = None;
+            TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
             self.search_cursor = self.search_query.chars().count();
         }
         if mode == SidebarMode::Git {
@@ -155,7 +160,7 @@ impl SidebarView {
         cx.notify();
     }
 
-    fn read_entries(path: &PathBuf, rules: &OrbitshellRules) -> Vec<FileEntry> {
+    fn read_entries(path: &Path, rules: &OrbitshellRules) -> Vec<FileEntry> {
         let mut entries: Vec<FileEntry> = std::fs::read_dir(path)
             .map(|read_dir| {
                 read_dir
@@ -193,7 +198,9 @@ impl SidebarView {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
         } else {
-            self.expanded_folders.insert(path);
+            let children = Self::read_entries(&path, &self.rules);
+            self.expanded_folders.insert(path.clone());
+            self.entries_cache.insert(path, children);
         }
         cx.notify();
     }
@@ -271,8 +278,10 @@ impl SidebarView {
 
         let mut container = div().flex().flex_col().child(row);
         if is_expanded {
-            for child in Self::read_entries(&entry.path, &self.rules) {
-                container = container.child(self.render_entry(&child, depth + 1, cx));
+            if let Some(children) = self.entries_cache.get(&entry.path) {
+                for child in children {
+                    container = container.child(self.render_entry(child, depth + 1, cx));
+                }
             }
         }
 
@@ -324,10 +333,12 @@ impl SidebarView {
         let shift = event.keystroke.modifiers.shift;
 
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
-            let len = self.search_query.chars().count();
-            self.search_selection = Some((0, len));
-            self.search_anchor = Some(0);
-            self.search_cursor = len;
+            TextEditState::select_all(
+                &self.search_query,
+                &mut self.search_cursor,
+                &mut self.search_selection,
+                &mut self.search_anchor,
+            );
             cx.notify();
             cx.stop_propagation();
             return;
@@ -340,13 +351,23 @@ impl SidebarView {
                 cx.stop_propagation();
             }
             "backspace" => {
-                if self.delete_search_selection_if_any() {
+                if TextEditState::delete_selection_if_any(
+                    &mut self.search_query,
+                    &mut self.search_cursor,
+                    &mut self.search_selection,
+                    &mut self.search_anchor,
+                ) {
                     cx.notify();
                     cx.stop_propagation();
                     return;
                 }
                 if self.search_cursor > 0 {
-                    self.pop_search_char_before_cursor();
+                    TextEditState::pop_char_before_cursor(
+                        &mut self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                     cx.notify();
                 }
                 cx.stop_propagation();
@@ -355,16 +376,26 @@ impl SidebarView {
                 if shift {
                     let anchor = self.search_anchor.unwrap_or(self.search_cursor);
                     self.search_cursor = self.search_cursor.saturating_sub(1);
-                    self.set_search_selection_from_anchor(anchor, self.search_cursor);
+                    TextEditState::set_selection_from_anchor(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        anchor,
+                        self.search_cursor,
+                    );
                 } else {
-                    if self.has_search_selection() {
-                        if let Some((a, b)) = self.normalized_search_selection() {
+                    if TextEditState::has_selection(self.search_selection) {
+                        if let Some((a, b)) =
+                            TextEditState::normalized_selection(self.search_selection)
+                        {
                             self.search_cursor = a.min(b);
                         }
                     } else {
                         self.search_cursor = self.search_cursor.saturating_sub(1);
                     }
-                    self.clear_search_selection();
+                    TextEditState::clear_selection(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                 }
                 cx.notify();
                 cx.stop_propagation();
@@ -374,12 +405,21 @@ impl SidebarView {
                 if shift {
                     let anchor = self.search_anchor.unwrap_or(self.search_cursor);
                     self.search_cursor = (self.search_cursor + 1).min(max);
-                    self.set_search_selection_from_anchor(anchor, self.search_cursor);
-                } else if self.has_search_selection() {
-                    if let Some((a, b)) = self.normalized_search_selection() {
+                    TextEditState::set_selection_from_anchor(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        anchor,
+                        self.search_cursor,
+                    );
+                } else if TextEditState::has_selection(self.search_selection) {
+                    if let Some((a, b)) = TextEditState::normalized_selection(self.search_selection)
+                    {
                         self.search_cursor = a.max(b);
                     }
-                    self.clear_search_selection();
+                    TextEditState::clear_selection(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                 } else if self.search_cursor < max {
                     self.search_cursor += 1;
                 }
@@ -388,126 +428,56 @@ impl SidebarView {
             }
             "home" => {
                 self.search_cursor = 0;
-                self.clear_search_selection();
+                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             "end" => {
                 self.search_cursor = self.search_query.chars().count();
-                self.clear_search_selection();
+                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             "escape" => {
-                self.search_selection = None;
-                self.search_anchor = None;
+                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             _ => {
                 if let Some(text) = event.keystroke.key_char.as_deref() {
                     if !text.is_empty() && !ctrl {
-                        self.insert_search_text(text);
+                        TextEditState::insert_text(
+                            &mut self.search_query,
+                            &mut self.search_cursor,
+                            &mut self.search_selection,
+                            &mut self.search_anchor,
+                            text,
+                        );
                         cx.notify();
                         cx.stop_propagation();
                     }
                 } else if event.keystroke.key.len() == 1 && !ctrl {
                     let key = event.keystroke.key.clone();
-                    self.insert_search_text(&key);
+                    TextEditState::insert_text(
+                        &mut self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        &key,
+                    );
                     cx.notify();
                     cx.stop_propagation();
                 }
             }
         }
     }
-
     // Text input handled via KeyDownEvent for gpui 0.2.2
-
-    fn insert_search_text(&mut self, text: &str) {
-        if self.delete_search_selection_if_any() {
-            // selection removed
-        }
-        let (left, right) = self.split_search_at_cursor();
-        let mut out = left;
-        out.push_str(text);
-        out.push_str(&right);
-        self.search_query = out;
-        self.search_cursor =
-            (self.search_cursor + text.chars().count()).min(self.search_query.chars().count());
-        self.clear_search_selection();
-    }
-
-    fn pop_search_char_before_cursor(&mut self) {
-        if self.search_cursor == 0 {
-            return;
-        }
-        let mut out = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i + 1 == self.search_cursor {
-                continue;
-            }
-            out.push(ch);
-        }
-        self.search_query = out;
-        self.search_cursor = self.search_cursor.saturating_sub(1);
-        self.clear_search_selection();
-    }
-
-    fn split_search_at_cursor(&self) -> (String, String) {
-        let mut left = String::new();
-        let mut right = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i < self.search_cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-        (left, right)
-    }
-
-    fn has_search_selection(&self) -> bool {
-        matches!(self.search_selection, Some((a, b)) if a != b)
-    }
-
-    fn normalized_search_selection(&self) -> Option<(usize, usize)> {
-        self.search_selection
-            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
-    }
-
-    fn clear_search_selection(&mut self) {
-        self.search_selection = None;
-        self.search_anchor = None;
-    }
-
-    fn set_search_selection_from_anchor(&mut self, anchor: usize, cursor: usize) {
-        self.search_anchor = Some(anchor);
-        self.search_selection = Some((anchor, cursor));
-    }
-
-    fn delete_search_selection_if_any(&mut self) -> bool {
-        let Some((a, b)) = self.normalized_search_selection() else {
-            return false;
-        };
-        if a == b {
-            return false;
-        }
-        let mut out = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i < a || i >= b {
-                out.push(ch);
-            }
-        }
-        self.search_query = out;
-        self.search_cursor = a;
-        self.clear_search_selection();
-        true
-    }
 
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let query = self.search_query.trim().to_string();
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
+        self.search_cancel.store(generation, Ordering::Relaxed);
         self.search_pending = true;
         self.search_results.clear();
         self.search_expanded_files.clear();
@@ -521,20 +491,30 @@ impl SidebarView {
         let root = self.current_path.clone();
         let rules = self.rules.clone();
         let (tx, mut rx) = mpsc::unbounded::<SearchMessage>();
+        let cancel = self.search_cancel.clone();
 
         thread::spawn(move || {
             let mut total = 0usize;
             let mut batch: Vec<SearchResult> = Vec::with_capacity(32);
 
-            Self::search_in_dir_stream(&root, &query, &rules, |result| {
-                batch.push(result);
-                total += 1;
-                if batch.len() >= 25 {
-                    let to_send = std::mem::take(&mut batch);
-                    let _ = tx.unbounded_send(SearchMessage::Batch(generation, to_send));
-                }
-                total < rules.search_limit
-            });
+            Self::search_in_dir_stream(
+                &root,
+                &query,
+                &rules,
+                || cancel.load(Ordering::Relaxed) == generation,
+                |result| {
+                    if cancel.load(Ordering::Relaxed) != generation {
+                        return false;
+                    }
+                    batch.push(result);
+                    total += 1;
+                    if batch.len() >= 25 {
+                        let to_send = std::mem::take(&mut batch);
+                        let _ = tx.unbounded_send(SearchMessage::Batch(generation, to_send));
+                    }
+                    total < rules.search_limit
+                },
+            );
 
             if !batch.is_empty() {
                 let to_send = std::mem::take(&mut batch);
@@ -592,17 +572,24 @@ impl SidebarView {
         root: &Path,
         query: &str,
         rules: &OrbitshellRules,
+        mut should_continue: impl FnMut() -> bool,
         mut push: impl FnMut(SearchResult) -> bool,
     ) {
         let query_lower = query.to_ascii_lowercase();
         let mut stack = vec![root.to_path_buf()];
 
         while let Some(dir) = stack.pop() {
+            if !should_continue() {
+                return;
+            }
             let read = std::fs::read_dir(&dir);
             let Ok(read) = read else {
                 continue;
             };
             for entry in read.flatten() {
+                if !should_continue() {
+                    return;
+                }
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -627,6 +614,9 @@ impl SidebarView {
                     }
 
                     if let Ok(mut file) = File::open(&path) {
+                        if !should_continue() {
+                            return;
+                        }
                         if let Ok(meta) = file.metadata() {
                             if meta.len() > rules.max_file_kb * 1024 {
                                 continue;
@@ -641,7 +631,12 @@ impl SidebarView {
                         let _ = file.seek(SeekFrom::Start(0));
                         let reader = BufReader::new(file);
                         for (idx, line) in reader.lines().enumerate() {
-                            let Ok(line) = line else { continue; };
+                            if !should_continue() {
+                                return;
+                            }
+                            let Ok(line) = line else {
+                                continue;
+                            };
                             if line.to_ascii_lowercase().contains(&query_lower) {
                                 let snippet = Self::make_snippet(&line, query, 2);
                                 let keep = push(SearchResult {
@@ -663,28 +658,22 @@ impl SidebarView {
 
     fn should_skip_dir(name: &str, rules: &OrbitshellRules) -> bool {
         let name = name.to_lowercase();
-        rules
-            .skip_dirs
-            .iter()
-            .any(|entry| entry.to_lowercase() == name)
+        rules.skip_dirs.iter().any(|entry| entry == &name)
     }
 
     fn should_skip_file(name: &str, rules: &OrbitshellRules) -> bool {
         let name = name.to_lowercase();
-        rules
-            .skip_files
-            .iter()
-            .any(|entry| entry.to_lowercase() == name)
+        rules.skip_files.iter().any(|entry| entry == &name)
     }
 
     fn render_search_input(&self, window: &mut Window) -> Div {
         let is_focused = self.focus_handle.is_focused(window);
-        let (left, right) = self.split_search_at_cursor();
+        let (left, right) = TextEditState::split_at_cursor(&self.search_query, self.search_cursor);
         let mut pre = left;
         let mut post = right;
 
         let mut selection_mid = String::new();
-        if let Some((a, b)) = self.normalized_search_selection() {
+        if let Some((a, b)) = TextEditState::normalized_selection(self.search_selection) {
             let mut before = String::new();
             let mut mid = String::new();
             let mut after = String::new();
@@ -907,20 +896,12 @@ impl SidebarView {
                             cx.new(|_| TooltipView { text }).into()
                         });
 
-                        let mut section = div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .child(file_header);
+                        let mut section = div().flex().flex_col().gap(px(4.0)).child(file_header);
 
                         if expanded {
                             section = section.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .pl(px(22.0))
-                                    .children(items.iter().map(|r| {
+                                div().flex().flex_col().gap(px(2.0)).pl(px(22.0)).children(
+                                    items.iter().map(|r| {
                                         let text = r.text.clone();
                                         let (pre, mid, post) =
                                             Self::split_match(&text, &self.search_query);
@@ -962,7 +943,8 @@ impl SidebarView {
                                                     })
                                                     .child(post),
                                             )
-                                    })),
+                                    }),
+                                ),
                             );
                         }
 
@@ -1071,10 +1053,10 @@ impl SidebarView {
         let path = PathBuf::from("orbitshell_rules.json");
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if let Ok(parsed) = serde_json::from_str::<OrbitshellRules>(&contents) {
-                return parsed;
+                return Self::normalize_rules(parsed);
             }
         }
-        OrbitshellRules {
+        Self::normalize_rules(OrbitshellRules {
             skip_dirs: vec![
                 ".git".to_string(),
                 "node_modules".to_string(),
@@ -1085,7 +1067,21 @@ impl SidebarView {
             skip_files: vec![],
             max_file_kb: 512,
             search_limit: 200,
-        }
+        })
+    }
+
+    fn normalize_rules(mut rules: OrbitshellRules) -> OrbitshellRules {
+        rules.skip_dirs = rules
+            .skip_dirs
+            .into_iter()
+            .map(|entry| entry.to_lowercase())
+            .collect();
+        rules.skip_files = rules
+            .skip_files
+            .into_iter()
+            .map(|entry| entry.to_lowercase())
+            .collect();
+        rules
     }
 }
 
@@ -1156,23 +1152,22 @@ impl Render for SidebarView {
                     ),
             )
             .child(match mode {
-                SidebarMode::Explorer => {
-                    div()
-                        .id("sidebar_explorer")
-                        .flex()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .flex_col()
-                        .gap(px(2.0))
-                        .p(px(8.0))
-                        .track_scroll(&self.explorer_scroll)
-                        .overflow_scroll()
-                        .scrollbar_width(px(12.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
+                SidebarMode::Explorer => div()
+                    .id("sidebar_explorer")
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(8.0))
+                    .track_scroll(&self.explorer_scroll)
+                    .overflow_scroll()
+                    .scrollbar_width(px(12.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
                             .px(px(8.0))
                             .py(px(6.0))
                             .rounded(px(6.0))
@@ -1189,37 +1184,34 @@ impl Render for SidebarView {
                                         }),
                                 ),
                             ),
-                        )
-                        .children(
-                            self.entries
-                                .iter()
-                                .map(|entry| self.render_entry(entry, 1, cx)),
-                        )
-                        .into_any_element()
-                }
-                SidebarMode::Search => {
-                    div()
-                        .id("sidebar_search")
-                        .flex()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .flex_col()
-                        .gap(px(10.0))
-                        .p(px(12.0))
-                        .child(
-                            div()
-                                .rounded(px(6.0))
-                                .bg(rgb(0x131313))
-                                .border_1()
-                                .border_color(rgb(0x2a2a2a))
-                                .px(px(10.0))
-                                .py(px(8.0))
-                                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_search_focus))
-                                .child(self.render_search_input(window)),
-                        )
-                        .child(self.render_search_results(cx))
-                        .into_any_element()
-                }
+                    )
+                    .children(
+                        self.entries
+                            .iter()
+                            .map(|entry| self.render_entry(entry, 1, cx)),
+                    )
+                    .into_any_element(),
+                SidebarMode::Search => div()
+                    .id("sidebar_search")
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .gap(px(10.0))
+                    .p(px(12.0))
+                    .child(
+                        div()
+                            .rounded(px(6.0))
+                            .bg(rgb(0x131313))
+                            .border_1()
+                            .border_color(rgb(0x2a2a2a))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_search_focus))
+                            .child(self.render_search_input(window)),
+                    )
+                    .child(self.render_search_results(cx))
+                    .into_any_element(),
                 SidebarMode::Git => {
                     let (staged, unstaged): (Vec<_>, Vec<_>) =
                         self.git_changes.iter().cloned().partition(|c| c.staged);

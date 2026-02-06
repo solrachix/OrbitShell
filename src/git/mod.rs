@@ -13,7 +13,6 @@ pub struct GitStatus {
 pub struct GitChange {
     pub path: String,
     pub staged: bool,
-    pub unstaged: bool,
     pub kind: String,
 }
 
@@ -105,12 +104,6 @@ pub fn get_git_changes(path: &Path) -> Vec<GitChange> {
             || status.is_index_deleted()
             || status.is_index_renamed()
             || status.is_index_typechange();
-        let unstaged = status.is_wt_new()
-            || status.is_wt_modified()
-            || status.is_wt_deleted()
-            || status.is_wt_renamed()
-            || status.is_wt_typechange();
-
         let kind = if status.is_index_new() || status.is_wt_new() {
             "A"
         } else if status.is_index_deleted() || status.is_wt_deleted() {
@@ -130,7 +123,6 @@ pub fn get_git_changes(path: &Path) -> Vec<GitChange> {
         out.push(GitChange {
             path,
             staged,
-            unstaged,
             kind: kind.to_string(),
         });
     }

@@ -1,11 +1,10 @@
-use gpui::InteractiveElement;
 use gpui::*;
 use lucide_icons::Icon;
 
 use crate::ui::icons::lucide_icon;
+use crate::ui::text_edit::TextEditState;
 
 const ACCENT: u32 = 0x6b9eff;
-const ACCENT_BG: u32 = 0x6b9eff22;
 const ACCENT_BORDER: u32 = 0x6b9eff66;
 
 pub struct SettingsView {
@@ -52,10 +51,12 @@ impl SettingsView {
         let shift = event.keystroke.modifiers.shift;
 
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
-            let len = self.search_query.chars().count();
-            self.search_selection = Some((0, len));
-            self.search_anchor = Some(0);
-            self.search_cursor = len;
+            TextEditState::select_all(
+                &self.search_query,
+                &mut self.search_cursor,
+                &mut self.search_selection,
+                &mut self.search_anchor,
+            );
             cx.notify();
             cx.stop_propagation();
             return;
@@ -63,13 +64,23 @@ impl SettingsView {
 
         match event.keystroke.key.as_str() {
             "backspace" => {
-                if self.delete_selection_if_any() {
+                if TextEditState::delete_selection_if_any(
+                    &mut self.search_query,
+                    &mut self.search_cursor,
+                    &mut self.search_selection,
+                    &mut self.search_anchor,
+                ) {
                     cx.notify();
                     cx.stop_propagation();
                     return;
                 }
                 if self.search_cursor > 0 {
-                    self.pop_char_before_cursor();
+                    TextEditState::pop_char_before_cursor(
+                        &mut self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                     cx.notify();
                 }
                 cx.stop_propagation();
@@ -78,14 +89,23 @@ impl SettingsView {
                 if shift {
                     let anchor = self.search_anchor.unwrap_or(self.search_cursor);
                     self.search_cursor = self.search_cursor.saturating_sub(1);
-                    self.set_selection_from_anchor(anchor, self.search_cursor);
+                    TextEditState::set_selection_from_anchor(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        anchor,
+                        self.search_cursor,
+                    );
                 } else {
-                    if let Some((a, b)) = self.normalized_selection() {
+                    if let Some((a, b)) = TextEditState::normalized_selection(self.search_selection)
+                    {
                         self.search_cursor = a.min(b);
                     } else {
                         self.search_cursor = self.search_cursor.saturating_sub(1);
                     }
-                    self.clear_selection();
+                    TextEditState::clear_selection(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                 }
                 cx.notify();
                 cx.stop_propagation();
@@ -95,10 +115,20 @@ impl SettingsView {
                 if shift {
                     let anchor = self.search_anchor.unwrap_or(self.search_cursor);
                     self.search_cursor = (self.search_cursor + 1).min(max);
-                    self.set_selection_from_anchor(anchor, self.search_cursor);
-                } else if let Some((a, b)) = self.normalized_selection() {
+                    TextEditState::set_selection_from_anchor(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        anchor,
+                        self.search_cursor,
+                    );
+                } else if let Some((a, b)) =
+                    TextEditState::normalized_selection(self.search_selection)
+                {
                     self.search_cursor = a.max(b);
-                    self.clear_selection();
+                    TextEditState::clear_selection(
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    );
                 } else if self.search_cursor < max {
                     self.search_cursor += 1;
                 }
@@ -107,104 +137,43 @@ impl SettingsView {
             }
             "home" => {
                 self.search_cursor = 0;
-                self.clear_selection();
+                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             "end" => {
                 self.search_cursor = self.search_query.chars().count();
-                self.clear_selection();
+                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             _ => {
                 if let Some(text) = event.keystroke.key_char.as_deref() {
                     if !text.is_empty() && !ctrl {
-                        self.insert_text(text);
+                        TextEditState::insert_text(
+                            &mut self.search_query,
+                            &mut self.search_cursor,
+                            &mut self.search_selection,
+                            &mut self.search_anchor,
+                            text,
+                        );
                         cx.notify();
                         cx.stop_propagation();
                     }
                 } else if event.keystroke.key.len() == 1 && !ctrl {
                     let key = event.keystroke.key.clone();
-                    self.insert_text(&key);
+                    TextEditState::insert_text(
+                        &mut self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                        &key,
+                    );
                     cx.notify();
                     cx.stop_propagation();
                 }
             }
         }
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        if self.delete_selection_if_any() {}
-        let (left, right) = self.split_at_cursor();
-        let mut out = left;
-        out.push_str(text);
-        out.push_str(&right);
-        self.search_query = out;
-        self.search_cursor =
-            (self.search_cursor + text.chars().count()).min(self.search_query.chars().count());
-        self.clear_selection();
-    }
-
-    fn pop_char_before_cursor(&mut self) {
-        if self.search_cursor == 0 {
-            return;
-        }
-        let mut out = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i + 1 == self.search_cursor {
-                continue;
-            }
-            out.push(ch);
-        }
-        self.search_query = out;
-        self.search_cursor = self.search_cursor.saturating_sub(1);
-        self.clear_selection();
-    }
-
-    fn split_at_cursor(&self) -> (String, String) {
-        let mut left = String::new();
-        let mut right = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i < self.search_cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-        (left, right)
-    }
-
-    fn normalized_selection(&self) -> Option<(usize, usize)> {
-        self.search_selection
-            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
-    }
-
-    fn set_selection_from_anchor(&mut self, anchor: usize, cursor: usize) {
-        self.search_anchor = Some(anchor);
-        self.search_selection = Some((anchor, cursor));
-    }
-
-    fn clear_selection(&mut self) {
-        self.search_selection = None;
-        self.search_anchor = None;
-    }
-
-    fn delete_selection_if_any(&mut self) -> bool {
-        let Some((a, b)) = self.normalized_selection() else { return false; };
-        if a == b {
-            return false;
-        }
-        let mut out = String::new();
-        for (i, ch) in self.search_query.chars().enumerate() {
-            if i < a || i >= b {
-                out.push(ch);
-            }
-        }
-        self.search_query = out;
-        self.search_cursor = a;
-        self.clear_selection();
-        true
     }
 
     fn render_search_input(&self, is_focused: bool) -> Div {
@@ -213,7 +182,11 @@ impl SettingsView {
             .w(px(2.0))
             .h(px(16.0))
             .rounded(px(1.0))
-            .bg(if is_focused { rgb(ACCENT) } else { rgb(0x2a2a2a) });
+            .bg(if is_focused {
+                rgb(ACCENT)
+            } else {
+                rgb(0x2a2a2a)
+            });
 
         let text_normal = |text: String| {
             div()
@@ -253,7 +226,9 @@ impl SettingsView {
                 );
         }
 
-        if let Some((a, b)) = self.normalized_selection().filter(|(a, b)| a != b) {
+        if let Some((a, b)) =
+            TextEditState::normalized_selection(self.search_selection).filter(|(a, b)| a != b)
+        {
             let (pre, rest) = split_string(&self.search_query, a);
             let (sel, post) = split_string(&rest, b.saturating_sub(a));
             return div()
@@ -266,7 +241,7 @@ impl SettingsView {
                 .child(text_normal(post));
         }
 
-        let (left, right) = self.split_at_cursor();
+        let (left, right) = TextEditState::split_at_cursor(&self.search_query, self.search_cursor);
         div()
             .flex()
             .items_center()
@@ -308,16 +283,12 @@ impl SettingsView {
     fn render_section_content(&self) -> Div {
         let title = self.sections[self.active_section];
 
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .gap(px(16.0))
-            .child(
-                div()
-                    .text_size(px(20.0))
-                    .text_color(rgb(0xffffff))
-                    .child(title),
-            );
+        let mut content = div().flex().flex_col().gap(px(16.0)).child(
+            div()
+                .text_size(px(20.0))
+                .text_color(rgb(0xffffff))
+                .child(title),
+        );
 
         match title {
             "Account" => {
@@ -560,37 +531,34 @@ impl SettingsView {
                     ("Add Cursor Below", vec!["Ctrl", "Shift", "↓"], true),
                     ("Alternate Terminal Paste", vec!["Ctrl", "V"], false),
                 ];
-                content = content
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Configure keyboard shortcuts"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Command"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Shortcut"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .children(rows.into_iter().map(|(label, keys, active)| {
+                content =
+                    content
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x8a8a8a))
+                                .child("Configure keyboard shortcuts"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x9a9a9a))
+                                        .child("Command"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x9a9a9a))
+                                        .child("Shortcut"),
+                                ),
+                        )
+                        .child(div().flex().flex_col().gap(px(8.0)).children(
+                            rows.into_iter().map(|(label, keys, active)| {
                                 div()
                                     .flex()
                                     .items_center()
@@ -608,16 +576,13 @@ impl SettingsView {
                                             .child(label),
                                     )
                                     .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .children(keys.into_iter().map(|key| {
-                                                self.render_kbd_chip(key, active)
-                                            })),
+                                        div().flex().items_center().gap(px(6.0)).children(
+                                            keys.into_iter()
+                                                .map(|key| self.render_kbd_chip(key, active)),
+                                        ),
                                     )
-                            })),
-                    );
+                            }),
+                        ));
             }
             "Referrals" => {
                 content = content
@@ -814,39 +779,47 @@ impl Render for SettingsView {
                                     })
                                     .child(self.render_search_input(is_focused)),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .children(self.sections.iter().enumerate().map(|(i, label)| {
-                                        let is_active = i == self.active_section;
-                                        let handle = cx.entity().downgrade();
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .px(px(10.0))
-                                            .py(px(8.0))
-                                            .rounded(px(6.0))
-                                    .bg(if is_active { rgb(0x13354f) } else { rgb(0x0a0a0a) })
-                                    .border_1()
-                                    .border_color(if is_active { rgba(ACCENT_BORDER) } else { rgb(0x0a0a0a) })
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                                        cx.stop_propagation();
-                                        let _ = handle.update(cx, |view, cx| {
-                                            view.active_section = i;
-                                            cx.notify();
-                                                });
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_size(px(13.0))
-                                                    .text_color(if is_active { rgb(0xffffff) } else { rgb(0xaaaaaa) })
-                                                    .child((*label).to_string()),
-                                            )
-                                    })),
-                            ),
+                            .child(div().flex().flex_col().gap(px(4.0)).children(
+                                self.sections.iter().enumerate().map(|(i, label)| {
+                                    let is_active = i == self.active_section;
+                                    let handle = cx.entity().downgrade();
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .px(px(10.0))
+                                        .py(px(8.0))
+                                        .rounded(px(6.0))
+                                        .bg(if is_active {
+                                            rgb(0x13354f)
+                                        } else {
+                                            rgb(0x0a0a0a)
+                                        })
+                                        .border_1()
+                                        .border_color(if is_active {
+                                            rgba(ACCENT_BORDER)
+                                        } else {
+                                            rgb(0x0a0a0a)
+                                        })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                                            cx.stop_propagation();
+                                            let _ = handle.update(cx, |view, cx| {
+                                                view.active_section = i;
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            div()
+                                                .text_size(px(13.0))
+                                                .text_color(if is_active {
+                                                    rgb(0xffffff)
+                                                } else {
+                                                    rgb(0xaaaaaa)
+                                                })
+                                                .child((*label).to_string()),
+                                        )
+                                }),
+                            )),
                     )
                     .child(
                         // Right content

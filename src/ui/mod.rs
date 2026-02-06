@@ -18,12 +18,28 @@ pub mod views {
     pub mod sidebar_view;
     pub mod tab_bar;
     pub mod tab_view;
-    pub mod top_bar;
     pub mod welcome_view;
 }
 
 pub mod icons;
 pub mod recent;
+pub mod text_edit;
+
+pub(crate) fn move_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        return to;
+    }
+    if from < to {
+        if index > from && index <= to {
+            return index - 1;
+        }
+    } else if from > to {
+        if index >= to && index < from {
+            return index + 1;
+        }
+    }
+    index
+}
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -112,6 +128,14 @@ impl Workspace {
         cx.notify();
     }
 
+    fn sync_sidebar_root(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.tab_paths.get(self.active_tab).cloned() {
+            let _ = self.sidebar.update(cx, |sidebar, _cx| {
+                sidebar.set_root(path);
+            });
+        }
+    }
+
     fn on_tab_event(&mut self, event: &views::tab_bar::TabBarEvent, cx: &mut Context<Self>) {
         match event {
             views::tab_bar::TabBarEvent::NewTab => {
@@ -124,11 +148,7 @@ impl Workspace {
             views::tab_bar::TabBarEvent::Activate(index) => {
                 if *index < self.tabs.len() {
                     self.active_tab = *index;
-                    if let Some(path) = self.tab_paths.get(*index).cloned() {
-                        let _ = self.sidebar.update(cx, |sidebar, _cx| {
-                            sidebar.set_root(path);
-                        });
-                    }
+                    self.sync_sidebar_root(cx);
                     cx.notify();
                 }
             }
@@ -141,11 +161,7 @@ impl Workspace {
                     if self.active_tab >= self.tabs.len() {
                         self.active_tab = self.tabs.len() - 1;
                     }
-                    if let Some(path) = self.tab_paths.get(self.active_tab).cloned() {
-                        let _ = self.sidebar.update(cx, |sidebar, _cx| {
-                            sidebar.set_root(path);
-                        });
-                    }
+                    self.sync_sidebar_root(cx);
                     cx.notify();
                 }
             }
@@ -170,12 +186,8 @@ impl Workspace {
                 let tab_welcome = self.tab_is_welcome.remove(from);
                 self.tab_is_welcome.insert(to, tab_welcome);
 
-                self.active_tab = Self::move_index(self.active_tab, from, to);
-                if let Some(path) = self.tab_paths.get(self.active_tab).cloned() {
-                    let _ = self.sidebar.update(cx, |sidebar, _cx| {
-                        sidebar.set_root(path);
-                    });
-                }
+                self.active_tab = move_index(self.active_tab, from, to);
+                self.sync_sidebar_root(cx);
                 cx.notify();
             }
         }
@@ -192,15 +204,16 @@ impl Workspace {
     fn render_user_menu(&self, cx: &mut Context<Self>) -> Div {
         let handle = cx.entity().downgrade();
 
-        let overlay = div()
-            .absolute()
-            .size_full()
-            .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                let _ = handle.update(cx, |view, cx| {
-                    view.user_menu_open = false;
-                    cx.notify();
+        let overlay =
+            div()
+                .absolute()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                    let _ = handle.update(cx, |view, cx| {
+                        view.user_menu_open = false;
+                        cx.notify();
+                    });
                 });
-            });
 
         let handle_settings = cx.entity().downgrade();
         let handle_settings_settings = handle_settings.clone();
@@ -292,7 +305,7 @@ impl Workspace {
                                 });
                             }
                         });
-                    })
+                    }),
             )
             .child(
                 div()
@@ -333,9 +346,7 @@ impl Workspace {
                         *slot = path.clone();
                     }
                     if index == self.active_tab {
-                        let _ = self.sidebar.update(cx, |sidebar, _cx| {
-                            sidebar.set_root(path.clone());
-                        });
+                        self.sync_sidebar_root(cx);
                     }
                     cx.notify();
                 }
@@ -380,26 +391,8 @@ impl Workspace {
             tab_bar.rename_tab(index, tab_name, tab_path, cx);
             tab_bar.set_active(index, cx);
         });
-        let _ = self.sidebar.update(cx, |sidebar, _cx| {
-            sidebar.set_root(path);
-        });
+        self.sync_sidebar_root(cx);
         cx.notify();
-    }
-
-    fn move_index(index: usize, from: usize, to: usize) -> usize {
-        if index == from {
-            return to;
-        }
-        if from < to {
-            if index > from && index <= to {
-                return index - 1;
-            }
-        } else if from > to {
-            if index >= to && index < from {
-                return index + 1;
-            }
-        }
-        index
     }
 }
 
@@ -450,8 +443,7 @@ impl Render for Workspace {
                             },
                         ),
                     ),
-            )
-            ;
+            );
 
         if self.user_menu_open {
             root = root.child(self.render_user_menu(_cx));

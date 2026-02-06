@@ -1,8 +1,6 @@
 use gpui::*;
 use std::borrow::Cow;
 
-mod core;
-mod events;
 mod git;
 mod terminal;
 mod ui;

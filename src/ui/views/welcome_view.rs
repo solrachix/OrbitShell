@@ -23,16 +23,6 @@ enum WelcomeOverlay {
 }
 
 impl WelcomeView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        Self {
-            focus_handle: cx.focus_handle(),
-            recent: Vec::new(),
-            overlay: None,
-            input: String::new(),
-            suggest_index: 0,
-        }
-    }
-
     pub fn with_recent(cx: &mut Context<Self>, recent: Vec<RecentEntry>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),

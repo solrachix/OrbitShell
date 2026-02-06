@@ -3,17 +3,17 @@ use crate::git::get_git_status;
 use crate::terminal::TerminalPty;
 use futures::StreamExt;
 use futures::channel::mpsc;
-use gpui::StatefulInteractiveElement;
 use gpui::*;
 use lucide_icons::Icon;
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ui::icons::lucide_icon;
 use crate::ui::recent::RecentEntry;
+use crate::ui::text_edit::TextEditState;
 use crate::ui::views::settings_view::SettingsView;
 use crate::ui::views::welcome_view::{OpenRepositoryEvent, WelcomeView};
 
@@ -44,6 +44,9 @@ pub struct TabView {
     overlay: Option<Overlay>,
     needs_git_refresh: bool,
     mode: TabViewMode,
+    last_line_incomplete: bool,
+    total_output_lines: usize,
+    follow_output: bool,
 }
 
 #[derive(Clone)]
@@ -84,29 +87,27 @@ struct BranchPickerState {
     selected: usize,
 }
 
+struct TooltipView {
+    text: String,
+}
+
 enum Overlay {
     Path(PathPickerState),
     Branch(BranchPickerState),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SuggestSource {
-    History,
-    Command,
-    Path,
 }
 
 #[derive(Clone, Debug)]
 struct SuggestionItem {
     display: String,
     insert: String,
-    source: SuggestSource,
 }
 
 pub enum TabViewEvent {
     CwdChanged(PathBuf),
     OpenRepository(PathBuf),
 }
+
+const MAX_OUTPUT_LINES: usize = 5000;
 
 enum TabViewMode {
     Terminal,
@@ -115,11 +116,66 @@ enum TabViewMode {
 }
 
 impl TabView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        Self::new_with_path(cx, None)
+    fn update_follow_output_from_scroll(&mut self) {
+        let max_y: f32 = self.scroll_handle.max_offset().height.into();
+        if max_y <= 0.0 {
+            self.follow_output = true;
+            return;
+        }
+        let offset_y: f32 = self.scroll_handle.offset().y.into();
+        let threshold_px = 24.0;
+        self.follow_output = (max_y - offset_y) <= threshold_px;
     }
 
-    fn format_path(path: &PathBuf) -> String {
+    fn on_output_scroll_wheel(
+        &mut self,
+        _event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = cx.entity().downgrade();
+        window.defer(cx, move |_window, cx| {
+            let _ = handle.update(cx, |view, cx| {
+                view.update_follow_output_from_scroll();
+                cx.notify();
+            });
+        });
+    }
+
+    fn render_jump_to_bottom(&self, cx: &Context<Self>) -> Div {
+        let handle = cx.entity().downgrade();
+        let tooltip_text = "Jump to the bottom of this block".to_string();
+        let mut button = div()
+            .absolute()
+            .right(px(16.0))
+            .bottom(px(16.0))
+            .size(px(36.0))
+            .rounded(px(8.0))
+            .bg(rgb(0x1a1a1a))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(lucide_icon(Icon::ArrowDownToLine, 16.0, 0xdddddd))
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = handle.update(cx, |view, cx| {
+                    view.follow_output = true;
+                    view.scroll_handle.scroll_to_bottom();
+                    cx.notify();
+                });
+            });
+
+        button.interactivity().tooltip(move |_window, cx| {
+            let text = tooltip_text.clone();
+            cx.new(|_| TooltipView { text }).into()
+        });
+
+        button
+    }
+
+    fn format_path(path: &Path) -> String {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .ok()
@@ -141,12 +197,6 @@ impl TabView {
             out = out.replace('\\', "/");
         }
         out
-    }
-
-    pub fn new_with_path(cx: &mut Context<Self>, path: Option<PathBuf>) -> Self {
-        let mut view = Self::new_base(cx);
-        view.start_terminal_with_path(cx, path);
-        view
     }
 
     pub fn new_welcome(cx: &mut Context<Self>, recent: Vec<RecentEntry>) -> Self {
@@ -197,6 +247,9 @@ impl TabView {
             overlay: None,
             needs_git_refresh: false,
             mode: TabViewMode::Terminal,
+            last_line_incomplete: false,
+            total_output_lines: 0,
+            follow_output: true,
         }
     }
 
@@ -206,10 +259,6 @@ impl TabView {
                 view.set_recent(recent, cx);
             });
         }
-    }
-
-    pub fn is_welcome(&self) -> bool {
-        matches!(self.mode, TabViewMode::Welcome(_))
     }
 
     pub fn set_settings_section(&mut self, section: &str, cx: &mut Context<Self>) {
@@ -231,10 +280,11 @@ impl TabView {
         self.pty = Some(pty);
         self.current_path = cwd
             .as_ref()
-            .map(Self::format_path)
+            .map(|path| Self::format_path(path))
             .unwrap_or_else(|| "~".to_string());
         self.git_status = cwd.as_ref().and_then(|path| get_git_status(path));
         self.blocks.clear();
+        self.total_output_lines = 0;
         self.input.clear();
         self.cursor = 0;
         self.history_open = false;
@@ -248,6 +298,8 @@ impl TabView {
         self.input_visible = true;
         self.overlay = None;
         self.needs_git_refresh = false;
+        self.last_line_incomplete = false;
+        self.follow_output = true;
         self.mode = TabViewMode::Terminal;
 
         let (tx, mut rx) = mpsc::unbounded::<String>();
@@ -297,6 +349,25 @@ impl TabView {
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
             self.select_all_input();
             cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.input_visible
+            && ((ctrl && event.keystroke.key.eq_ignore_ascii_case("v"))
+                || (shift && event.keystroke.key.eq_ignore_ascii_case("insert")))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let paste = text
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('\n', " ");
+                if !paste.is_empty() {
+                    self.insert_text(&paste);
+                    self.refresh_suggestions();
+                    self.refresh_history_menu();
+                    cx.notify();
+                }
+            }
             cx.stop_propagation();
             return;
         }
@@ -714,8 +785,9 @@ impl TabView {
             .py(px(10.0))
             .h(px(84.0))
             .bg(rgb(0x1a1a1a))
-            .border_t_1()
+            .border_1()
             .border_color(rgb(0x2a2a2a))
+            .rounded(px(10.0))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::on_focus_input))
             .child(
                 // Meta row (path + git)
@@ -958,6 +1030,7 @@ impl TabView {
             return;
         }
 
+        self.follow_output = true;
         let lower = command.to_ascii_lowercase();
         self.needs_git_refresh =
             lower.starts_with("git checkout") || lower.starts_with("git switch");
@@ -977,6 +1050,7 @@ impl TabView {
                 git_modified: self.git_status.as_ref().map(|g| g.modified),
             }),
         });
+        self.last_line_incomplete = false;
 
         if let Some(ref mut pty) = self.pty {
             let _ = pty.write(format!("{command}\r\n").as_bytes());
@@ -1311,13 +1385,6 @@ impl TabView {
         false
     }
 
-    fn cycle_suggestion(&mut self) {
-        if self.suggestions.is_empty() {
-            return;
-        }
-        self.suggest_index = (self.suggest_index + 1) % self.suggestions.len();
-    }
-
     fn accept_suggestion(&mut self) {
         if let Some(insert) = self.inline_ghost_insert() {
             if !insert.is_empty() {
@@ -1391,7 +1458,6 @@ impl TabView {
             .map(|cmd| SuggestionItem {
                 display: cmd.clone(),
                 insert: cmd.clone(),
-                source: SuggestSource::History,
             })
             .collect();
         if self.history_items.is_empty() {
@@ -1415,7 +1481,6 @@ impl TabView {
                 history_items.push(SuggestionItem {
                     display: cmd.clone(),
                     insert: cmd.clone(),
-                    source: SuggestSource::History,
                 });
             }
         }
@@ -1433,7 +1498,6 @@ impl TabView {
                     command_items.push(SuggestionItem {
                         display: cmd.clone(),
                         insert: cmd.clone(),
-                        source: SuggestSource::Command,
                     });
                 }
             }
@@ -1456,16 +1520,7 @@ impl TabView {
     }
 
     fn split_at_cursor(&self) -> (String, String) {
-        let mut left = String::new();
-        let mut right = String::new();
-        for (i, ch) in self.input.chars().enumerate() {
-            if i < self.cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-        (left, right)
+        TextEditState::split_at_cursor(&self.input, self.cursor)
     }
 
     fn split_at_index(input: &str, index: usize) -> (String, String) {
@@ -1482,42 +1537,33 @@ impl TabView {
     }
 
     fn has_selection(&self) -> bool {
-        matches!(self.selection, Some((a, b)) if a != b)
+        TextEditState::has_selection(self.selection)
     }
 
     fn normalized_selection(&self) -> Option<(usize, usize)> {
-        self.selection
-            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+        TextEditState::normalized_selection(self.selection)
     }
 
     fn clear_selection(&mut self) {
-        self.selection = None;
-        self.selection_anchor = None;
+        TextEditState::clear_selection(&mut self.selection, &mut self.selection_anchor);
     }
 
     fn set_selection_from_anchor(&mut self, anchor: usize, cursor: usize) {
-        self.selection_anchor = Some(anchor);
-        self.selection = Some((anchor, cursor));
+        TextEditState::set_selection_from_anchor(
+            &mut self.selection,
+            &mut self.selection_anchor,
+            anchor,
+            cursor,
+        );
     }
 
     fn delete_selection_if_any(&mut self) -> bool {
-        let Some((a, b)) = self.normalized_selection() else {
-            return false;
-        };
-        if a == b {
-            return false;
-        }
-
-        let mut out = String::new();
-        for (i, ch) in self.input.chars().enumerate() {
-            if i < a || i >= b {
-                out.push(ch);
-            }
-        }
-        self.input = out;
-        self.cursor = a;
-        self.clear_selection();
-        true
+        TextEditState::delete_selection_if_any(
+            &mut self.input,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.selection_anchor,
+        )
     }
 
     fn prefix_at_cursor(&self) -> String {
@@ -1613,39 +1659,22 @@ impl TabView {
     }
 
     fn insert_text(&mut self, text: &str) {
-        let _ = self.delete_selection_if_any();
-        let mut left = String::new();
-        let mut right = String::new();
-        for (i, ch) in self.input.chars().enumerate() {
-            if i < self.cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-        left.push_str(text);
-        left.push_str(&right);
-        self.input = left;
-        self.cursor = (self.cursor + text.chars().count()).min(self.input.chars().count());
-        self.selection_anchor = None;
+        TextEditState::insert_text(
+            &mut self.input,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.selection_anchor,
+            text,
+        );
     }
 
     fn pop_char_before_cursor(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let mut out = String::new();
-        let mut removed = false;
-        for (i, ch) in self.input.chars().enumerate() {
-            if i + 1 == self.cursor && !removed {
-                removed = true;
-                continue;
-            }
-            out.push(ch);
-        }
-        self.input = out;
-        self.cursor = self.cursor.saturating_sub(1);
-        self.selection_anchor = None;
+        TextEditState::pop_char_before_cursor(
+            &mut self.input,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.selection_anchor,
+        );
     }
 
     fn move_cursor_left(&mut self) {
@@ -1665,10 +1694,12 @@ impl TabView {
         if self.input.is_empty() {
             return;
         }
-        let end = self.input.chars().count();
-        self.selection = Some((0, end));
-        self.selection_anchor = Some(0);
-        self.cursor = end;
+        TextEditState::select_all(
+            &self.input,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.selection_anchor,
+        );
         self.history_open = false;
     }
 
@@ -1811,11 +1842,7 @@ impl TabView {
         Self::load_fish_history(&fish, history, seen);
     }
 
-    fn load_zsh_history(
-        path: &PathBuf,
-        history: &mut VecDeque<String>,
-        seen: &mut HashSet<String>,
-    ) {
+    fn load_zsh_history(path: &Path, history: &mut VecDeque<String>, seen: &mut HashSet<String>) {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return;
         };
@@ -1839,11 +1866,7 @@ impl TabView {
         }
     }
 
-    fn load_fish_history(
-        path: &PathBuf,
-        history: &mut VecDeque<String>,
-        seen: &mut HashSet<String>,
-    ) {
+    fn load_fish_history(path: &Path, history: &mut VecDeque<String>, seen: &mut HashSet<String>) {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return;
         };
@@ -1888,7 +1911,7 @@ impl TabView {
     }
 
     fn load_history_from_file(
-        path: &PathBuf,
+        path: &Path,
         history: &mut VecDeque<String>,
         seen: &mut HashSet<String>,
     ) {
@@ -1903,7 +1926,7 @@ impl TabView {
         }
     }
 
-    fn append_history_line(path: &PathBuf, command: &str) -> std::io::Result<()> {
+    fn append_history_line(path: &Path, command: &str) -> std::io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -1981,7 +2004,6 @@ impl TabView {
             items.push(SuggestionItem {
                 display: completed,
                 insert,
-                source: SuggestSource::Path,
             });
         }
     }
@@ -2027,12 +2049,18 @@ impl TabView {
 
     fn append_output(&mut self, chunk: &str, cx: &mut Context<Self>) {
         let normalized = strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+
         let mut lines: Vec<&str> = normalized.split('\n').collect();
-        if normalized.ends_with('\n') {
+        let ends_with_newline = normalized.ends_with('\n');
+        if ends_with_newline {
             if matches!(lines.last(), Some(&"")) {
                 lines.pop();
             }
         }
+
         for line in &lines {
             self.maybe_update_prompt_path(line, cx);
             if self.needs_git_refresh && Self::is_git_branch_change_line(line) {
@@ -2041,12 +2069,25 @@ impl TabView {
             }
         }
 
-        let mut iter = lines.into_iter();
-        if let Some(first) = iter.next() {
-            self.append_output_first_line(first);
+        let mut appended_any = false;
+        let mut last_line_appended = false;
+        for (index, line) in lines.iter().enumerate() {
+            let append_to_last = index == 0 && self.last_line_incomplete;
+            let appended = self.append_output_line(line, append_to_last);
+            if appended {
+                appended_any = true;
+                last_line_appended = true;
+            }
         }
-        for part in iter {
-            self.append_output_new_line(part);
+
+        self.last_line_incomplete = !ends_with_newline && last_line_appended;
+
+        if appended_any {
+            self.trim_output_lines();
+            self.update_follow_output_from_scroll();
+            if self.follow_output {
+                self.scroll_handle.scroll_to_bottom();
+            }
         }
     }
 
@@ -2108,33 +2149,52 @@ impl TabView {
         self.git_status = get_git_status(&cwd);
     }
 
-    fn append_output_first_line(&mut self, line: &str) {
+    fn append_output_line(&mut self, line: &str, append_to_last: bool) -> bool {
         if self.should_skip_output_line(line) {
-            return;
+            if append_to_last {
+                if let Some(block) = self.blocks.last_mut() {
+                    if !block.output_lines.is_empty() {
+                        block.output_lines.pop();
+                        self.total_output_lines = self.total_output_lines.saturating_sub(1);
+                    }
+                }
+            }
+            return false;
         }
-
         let block = self.ensure_output_block();
         if Self::is_error_line(line) {
             block.has_error = true;
         }
-        if block.output_lines.is_empty() {
-            block.output_lines.push(line.to_string());
-        } else if let Some(last) = block.output_lines.last_mut() {
-            last.push_str(line);
-        }
-        self.scroll_handle.scroll_to_bottom();
-    }
-
-    fn append_output_new_line(&mut self, line: &str) {
-        if self.should_skip_output_line(line) {
-            return;
-        }
-        let block = self.ensure_output_block();
-        if Self::is_error_line(line) {
-            block.has_error = true;
+        if append_to_last {
+            if let Some(last) = block.output_lines.last_mut() {
+                last.push_str(line);
+                return true;
+            }
         }
         block.output_lines.push(line.to_string());
-        self.scroll_handle.scroll_to_bottom();
+        self.total_output_lines += 1;
+        true
+    }
+
+    fn trim_output_lines(&mut self) {
+        if self.total_output_lines <= MAX_OUTPUT_LINES {
+            return;
+        }
+
+        let mut to_remove = self.total_output_lines - MAX_OUTPUT_LINES;
+        while to_remove > 0 && !self.blocks.is_empty() {
+            if self.blocks[0].output_lines.is_empty() {
+                self.blocks.remove(0);
+                continue;
+            }
+            let remove_count = to_remove.min(self.blocks[0].output_lines.len());
+            self.blocks[0].output_lines.drain(0..remove_count);
+            self.total_output_lines -= remove_count;
+            to_remove -= remove_count;
+            if self.blocks[0].output_lines.is_empty() {
+                self.blocks.remove(0);
+            }
+        }
     }
 
     fn is_error_line(line: &str) -> bool {
@@ -2270,6 +2330,21 @@ impl TabView {
     }
 }
 
+impl Render for TooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(rgb(0x1a1a1a))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .text_size(px(11.0))
+            .text_color(rgb(0xdddddd))
+            .child(self.text.clone())
+    }
+}
+
 impl Render for TabView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.auto_focus {
@@ -2296,26 +2371,38 @@ impl Render for TabView {
                     div()
                         .flex_1()
                         .min_h(px(0.0))
-                        .p(px(16.0))
-                        .id("terminal_output")
-                        .track_scroll(&self.scroll_handle)
-                        .overflow_scroll()
-                        .font_family("Cascadia Code")
-                        .text_size(px(13.0))
-                        .text_color(rgb(0xcccccc))
-                        .child({
-                            let active_index = self.blocks.len().saturating_sub(1);
-                            let blocks: Vec<Div> = self
-                                .blocks
-                                .iter()
-                                .enumerate()
-                                .map(|(i, block)| self.render_block(block, i, active_index))
-                                .collect();
+                        .relative()
+                        .child(
                             div()
-                                .flex_col()
-                                .gap(px(0.0))
-                                .min_h(px(0.0))
-                                .children(blocks)
+                                .p(px(16.0))
+                                .id("terminal_output")
+                                .track_scroll(&self.scroll_handle)
+                                .on_scroll_wheel(cx.listener(Self::on_output_scroll_wheel))
+                                .overflow_scroll()
+                                .scrollbar_width(px(16.0))
+                                .size_full()
+                                .font_family("Cascadia Code")
+                                .text_size(px(13.0))
+                                .text_color(rgb(0xcccccc))
+                                .child({
+                                    let active_index = self.blocks.len().saturating_sub(1);
+                                    let blocks: Vec<Div> = self
+                                        .blocks
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, block)| self.render_block(block, i, active_index))
+                                        .collect();
+                                    div()
+                                        .flex_col()
+                                        .gap(px(0.0))
+                                        .min_h(px(0.0))
+                                        .children(blocks)
+                                }),
+                        )
+                        .child(if self.follow_output {
+                            div()
+                        } else {
+                            self.render_jump_to_bottom(cx)
                         }),
                 )
                 .child(self.render_overlay(cx))

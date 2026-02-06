@@ -4,6 +4,8 @@ use lucide_icons::Icon;
 use std::time::Duration;
 
 use crate::ui::icons::lucide_icon;
+use crate::ui::move_index;
+use crate::ui::text_edit::TextEditState;
 
 const ACCENT: u32 = 0x6b9eff;
 const ACCENT_BG: u32 = 0x6b9eff22;
@@ -42,6 +44,8 @@ pub struct TabBar {
     editing_index: Option<usize>,
     edit_value: String,
     edit_cursor: usize,
+    edit_selection: Option<(usize, usize)>,
+    edit_anchor: Option<usize>,
     edit_original: String,
 
     sidebar_visible: bool,
@@ -66,6 +70,8 @@ impl TabBar {
             editing_index: None,
             edit_value: String::new(),
             edit_cursor: 0,
+            edit_selection: None,
+            edit_anchor: None,
             edit_original: String::new(),
 
             sidebar_visible: true,
@@ -147,6 +153,8 @@ impl TabBar {
         self.edit_value = tab.name.clone();
         self.edit_original = tab.name.clone();
         self.edit_cursor = self.edit_value.chars().count();
+        self.edit_selection = None;
+        self.edit_anchor = None;
         cx.notify();
     }
 
@@ -155,6 +163,8 @@ impl TabBar {
         self.edit_value.clear();
         self.edit_original.clear();
         self.edit_cursor = 0;
+        self.edit_selection = None;
+        self.edit_anchor = None;
     }
 
     fn commit_tab_edit(&mut self, cx: &mut Context<Self>) {
@@ -183,58 +193,26 @@ impl TabBar {
     }
 
     fn split_edit_at_cursor(&self) -> (String, String) {
-        let mut left = String::new();
-        let mut right = String::new();
-
-        for (i, ch) in self.edit_value.chars().enumerate() {
-            if i < self.edit_cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-
-        (left, right)
+        TextEditState::split_at_cursor(&self.edit_value, self.edit_cursor)
     }
 
     fn insert_edit_text(&mut self, text: &str) {
-        let mut left = String::new();
-        let mut right = String::new();
-
-        for (i, ch) in self.edit_value.chars().enumerate() {
-            if i < self.edit_cursor {
-                left.push(ch);
-            } else {
-                right.push(ch);
-            }
-        }
-
-        left.push_str(text);
-        left.push_str(&right);
-
-        self.edit_value = left;
-        self.edit_cursor =
-            (self.edit_cursor + text.chars().count()).min(self.edit_value.chars().count());
+        TextEditState::insert_text(
+            &mut self.edit_value,
+            &mut self.edit_cursor,
+            &mut self.edit_selection,
+            &mut self.edit_anchor,
+            text,
+        );
     }
 
     fn pop_edit_char_before_cursor(&mut self) {
-        if self.edit_cursor == 0 {
-            return;
-        }
-
-        let mut out = String::new();
-        let mut removed = false;
-
-        for (i, ch) in self.edit_value.chars().enumerate() {
-            if i + 1 == self.edit_cursor && !removed {
-                removed = true;
-                continue;
-            }
-            out.push(ch);
-        }
-
-        self.edit_value = out;
-        self.edit_cursor = self.edit_cursor.saturating_sub(1);
+        TextEditState::pop_char_before_cursor(
+            &mut self.edit_value,
+            &mut self.edit_cursor,
+            &mut self.edit_selection,
+            &mut self.edit_anchor,
+        );
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -337,22 +315,6 @@ impl TabBar {
         x
     }
 
-    fn move_index(index: usize, from: usize, to: usize) -> usize {
-        if index == from {
-            return to;
-        }
-        if from < to {
-            if index > from && index <= to {
-                return index - 1;
-            }
-        } else if from > to {
-            if index >= to && index < from {
-                return index + 1;
-            }
-        }
-        index
-    }
-
     fn on_drag_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -451,9 +413,9 @@ impl TabBar {
             let tab = self.tabs.remove(from);
             self.tabs.insert(to, tab);
 
-            self.active_tab = Self::move_index(self.active_tab, from, to);
+            self.active_tab = move_index(self.active_tab, from, to);
             if let Some(edit) = self.editing_index {
-                self.editing_index = Some(Self::move_index(edit, from, to));
+                self.editing_index = Some(move_index(edit, from, to));
             }
             cx.emit(TabBarEvent::Reorder(from, to));
         }
@@ -519,28 +481,6 @@ impl TabBar {
     // Styling helpers
     // --------------------------
 
-    fn icon_button(
-        &self,
-        icon: Icon,
-        size: f32,
-        fg: u32,
-        bg: u32,
-        border: u32,
-    ) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(size))
-            .h(px(size))
-            .rounded(px(6.0))
-            .bg(rgba(bg))
-            .border_1()
-            .border_color(rgba(border))
-            .occlude()
-            .child(lucide_icon(icon, 14.0, fg))
-    }
-
     fn chrome_button(&self, icon: Icon, fg: u32) -> Div {
         div()
             .flex()
@@ -554,18 +494,6 @@ impl TabBar {
             .border_color(rgb(0x2a2a2a))
             .occlude()
             .child(lucide_icon(icon, 12.0, fg))
-    }
-
-    fn user_menu_item(&self, label: &str) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .px(px(12.0))
-            .py(px(8.0))
-            .rounded(px(6.0))
-            .text_size(px(13.0))
-            .text_color(rgb(0xe6e6e6))
-            .child(label.to_string())
     }
 }
 
