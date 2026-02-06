@@ -102,7 +102,12 @@ impl WelcomeView {
         cx.notify();
     }
 
-    fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.overlay.is_none() {
             return;
         }
@@ -193,7 +198,8 @@ impl WelcomeView {
         last_opened: Option<i64>,
         cx: &Context<Self>,
     ) -> Div {
-        let time_label = last_opened.map(Self::format_recent_time);
+        let now = chrono::Utc::now().timestamp();
+        let time_label = last_opened.map(|last| format_recent_time(last, now));
         let mut row = div()
             .flex()
             .items_center()
@@ -247,27 +253,26 @@ impl WelcomeView {
 
         row
     }
+}
 
-    fn format_recent_time(last_opened: i64) -> String {
-        let now = chrono::Utc::now().timestamp();
-        let diff = (now - last_opened).max(0);
-        if diff < 60 {
-            return "agora".to_string();
-        }
-        if diff < 3600 {
-            return format!("{}m", diff / 60);
-        }
-        if diff < 86_400 {
-            return format!("{}h", diff / 3600);
-        }
-        if diff < 2_592_000 {
-            return format!("{}d", diff / 86_400);
-        }
-        let date = chrono::DateTime::<chrono::Utc>::from_timestamp(last_opened, 0)
-            .or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0))
-            .unwrap();
-        date.format("%d/%m/%Y").to_string()
+fn format_recent_time(last_opened: i64, now: i64) -> String {
+    let diff = (now - last_opened).max(0);
+    if diff < 60 {
+        return "agora".to_string();
     }
+    if diff < 3600 {
+        return format!("{}m", diff / 60);
+    }
+    if diff < 86_400 {
+        return format!("{}h", diff / 3600);
+    }
+    if diff < 2_592_000 {
+        return format!("{}d", diff / 86_400);
+    }
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(last_opened, 0)
+        .or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0))
+        .unwrap();
+    date.format("%d/%m/%Y").to_string()
 }
 
 impl Render for WelcomeView {
@@ -443,11 +448,8 @@ impl WelcomeView {
                             ),
                     )
                     .child(if !suggestions.is_empty() && self.input.is_empty() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .children(suggestions.into_iter().enumerate().map(|(i, s)| {
+                        div().flex().flex_col().gap(px(4.0)).children(
+                            suggestions.into_iter().enumerate().map(|(i, s)| {
                                 let is_selected = i == self.suggest_index;
                                 div()
                                     .flex()
@@ -472,7 +474,8 @@ impl WelcomeView {
                                             })
                                             .child(s),
                                     )
-                            }))
+                            }),
+                        )
                     } else {
                         div()
                     }),

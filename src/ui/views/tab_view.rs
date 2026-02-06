@@ -551,7 +551,7 @@ impl TabView {
         if !self.input_visible {
             return;
         }
-        let cwd = Self::expand_tilde(&self.current_path);
+        let cwd = expand_tilde(&self.current_path);
         let mut picker = PathPickerState {
             cwd,
             query: String::new(),
@@ -572,7 +572,7 @@ impl TabView {
         if !self.input_visible {
             return;
         }
-        let cwd = Self::expand_tilde(&self.current_path);
+        let cwd = expand_tilde(&self.current_path);
         let all = get_git_branches(&cwd);
         if all.is_empty() {
             return;
@@ -1846,44 +1846,14 @@ impl TabView {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return;
         };
-        for line in contents.lines().rev() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let cmd = if let Some(pos) = line.find(';') {
-                &line[pos + 1..]
-            } else {
-                line
-            };
-            let cmd = cmd.trim();
-            if cmd.is_empty() {
-                continue;
-            }
-            if seen.insert(cmd.to_string()) {
-                history.push_front(cmd.to_string());
-            }
-        }
+        load_zsh_history_contents(&contents, history, seen);
     }
 
     fn load_fish_history(path: &Path, history: &mut VecDeque<String>, seen: &mut HashSet<String>) {
         let Ok(contents) = std::fs::read_to_string(path) else {
             return;
         };
-        for line in contents.lines().rev() {
-            let line = line.trim();
-            if let Some(cmd) = line.strip_prefix("- cmd:") {
-                let cmd = cmd.trim();
-                if !cmd.is_empty() && seen.insert(cmd.to_string()) {
-                    history.push_front(cmd.to_string());
-                }
-            } else if let Some(cmd) = line.strip_prefix("cmd:") {
-                let cmd = cmd.trim();
-                if !cmd.is_empty() && seen.insert(cmd.to_string()) {
-                    history.push_front(cmd.to_string());
-                }
-            }
-        }
+        load_fish_history_contents(&contents, history, seen);
     }
 
     #[cfg(windows)]
@@ -1915,15 +1885,23 @@ impl TabView {
         history: &mut VecDeque<String>,
         seen: &mut HashSet<String>,
     ) {
-        let Ok(contents) = std::fs::read_to_string(path) else {
+        Self::load_history_from_file_with_reader(path, history, seen, |p| {
+            std::fs::read_to_string(p)
+        });
+    }
+
+    fn load_history_from_file_with_reader<F>(
+        path: &Path,
+        history: &mut VecDeque<String>,
+        seen: &mut HashSet<String>,
+        read_to_string: F,
+    ) where
+        F: for<'a> Fn(&'a Path) -> std::io::Result<String>,
+    {
+        let Ok(contents) = read_to_string(path) else {
             return;
         };
-        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
-        for line in lines.into_iter().rev() {
-            if seen.insert(line.to_string()) {
-                history.push_front(line.to_string());
-            }
-        }
+        load_history_from_contents(&contents, history, seen);
     }
 
     fn append_history_line(path: &Path, command: &str) -> std::io::Result<()> {
@@ -1970,11 +1948,11 @@ impl TabView {
             return;
         }
 
-        let (base, partial, sep) = Self::split_path_token(&token);
+        let (base, partial, sep) = split_path_token(&token);
         let base_dir = if base.is_empty() {
             PathBuf::from(".")
         } else {
-            Self::expand_tilde(&base)
+            expand_tilde(&base)
         };
 
         let Ok(entries) = std::fs::read_dir(&base_dir) else {
@@ -2006,33 +1984,6 @@ impl TabView {
                 insert,
             });
         }
-    }
-
-    fn split_path_token(token: &str) -> (String, String, char) {
-        let sep = if token.contains('\\') { '\\' } else { '/' };
-        if let Some(pos) = token.rfind(sep) {
-            let base = token[..pos].to_string();
-            let partial = token[pos + 1..].to_string();
-            (base, partial, sep)
-        } else {
-            (String::new(), token.to_string(), sep)
-        }
-    }
-
-    fn expand_tilde(path: &str) -> PathBuf {
-        if let Some(rest) = path.strip_prefix('~') {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("~"));
-            if rest.is_empty() {
-                return home;
-            }
-            let rest = rest.trim_start_matches(['\\', '/']);
-            return home.join(rest);
-        }
-        PathBuf::from(path)
     }
 
     fn ensure_output_block(&mut self) -> &mut Block {
@@ -2145,7 +2096,7 @@ impl TabView {
     }
 
     fn refresh_git_status(&mut self) {
-        let cwd = Self::expand_tilde(&self.current_path);
+        let cwd = expand_tilde(&self.current_path);
         self.git_status = get_git_status(&cwd);
     }
 
@@ -2162,7 +2113,7 @@ impl TabView {
             return false;
         }
         let block = self.ensure_output_block();
-        if Self::is_error_line(line) {
+        if is_error_line(line) {
             block.has_error = true;
         }
         if append_to_last {
@@ -2197,18 +2148,6 @@ impl TabView {
         }
     }
 
-    fn is_error_line(line: &str) -> bool {
-        let s = line.trim().to_ascii_lowercase();
-        s.contains("not recognized as")
-            || s.contains("is not recognized")
-            || s.contains("cannot find path")
-            || s.contains("categoryinfo")
-            || s.contains("fullyqualifiederrorid")
-            || s.starts_with("error:")
-            || s.contains("exception")
-            || s.contains("at line:")
-    }
-
     fn is_dir_header_line(line: &str) -> bool {
         let trimmed = line.trim();
         trimmed.starts_with("Directory:")
@@ -2220,7 +2159,7 @@ impl TabView {
     }
 
     fn render_output_line(&self, line: &str, has_error: bool) -> Div {
-        let color = if has_error && Self::is_error_line(line) {
+        let color = if has_error && is_error_line(line) {
             rgb(0xff7b72)
         } else if Self::is_dir_header_line(line) {
             rgb(0x8bd06f)
@@ -2426,6 +2365,104 @@ impl Render for TabView {
         }
 
         root
+    }
+}
+
+fn split_path_token(token: &str) -> (String, String, char) {
+    let sep = if token.contains('\\') { '\\' } else { '/' };
+    if let Some(pos) = token.rfind(sep) {
+        let base = token[..pos].to_string();
+        let partial = token[pos + 1..].to_string();
+        (base, partial, sep)
+    } else {
+        (String::new(), token.to_string(), sep)
+    }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix('~') {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        if rest.is_empty() {
+            return home;
+        }
+        let rest = rest.trim_start_matches(['\\', '/']);
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn is_error_line(line: &str) -> bool {
+    let s = line.trim().to_ascii_lowercase();
+    s.contains("not recognized as")
+        || s.contains("is not recognized")
+        || s.contains("cannot find path")
+        || s.contains("categoryinfo")
+        || s.contains("fullyqualifiederrorid")
+        || s.starts_with("error:")
+        || s.contains("exception")
+        || s.contains("at line:")
+}
+
+fn load_history_from_contents(
+    contents: &str,
+    history: &mut VecDeque<String>,
+    seen: &mut HashSet<String>,
+) {
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    for line in lines.into_iter().rev() {
+        if seen.insert(line.to_string()) {
+            history.push_front(line.to_string());
+        }
+    }
+}
+
+fn load_zsh_history_contents(
+    contents: &str,
+    history: &mut VecDeque<String>,
+    seen: &mut HashSet<String>,
+) {
+    for line in contents.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cmd = if let Some(pos) = line.find(';') {
+            &line[pos + 1..]
+        } else {
+            line
+        };
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        if seen.insert(cmd.to_string()) {
+            history.push_front(cmd.to_string());
+        }
+    }
+}
+
+fn load_fish_history_contents(
+    contents: &str,
+    history: &mut VecDeque<String>,
+    seen: &mut HashSet<String>,
+) {
+    for line in contents.lines().rev() {
+        let line = line.trim();
+        if let Some(cmd) = line.strip_prefix("- cmd:") {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() && seen.insert(cmd.to_string()) {
+                history.push_front(cmd.to_string());
+            }
+        } else if let Some(cmd) = line.strip_prefix("cmd:") {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() && seen.insert(cmd.to_string()) {
+                history.push_front(cmd.to_string());
+            }
+        }
     }
 }
 

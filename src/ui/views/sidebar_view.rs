@@ -572,9 +572,32 @@ impl SidebarView {
         root: &Path,
         query: &str,
         rules: &OrbitshellRules,
+        should_continue: impl FnMut() -> bool,
+        push: impl FnMut(SearchResult) -> bool,
+    ) {
+        Self::search_in_dir_stream_with_fs(
+            root,
+            query,
+            rules,
+            should_continue,
+            push,
+            |path| std::fs::read_dir(path),
+            |path| File::open(path),
+        );
+    }
+
+    fn search_in_dir_stream_with_fs<ReadDirFn, OpenFileFn>(
+        root: &Path,
+        query: &str,
+        rules: &OrbitshellRules,
         mut should_continue: impl FnMut() -> bool,
         mut push: impl FnMut(SearchResult) -> bool,
-    ) {
+        read_dir: ReadDirFn,
+        open_file: OpenFileFn,
+    ) where
+        ReadDirFn: for<'a> Fn(&'a Path) -> std::io::Result<std::fs::ReadDir>,
+        OpenFileFn: for<'a> Fn(&'a Path) -> std::io::Result<File>,
+    {
         let query_lower = query.to_ascii_lowercase();
         let mut stack = vec![root.to_path_buf()];
 
@@ -582,7 +605,7 @@ impl SidebarView {
             if !should_continue() {
                 return;
             }
-            let read = std::fs::read_dir(&dir);
+            let read = read_dir(&dir);
             let Ok(read) = read else {
                 continue;
             };
@@ -613,7 +636,7 @@ impl SidebarView {
                         }
                     }
 
-                    if let Ok(mut file) = File::open(&path) {
+                    if let Ok(mut file) = open_file(&path) {
                         if !should_continue() {
                             return;
                         }
@@ -638,7 +661,7 @@ impl SidebarView {
                                 continue;
                             };
                             if line.to_ascii_lowercase().contains(&query_lower) {
-                                let snippet = Self::make_snippet(&line, query, 2);
+                                let snippet = make_snippet(&line, query, 2);
                                 let keep = push(SearchResult {
                                     path: path.clone(),
                                     line: idx + 1,
@@ -904,7 +927,7 @@ impl SidebarView {
                                     items.iter().map(|r| {
                                         let text = r.text.clone();
                                         let (pre, mid, post) =
-                                            Self::split_match(&text, &self.search_query);
+                                            split_match(&text, &self.search_query);
                                         div()
                                             .flex()
                                             .items_center()
@@ -956,87 +979,6 @@ impl SidebarView {
 }
 
 impl SidebarView {
-    fn split_match(text: &str, query: &str) -> (String, String, String) {
-        let lower_text = text.to_lowercase();
-        let lower_query = query.to_lowercase();
-        if lower_query.is_empty() {
-            return (text.to_string(), String::new(), String::new());
-        }
-        if let Some(pos) = lower_text.find(&lower_query) {
-            let mut pre = String::new();
-            let mut mid = String::new();
-            let mut post = String::new();
-            let mut idx = 0usize;
-            let match_len = lower_query.chars().count();
-            for ch in text.chars() {
-                if idx < pos {
-                    pre.push(ch);
-                } else if idx < pos + match_len {
-                    mid.push(ch);
-                } else {
-                    post.push(ch);
-                }
-                idx += 1;
-            }
-            (pre, mid, post)
-        } else {
-            (text.to_string(), String::new(), String::new())
-        }
-    }
-
-    fn make_snippet(line: &str, query: &str, padding: usize) -> String {
-        let lower = line.to_lowercase();
-        let q = query.to_lowercase();
-        if q.is_empty() {
-            return line.chars().take(80).collect();
-        }
-        if let Some(byte_pos) = lower.find(&q) {
-            let char_pos = line[..byte_pos].chars().count();
-            let q_len = q.chars().count();
-            let chars: Vec<char> = line.chars().collect();
-            let mut start = char_pos;
-            let mut words = 0usize;
-            while start > 0 && words < padding {
-                start -= 1;
-                if chars[start].is_whitespace() {
-                    while start > 0 && chars[start].is_whitespace() {
-                        start -= 1;
-                    }
-                    words += 1;
-                }
-            }
-            while start > 0 && !chars[start - 1].is_whitespace() {
-                start -= 1;
-            }
-
-            let mut end = (char_pos + q_len).min(chars.len());
-            let mut words_right = 0usize;
-            while end < chars.len() && words_right < padding {
-                if chars[end].is_whitespace() {
-                    while end < chars.len() && chars[end].is_whitespace() {
-                        end += 1;
-                    }
-                    words_right += 1;
-                } else {
-                    end += 1;
-                }
-            }
-            while end < chars.len() && !chars[end].is_whitespace() {
-                end += 1;
-            }
-
-            let mut snippet: String = chars[start..end].iter().collect();
-            if start > 0 {
-                snippet = format!("…{snippet}");
-            }
-            if end < chars.len() {
-                snippet = format!("{snippet}…");
-            }
-            return snippet;
-        }
-        line.chars().take(80).collect()
-    }
-
     fn relative_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.current_path)
             .map(|p| p.to_path_buf())
@@ -1400,6 +1342,87 @@ impl SidebarView {
             )
             .child(list)
     }
+}
+
+fn split_match(text: &str, query: &str) -> (String, String, String) {
+    let lower_text = text.to_lowercase();
+    let lower_query = query.to_lowercase();
+    if lower_query.is_empty() {
+        return (text.to_string(), String::new(), String::new());
+    }
+    if let Some(pos) = lower_text.find(&lower_query) {
+        let mut pre = String::new();
+        let mut mid = String::new();
+        let mut post = String::new();
+        let mut idx = 0usize;
+        let match_len = lower_query.chars().count();
+        for ch in text.chars() {
+            if idx < pos {
+                pre.push(ch);
+            } else if idx < pos + match_len {
+                mid.push(ch);
+            } else {
+                post.push(ch);
+            }
+            idx += 1;
+        }
+        (pre, mid, post)
+    } else {
+        (text.to_string(), String::new(), String::new())
+    }
+}
+
+fn make_snippet(line: &str, query: &str, padding: usize) -> String {
+    let lower = line.to_lowercase();
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return line.chars().take(80).collect();
+    }
+    if let Some(byte_pos) = lower.find(&q) {
+        let char_pos = line[..byte_pos].chars().count();
+        let q_len = q.chars().count();
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = char_pos;
+        let mut words = 0usize;
+        while start > 0 && words < padding {
+            start -= 1;
+            if chars[start].is_whitespace() {
+                while start > 0 && chars[start].is_whitespace() {
+                    start -= 1;
+                }
+                words += 1;
+            }
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+
+        let mut end = (char_pos + q_len).min(chars.len());
+        let mut words_right = 0usize;
+        while end < chars.len() && words_right < padding {
+            if chars[end].is_whitespace() {
+                while end < chars.len() && chars[end].is_whitespace() {
+                    end += 1;
+                }
+                words_right += 1;
+            } else {
+                end += 1;
+            }
+        }
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+
+        let mut snippet: String = chars[start..end].iter().collect();
+        if start > 0 {
+            snippet = format!("…{snippet}");
+        }
+        if end < chars.len() {
+            snippet = format!("{snippet}…");
+        }
+        return snippet;
+    }
+    line.chars().take(80).collect()
 }
 
 impl SidebarView {
