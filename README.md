@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logomarca.png" alt="OrbitShell" width="240" />
+  <img src="https://raw.githubusercontent.com/solrachix/OrbitShell/main/assets/logomarca.png" alt="OrbitShell" width="240" />
 </p>
 
 # OrbitShell
