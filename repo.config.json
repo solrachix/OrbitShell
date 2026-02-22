@@ -2,5 +2,6 @@
   "project_name": "OrbitShell",
   "type": "desktop",
   "template_url": "./assets/logomarca.png",
-  "logo_url": "./assets/logo.png"
+  "logo_url": "./assets/logo.png",
+  "description_pt": "Terminal moderno baseado em blocos, inspirado no Warp, feito em Rust e GPUI."
 }
