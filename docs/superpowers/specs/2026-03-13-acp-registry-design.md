@@ -93,6 +93,12 @@ The ACP Registry page becomes a unified catalog with the following controls:
   - last refresh timestamp
   - errors when refresh fails
 
+Settings is a global surface, but workspace-local ACP definitions are scoped to the workspace context of the current Settings tab. For the first cut:
+
+- A Settings tab opened from a workspace tab uses that workspace path as its local ACP source.
+- If the Settings tab has no workspace context, workspace-local `agents.json` entries are omitted.
+- OrbitShell must not implicitly switch workspace-local ACP sources based on unrelated tab focus changes after the Settings tab is opened.
+
 Each ACP row or card shows:
 
 - Name
@@ -125,6 +131,13 @@ Action visibility rules:
 - `Authenticate` is shown when the agent defines an auth command or the last runtime/test result indicates auth is required.
 - `Test` is shown for any resolved effective ACP.
 - `Remove` is shown for managed installs. For local-only custom agents, the UI does not delete the user-authored config automatically.
+
+Duplicate source handling:
+
+- Under `Show both`, both sources are rendered as separate rows with distinct source badges and internal identity.
+- Under `Local wins` or `Registry wins`, the winning source is shown as the primary row.
+- When a losing source still exists, the primary row exposes an `Other sources` disclosure so the user can still inspect, test, update, or remove the non-winning source.
+- A hidden losing source must never become operationally unreachable.
 
 ### Confirmation Before Install Or Update
 
@@ -181,11 +194,13 @@ OrbitShell stores registry and MCP state under `%APPDATA%/orbitshell/`.
 
 The current project-local `agents.json` remains supported as an additional source.
 
-The effective merge order uses three sources:
+OrbitShell discovers three sources:
 
 1. Managed registry installs
 2. Global custom agents from `%APPDATA%/orbitshell/agents.json`
 3. Workspace-local custom agents from the current working directory `agents.json`
+
+This discovery order does not decide conflict winners. Conflict winners are chosen only by the user-configured conflict policy.
 
 This keeps existing behavior while introducing a real global settings model.
 
@@ -242,14 +257,26 @@ For merge purposes they also need a source marker:
 
 - `source = global_custom` or `workspace_custom`
 
+### Effective Agent Identity
+
+The merged catalog cannot use raw ACP `id` as its only identity, because duplicate `id` values can remain visible under `Show both` and can remain manageable under the other conflict policies.
+
+OrbitShell therefore needs a first-class composite identity:
+
+- `agent_key`
+  - source kind
+  - source-local stable identifier
+  - ACP `id`
+
+The UI, actions, diagnostics, and runtime resolution must use `agent_key`, not just ACP `id`.
+
 ### Preferences
 
 Preferences should include:
 
 - `conflict_policy`
-- `registry_url`
-- `auto_refresh_on_open`
-- `registry_cache_ttl_seconds`
+
+The first cut does not expose registry URL or refresh cadence as user-facing preferences. Registry fetch-on-open is fixed behavior for this release.
 
 ### MCP Server Entry
 
@@ -312,6 +339,24 @@ The install layer is split by distribution:
 
 This keeps distribution-specific logic isolated and testable.
 
+Materialization rules:
+
+- `npx`
+  - OrbitShell stores managed state plus a small wrapper script or launch definition under `%APPDATA%/orbitshell/registry/installs/<id>/<version>/`.
+  - The wrapper must pin the package version explicitly in the invocation.
+  - OrbitShell does not vendor the npm package payload into its own install directory for the first cut; package contents remain managed by the external npm cache.
+- `uvx`
+  - OrbitShell stores managed state plus a small wrapper script or launch definition under `%APPDATA%/orbitshell/registry/installs/<id>/<version>/`.
+  - The wrapper must pin the package version explicitly in the invocation.
+  - OrbitShell does not vendor the Python package payload into its own install directory for the first cut; package contents remain managed by the external uv cache.
+- `binary`
+  - OrbitShell downloads the artifact into the managed install directory, verifies it, and activates the resolved executable from that directory.
+
+Remove semantics:
+
+- Removing an `npx` or `uvx` managed install removes OrbitShell-managed wrappers and state only.
+- OrbitShell does not attempt to garbage-collect shared external package-manager caches in the first cut.
+
 ### 3. Custom Agent Config Layer
 
 Responsibility:
@@ -338,8 +383,9 @@ Responsibility:
 
 Interface:
 
-- `list_effective_agents() -> Vec<EffectiveAgent>`
-- `resolve_agent(id) -> Option<ResolvedAgentSpec>`
+- `list_effective_agents() -> Vec<EffectiveAgentRow>`
+- `resolve_agent(agent_key) -> Option<ResolvedAgentSpec>`
+- `list_alternate_sources(acp_id) -> Vec<EffectiveAgentRow>`
 
 This is the only layer that decides which agent wins under conflict.
 
@@ -373,17 +419,18 @@ This remains the job of the existing `AcpClient` and `AcpTransport`. The runtime
 ### Opening ACP Registry
 
 1. User opens `Settings > ACP Registry`.
-2. OrbitShell attempts to refresh the registry from the configured remote URL.
-3. If refresh succeeds:
+2. OrbitShell resolves the Settings tab workspace context, if any, for workspace-local custom ACP discovery.
+3. OrbitShell attempts to refresh the registry from the configured remote URL.
+4. If refresh succeeds:
    - cache is updated
    - manifests are refreshed as needed
    - update availability is recomputed
-4. If refresh fails:
+5. If refresh fails:
    - cache is loaded instead
    - UI shows cached mode and the refresh error
-5. Managed installs and custom agents are loaded.
-6. Effective merge is computed.
-7. Unified list is rendered.
+6. Managed installs and custom agents are loaded.
+7. Effective merge is computed.
+8. Unified list is rendered.
 
 ### Installing An ACP
 
@@ -414,7 +461,7 @@ This remains the job of the existing `AcpClient` and `AcpTransport`. The runtime
 
 The test action reuses the current handshake shape:
 
-1. Resolve effective runtime `AgentSpec`.
+1. Resolve effective runtime `AgentSpec` from `agent_key`.
 2. Spawn the ACP command.
 3. Run `initialize`.
 4. Run `session/new` with global MCP servers.
@@ -446,7 +493,7 @@ Both entries remain visible and selectable in the UI, but they must be uniquely 
 
 Implementation note:
 
-The resolver must avoid ambiguous row identity even if two visible entries share the same ACP `id`. The effective list therefore needs an internal composite key based on source plus `id`.
+The resolver must avoid ambiguous row identity even if two visible entries share the same ACP `id`. The effective list therefore needs a stable composite key based on source and source-local identity, not just source plus ACP `id`.
 
 ## Error Handling
 
@@ -462,6 +509,8 @@ The first cut must handle the following cases cleanly:
   - Show actionable hint, for example missing Node or Python tooling.
 - Binary download or extraction failure
   - Leave previous managed state intact when possible.
+- Binary checksum verification failure
+  - Abort install or update and do not activate the downloaded artifact.
 - Broken managed install
   - Mark `Broken` and surface reinstall or remove.
 - ACP auth failure
@@ -479,6 +528,12 @@ OrbitShell executes third-party commands and downloads external binaries in this
 - visible artifact or command source
 - install destination shown to the user
 - no silent auto-update
+- checksum verification for managed `binary` installs before activation
+
+Binary distribution rule for the first cut:
+
+- A binary artifact must provide a stable versioned URL and checksum metadata usable by OrbitShell.
+- If a binary distribution entry cannot be verified, OrbitShell marks it unavailable for managed install rather than downloading and running it blindly.
 
 This is intentionally stricter than a hidden background installer.
 
