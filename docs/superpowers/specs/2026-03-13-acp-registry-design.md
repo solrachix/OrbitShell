@@ -176,7 +176,9 @@ OrbitShell stores registry and MCP state under `%APPDATA%/orbitshell/`.
 ### Files And Directories
 
 - `%APPDATA%/orbitshell/registry/cache/registry-index.json`
-  - Last fetched registry index plus refresh metadata.
+  - Cached registry index payload.
+- `%APPDATA%/orbitshell/registry/cache/registry-meta.json`
+  - Cache metadata including `last_fetch`, `etag`, and `ttl_seconds`.
 - `%APPDATA%/orbitshell/registry/cache/manifests/<id>.json`
   - Cached, normalized manifest for each registry ACP.
 - `%APPDATA%/orbitshell/registry/state/managed-agents.json`
@@ -230,16 +232,19 @@ Each installed registry ACP should track:
 
 - `id`
 - `installed_version`
-- `catalog_version`
+- `latest_registry_version`
 - `distribution_kind`
 - `install_root`
 - `resolved_command`
 - `resolved_args`
+- `active_version`
 - `last_install_at`
 - `last_checked_at`
 - `status`
 - `auth_required`
 - `install_error`
+
+The first cut only requires update decisions against the installed version and latest registry version. It does not require full version history or user-selectable rollback UX, though the storage layout must not block that later.
 
 ### Custom Agent Entry
 
@@ -264,8 +269,8 @@ The merged catalog cannot use raw ACP `id` as its only identity, because duplica
 OrbitShell therefore needs a first-class composite identity:
 
 - `agent_key`
-  - source kind
-  - source-local stable identifier
+  - `source_type`
+  - `source_id`
   - ACP `id`
 
 The UI, actions, diagnostics, and runtime resolution must use `agent_key`, not just ACP `id`.
@@ -282,16 +287,16 @@ The first cut does not expose registry URL or refresh cadence as user-facing pre
 
 MCP entries should contain enough information to render, test, and serialize global server config. The exact fields can follow the OrbitShell runtime needs, but at minimum the model must support:
 
-- stable server identifier
-- display name
-- transport type or command type
-- command or endpoint details
-- args
-- environment overrides or secret references
-- enabled flag
-- last tested timestamp
-- last known status
-- last error summary
+- `id`
+- `name`
+- `transport`
+- `command` or `url`
+- `args`
+- `env`
+- `enabled`
+- `last_tested_at`
+- `last_status`
+- `last_error`
 
 The UI must not rely on opaque free-form JSON as its only editable representation.
 
@@ -351,6 +356,14 @@ Materialization rules:
   - OrbitShell does not vendor the Python package payload into its own install directory for the first cut; package contents remain managed by the external uv cache.
 - `binary`
   - OrbitShell downloads the artifact into the managed install directory, verifies it, and activates the resolved executable from that directory.
+
+Activation rules:
+
+- Managed installs are versioned under `installs/<id>/<version>/`.
+- The active version is chosen through managed state metadata, not a filesystem symlink.
+- Update activation must be atomic at the state-file level so OrbitShell never points at a partially installed version.
+
+This avoids symlink-specific platform friction on Windows while still allowing future rollback support.
 
 Remove semantics:
 
@@ -420,17 +433,20 @@ This remains the job of the existing `AcpClient` and `AcpTransport`. The runtime
 
 1. User opens `Settings > ACP Registry`.
 2. OrbitShell resolves the Settings tab workspace context, if any, for workspace-local custom ACP discovery.
-3. OrbitShell attempts to refresh the registry from the configured remote URL.
-4. If refresh succeeds:
-   - cache is updated
+3. OrbitShell loads the cached registry immediately, if present.
+4. Managed installs and custom agents are loaded.
+5. Effective merge is computed from cached data and rendered immediately.
+6. OrbitShell starts an asynchronous registry refresh in the background.
+7. If refresh succeeds:
+   - cache payload and metadata are updated
    - manifests are refreshed as needed
    - update availability is recomputed
-5. If refresh fails:
-   - cache is loaded instead
+   - the UI refreshes in place
+8. If refresh fails:
+   - cached content remains visible
    - UI shows cached mode and the refresh error
-6. Managed installs and custom agents are loaded.
-7. Effective merge is computed.
-8. Unified list is rendered.
+
+The page also exposes a manual `Refresh` action.
 
 ### Installing An ACP
 
@@ -528,11 +544,12 @@ OrbitShell executes third-party commands and downloads external binaries in this
 - visible artifact or command source
 - install destination shown to the user
 - no silent auto-update
-- checksum verification for managed `binary` installs before activation
+- SHA-256 checksum verification for managed `binary` installs before activation
 
 Binary distribution rule for the first cut:
 
-- A binary artifact must provide a stable versioned URL and checksum metadata usable by OrbitShell.
+- A binary artifact must provide a stable versioned URL plus `sha256` metadata usable by OrbitShell.
+- Artifact metadata should also include byte size when available, but `sha256` is the required integrity check for the first cut.
 - If a binary distribution entry cannot be verified, OrbitShell marks it unavailable for managed install rather than downloading and running it blindly.
 
 This is intentionally stricter than a hidden background installer.
@@ -608,6 +625,11 @@ These are not unresolved requirements. They are planning constraints:
 - Avoid coupling registry fetch logic directly into view rendering.
 - Avoid making the `SettingsView` own business logic that belongs in ACP or MCP state modules.
 - Keep distribution-specific install logic out of the generic registry catalog code.
+
+## Known First-Cut Tradeoffs
+
+- `npx` and `uvx` managed installs use pinned wrappers plus external package-manager caches, not vendored package payloads. This is acceptable for the first release, but it is weaker than full artifact vendoring for long-term reproducibility.
+- Runtime process isolation is unchanged in the first cut. ACPs still execute as local child processes with the current trust model. Sandboxing is a future hardening topic, not part of this release.
 
 ## Recommended First Implementation Order
 
