@@ -1,9 +1,6 @@
 use gpui::*;
+use orbitshell::ui;
 use std::borrow::Cow;
-
-mod git;
-mod terminal;
-mod ui;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
