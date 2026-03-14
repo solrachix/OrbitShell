@@ -1,7 +1,9 @@
+use orbitshell::acp::install::binary::{BinaryInstallSpec, install_binary_from_file};
 use orbitshell::acp::install::runner::{
     LaunchCommand, build_npx_launch, build_uvx_launch, remove_launch_wrapper, write_launch_wrapper,
 };
 use orbitshell::acp::install::state::{ManagedAgentState, ManagedInstalledVersion};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn npx_wrapper_pins_package_version() {
@@ -80,4 +82,92 @@ fn active_version_is_driven_by_recorded_installations() {
     let active = state.active_install().expect("active install");
     assert_eq!(active.version, "1.0.0");
     assert_eq!(active.resolved_command, "npx");
+}
+
+#[test]
+fn binary_checksum_mismatch_aborts_activation() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let artifact_path = temp.path().join("codex-acp.exe");
+    std::fs::write(&artifact_path, b"binary-payload").expect("write binary payload");
+    let mut state = ManagedAgentState {
+        id: "codex-acp".into(),
+        ..Default::default()
+    };
+
+    let result = install_binary_from_file(
+        &artifact_path,
+        temp.path().join("installs").as_path(),
+        &BinaryInstallSpec {
+            version: "1.0.0".into(),
+            sha256: "deadbeef".into(),
+            executable_path: "codex-acp.exe".into(),
+            archive_kind: None,
+        },
+        &mut state,
+    );
+
+    assert!(result.is_err());
+    assert!(result.err().unwrap().to_string().contains("checksum"));
+    assert!(state.active_version.is_none());
+}
+
+#[test]
+fn verified_binary_artifact_becomes_active_version() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let artifact_path = temp.path().join("codex-acp.exe");
+    let payload = b"binary-payload";
+    std::fs::write(&artifact_path, payload).expect("write binary payload");
+    let sha256 = format!("{:x}", Sha256::digest(payload));
+    let mut state = ManagedAgentState {
+        id: "codex-acp".into(),
+        ..Default::default()
+    };
+
+    let executable = install_binary_from_file(
+        &artifact_path,
+        temp.path().join("installs").as_path(),
+        &BinaryInstallSpec {
+            version: "1.0.0".into(),
+            sha256,
+            executable_path: "codex-acp.exe".into(),
+            archive_kind: None,
+        },
+        &mut state,
+    )
+    .expect("install verified binary");
+
+    assert!(executable.exists());
+    assert_eq!(state.active_version.as_deref(), Some("1.0.0"));
+    assert_eq!(
+        state
+            .active_install()
+            .map(|install| install.version.as_str()),
+        Some("1.0.0")
+    );
+}
+
+#[test]
+fn unsupported_or_unverifiable_binary_metadata_is_rejected() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let artifact_path = temp.path().join("codex-acp.exe");
+    std::fs::write(&artifact_path, b"binary-payload").expect("write binary payload");
+    let mut state = ManagedAgentState {
+        id: "codex-acp".into(),
+        ..Default::default()
+    };
+
+    let result = install_binary_from_file(
+        &artifact_path,
+        temp.path().join("installs").as_path(),
+        &BinaryInstallSpec {
+            version: "1.0.0".into(),
+            sha256: "".into(),
+            executable_path: "".into(),
+            archive_kind: Some("rar".into()),
+        },
+        &mut state,
+    );
+
+    assert!(result.is_err());
+    assert!(state.active_version.is_none());
 }
