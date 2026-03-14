@@ -210,10 +210,12 @@ impl RegistryFetchClient for UreqRegistryFetchClient {
 
 #[derive(Deserialize)]
 struct RemoteRegistryBody {
+    #[allow(dead_code)]
+    version: Option<String>,
     #[serde(default)]
     index: Vec<RegistryCatalogEntry>,
     #[serde(default)]
-    agents: Vec<RegistryCatalogEntry>,
+    agents: Vec<RegistryManifest>,
     #[serde(default)]
     manifests: Vec<RegistryManifest>,
     ttl_seconds: Option<u64>,
@@ -232,21 +234,43 @@ fn parse_response(response: ureq::Response) -> Result<FetchResponse> {
     let body_text = response
         .into_string()
         .context("failed to read registry index body")?;
+    Ok(FetchResponse::Snapshot(parse_registry_snapshot_json(
+        &body_text,
+        etag,
+        now_timestamp()?,
+        ttl_seconds,
+    )?))
+}
+
+pub fn parse_registry_snapshot_json(
+    body_text: &str,
+    etag: Option<String>,
+    fetched_at: i64,
+    ttl_seconds: u64,
+) -> Result<RegistrySnapshot> {
     let body: RemoteRegistryBody =
-        serde_json::from_str(&body_text).context("failed to decode registry index JSON")?;
-    let index = if body.index.is_empty() {
+        serde_json::from_str(body_text).context("failed to decode registry index JSON")?;
+    let manifests = if body.manifests.is_empty() {
         body.agents
+    } else {
+        body.manifests
+    };
+    let index = if body.index.is_empty() {
+        manifests
+            .iter()
+            .map(RegistryManifest::catalog_entry)
+            .collect()
     } else {
         body.index
     };
 
-    Ok(FetchResponse::Snapshot(RegistrySnapshot {
+    Ok(RegistrySnapshot {
         index,
-        manifests: body.manifests,
+        manifests,
         etag,
-        fetched_at: now_timestamp()?,
+        fetched_at,
         ttl_seconds: body.ttl_seconds.unwrap_or(ttl_seconds),
-    }))
+    })
 }
 
 fn cache_ttl_from_response(response: &ureq::Response) -> Option<u64> {

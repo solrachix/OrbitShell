@@ -92,18 +92,21 @@ impl AcpTransport {
         for arg in &spec.args {
             command.arg(arg);
         }
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in &spec.fixed_env {
+            command.env(key, value);
+        }
         for key in &spec.env_keys {
             if let Ok(value) = std::env::var(key) {
                 command.env(key, value);
             }
         }
-        command.spawn().with_context(|| {
-            format!(
-                "failed to spawn process for command '{}'",
-                command_name
-            )
-        })
+        command
+            .spawn()
+            .with_context(|| format!("failed to spawn process for command '{}'", command_name))
     }
 
     fn spawn_stdin_writer(mut stdin: ChildStdin, rx: Receiver<String>) {

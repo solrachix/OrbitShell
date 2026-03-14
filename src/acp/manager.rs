@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +22,8 @@ pub struct AgentSpec {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub fixed_env: BTreeMap<String, String>,
     #[serde(default)]
     pub env_keys: Vec<String>,
     #[serde(default)]
@@ -66,6 +69,7 @@ impl AgentRegistry {
                     name: "Codex ACP (local)".to_string(),
                     command: "codex-acp".to_string(),
                     args: Vec::new(),
+                    fixed_env: BTreeMap::new(),
                     env_keys: vec![
                         "OPENAI_API_KEY".to_string(),
                         "CODEX_API_KEY".to_string(),

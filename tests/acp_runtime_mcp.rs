@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use orbitshell::acp::client::session_new_params;
 use orbitshell::acp::manager::AgentSpec;
 use orbitshell::acp::resolve::{
@@ -13,6 +15,7 @@ fn agent_spec(id: &str, name: &str, command: &str) -> AgentSpec {
         name: name.into(),
         command: command.into(),
         args: Vec::new(),
+        fixed_env: BTreeMap::new(),
         env_keys: Vec::new(),
         install: None,
         auth: None,

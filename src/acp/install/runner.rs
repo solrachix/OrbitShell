@@ -9,24 +9,37 @@ pub struct LaunchCommand {
 }
 
 pub fn build_npx_launch(package: &str, version: &str) -> LaunchCommand {
+    build_npx_package_launch(&format!("{package}@{version}"), &[])
+}
+
+pub fn build_npx_package_launch(package_spec: &str, extra_args: &[String]) -> LaunchCommand {
     LaunchCommand {
         command: if cfg!(windows) {
             "npx.cmd".into()
         } else {
             "npx".into()
         },
-        args: vec!["-y".into(), format!("{package}@{version}")],
+        args: std::iter::once("-y".to_string())
+            .chain(std::iter::once(package_spec.to_string()))
+            .chain(extra_args.iter().cloned())
+            .collect(),
     }
 }
 
 pub fn build_uvx_launch(package: &str, version: &str) -> LaunchCommand {
+    build_uvx_package_launch(&format!("{package}=={version}"), &[])
+}
+
+pub fn build_uvx_package_launch(package_spec: &str, extra_args: &[String]) -> LaunchCommand {
     LaunchCommand {
         command: if cfg!(windows) {
             "uvx.exe".into()
         } else {
             "uvx".into()
         },
-        args: vec![format!("{package}=={version}")],
+        args: std::iter::once(package_spec.to_string())
+            .chain(extra_args.iter().cloned())
+            .collect(),
     }
 }
 

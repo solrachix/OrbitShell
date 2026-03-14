@@ -1,6 +1,9 @@
 use crate::mcp::config::{GlobalMcpConfig, McpServerConfig};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeMcpServer {
@@ -10,6 +13,13 @@ pub struct RuntimeMcpServer {
     pub url: Option<String>,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpProbeResult {
+    pub tested_at: i64,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 pub fn resolve_runtime_mcp_servers(config: &GlobalMcpConfig) -> Vec<RuntimeMcpServer> {
@@ -29,6 +39,73 @@ pub fn load_enabled_runtime_mcp_servers() -> Vec<RuntimeMcpServer> {
 
 pub fn runtime_mcp_servers_value(servers: &[RuntimeMcpServer]) -> Value {
     Value::Array(servers.iter().map(runtime_mcp_server_value).collect())
+}
+
+pub fn probe_server_config(config: &McpServerConfig) -> McpProbeResult {
+    let tested_at = current_timestamp();
+    let runtime = match RuntimeMcpServer::from_config(config) {
+        Some(runtime) => runtime,
+        None => {
+            return McpProbeResult {
+                tested_at,
+                status: "misconfigured".into(),
+                error: Some("transport requires command or url".into()),
+            };
+        }
+    };
+
+    match runtime.transport.as_str() {
+        "stdio" => {
+            let Some(command) = runtime.command.as_deref() else {
+                return McpProbeResult {
+                    tested_at,
+                    status: "misconfigured".into(),
+                    error: Some("stdio transport requires command".into()),
+                };
+            };
+
+            if command_exists(command) {
+                McpProbeResult {
+                    tested_at,
+                    status: "online".into(),
+                    error: None,
+                }
+            } else {
+                McpProbeResult {
+                    tested_at,
+                    status: "offline".into(),
+                    error: Some(format!("command '{command}' not found")),
+                }
+            }
+        }
+        "http" | "sse" => {
+            let Some(url) = runtime.url.as_deref() else {
+                return McpProbeResult {
+                    tested_at,
+                    status: "misconfigured".into(),
+                    error: Some("http/sse transport requires url".into()),
+                };
+            };
+
+            match ureq::get(url).call() {
+                Ok(_) | Err(ureq::Error::Status(_, _)) => McpProbeResult {
+                    tested_at,
+                    status: "online".into(),
+                    error: None,
+                },
+                Err(err) => McpProbeResult {
+                    tested_at,
+                    status: "offline".into(),
+                    error: Some(err.to_string()),
+                },
+            }
+        }
+        _ => McpProbeResult {
+            tested_at,
+            status: "misconfigured".into(),
+            error: Some(format!("unsupported transport '{}'", runtime.transport)),
+        },
+    }
 }
 
 impl RuntimeMcpServer {
@@ -61,4 +138,45 @@ fn runtime_mcp_server_value(server: &RuntimeMcpServer) -> Value {
         "args": server.args,
         "env": server.env,
     })
+}
+
+fn current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn command_exists(command: &str) -> bool {
+    let probe = if cfg!(windows) { "where" } else { "which" };
+    for candidate in resolve_command_candidates(command) {
+        if Command::new(probe)
+            .arg(&candidate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_command_candidates(command: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![command.to_string()];
+    }
+
+    let path = Path::new(command);
+    if path.extension().is_some() {
+        return vec![command.to_string()];
+    }
+
+    vec![
+        command.to_string(),
+        format!("{command}.cmd"),
+        format!("{command}.exe"),
+    ]
 }

@@ -1,9 +1,15 @@
 use orbitshell::acp::install::state::ManagedAgentState;
 use orbitshell::acp::manager::AgentSpec;
-use orbitshell::acp::resolve::{
-    AgentCandidate, AgentKey, AgentSourceKind, ConflictPolicy, list_alternate_sources,
-    resolve_agent, resolve_effective_agents,
+use orbitshell::acp::registry::fetch::CachedRegistryData;
+use orbitshell::acp::registry::model::{
+    RegistryCatalogEntry, RegistryDistribution, RegistryManifest, RegistryPackageDistribution,
 };
+use orbitshell::acp::resolve::{
+    AgentCandidate, AgentKey, AgentSourceKind, CatalogFilter, CatalogInstallStatus, ConflictPolicy,
+    build_catalog_rows, filter_catalog_rows, list_alternate_sources, resolve_agent,
+    resolve_effective_agents,
+};
+use std::collections::BTreeMap;
 
 fn agent_spec(id: &str, name: &str, command: &str) -> AgentSpec {
     AgentSpec {
@@ -11,6 +17,7 @@ fn agent_spec(id: &str, name: &str, command: &str) -> AgentSpec {
         name: name.into(),
         command: command.into(),
         args: Vec::new(),
+        fixed_env: BTreeMap::new(),
         env_keys: Vec::new(),
         install: None,
         auth: None,
@@ -42,6 +49,37 @@ fn managed_candidate(source_id: &str, spec: AgentSpec, installed_version: &str) 
             installed_version: Some(installed_version.into()),
             ..Default::default()
         }),
+    }
+}
+
+fn registry_entry(id: &str, name: &str, version: &str, description: &str) -> RegistryCatalogEntry {
+    RegistryCatalogEntry {
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+        version: version.into(),
+    }
+}
+
+fn registry_manifest(id: &str, name: &str, version: &str, description: &str) -> RegistryManifest {
+    RegistryManifest {
+        id: id.into(),
+        name: name.into(),
+        version: version.into(),
+        description: description.into(),
+        repository: None,
+        authors: Vec::new(),
+        license: None,
+        icon: None,
+        distribution: RegistryDistribution {
+            npx: Some(RegistryPackageDistribution {
+                package: format!("{id}@{version}"),
+                args: vec!["--acp".into()],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary: BTreeMap::new(),
+        },
     }
 }
 
@@ -150,4 +188,150 @@ fn local_wins_prefers_workspace_custom_over_registry_managed() {
     let alternate = &list_alternate_sources(&rows, "codex")[0];
     let alternate_spec = resolve_agent(&rows, &alternate.agent_key).unwrap();
     assert_eq!(alternate_spec.command, "codex-acp");
+}
+
+#[test]
+fn installed_filter_keeps_managed_registry_agents() {
+    let rows = resolve_effective_agents(
+        vec![managed_candidate(
+            "official",
+            agent_spec("codex-acp", "Codex CLI", "codex-acp"),
+            "0.10.0",
+        )],
+        ConflictPolicy::LocalWins,
+    );
+    let cached = CachedRegistryData {
+        index: vec![registry_entry(
+            "codex-acp",
+            "Codex CLI",
+            "0.10.0",
+            "ACP adapter for OpenAI",
+        )],
+        meta: None,
+        manifests: BTreeMap::from([(
+            "codex-acp".into(),
+            registry_manifest("codex-acp", "Codex CLI", "0.10.0", "ACP adapter for OpenAI"),
+        )]),
+    };
+
+    let catalog = build_catalog_rows(Some(&cached), &rows);
+    let filtered = filter_catalog_rows(&catalog, CatalogFilter::Installed, "");
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].acp_id, "codex-acp");
+    assert_eq!(filtered[0].install_status, CatalogInstallStatus::Installed);
+}
+
+#[test]
+fn not_installed_filter_keeps_registry_only_agents() {
+    let cached = CachedRegistryData {
+        index: vec![registry_entry(
+            "amp-acp",
+            "Amp",
+            "0.7.0",
+            "ACP wrapper for Amp",
+        )],
+        meta: None,
+        manifests: BTreeMap::from([(
+            "amp-acp".into(),
+            registry_manifest("amp-acp", "Amp", "0.7.0", "ACP wrapper for Amp"),
+        )]),
+    };
+
+    let catalog = build_catalog_rows(Some(&cached), &[]);
+    let filtered = filter_catalog_rows(&catalog, CatalogFilter::NotInstalled, "");
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].acp_id, "amp-acp");
+    assert_eq!(
+        filtered[0].install_status,
+        CatalogInstallStatus::NotInstalled
+    );
+}
+
+#[test]
+fn update_available_filter_keeps_registry_agents_with_newer_versions() {
+    let rows = resolve_effective_agents(
+        vec![AgentCandidate {
+            agent_key: AgentKey {
+                source_type: AgentSourceKind::Registry,
+                source_id: "official".into(),
+                acp_id: "codex-acp".into(),
+            },
+            spec: agent_spec("codex-acp", "Codex CLI", "codex-acp"),
+            managed_state: Some(ManagedAgentState {
+                id: "codex-acp".into(),
+                installed_version: Some("0.9.0".into()),
+                latest_registry_version: Some("0.10.0".into()),
+                update_available: true,
+                ..Default::default()
+            }),
+        }],
+        ConflictPolicy::LocalWins,
+    );
+    let cached = CachedRegistryData {
+        index: vec![registry_entry(
+            "codex-acp",
+            "Codex CLI",
+            "0.10.0",
+            "ACP adapter for OpenAI",
+        )],
+        meta: None,
+        manifests: BTreeMap::from([(
+            "codex-acp".into(),
+            registry_manifest("codex-acp", "Codex CLI", "0.10.0", "ACP adapter for OpenAI"),
+        )]),
+    };
+
+    let catalog = build_catalog_rows(Some(&cached), &rows);
+    let filtered = filter_catalog_rows(&catalog, CatalogFilter::UpdateAvailable, "");
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].acp_id, "codex-acp");
+    assert_eq!(
+        filtered[0].install_status,
+        CatalogInstallStatus::UpdateAvailable
+    );
+}
+
+#[test]
+fn catalog_rows_keep_other_sources_for_disclosure() {
+    let rows = resolve_effective_agents(
+        vec![
+            managed_candidate(
+                "official",
+                agent_spec("codex-acp", "Codex CLI", "codex-acp"),
+                "0.10.0",
+            ),
+            candidate(
+                AgentSourceKind::WorkspaceCustom,
+                "workspace",
+                agent_spec("codex-acp", "Codex Workspace", "codex-local"),
+            ),
+        ],
+        ConflictPolicy::LocalWins,
+    );
+    let cached = CachedRegistryData {
+        index: vec![registry_entry(
+            "codex-acp",
+            "Codex CLI",
+            "0.10.0",
+            "ACP adapter for OpenAI",
+        )],
+        meta: None,
+        manifests: BTreeMap::from([(
+            "codex-acp".into(),
+            registry_manifest("codex-acp", "Codex CLI", "0.10.0", "ACP adapter for OpenAI"),
+        )]),
+    };
+
+    let catalog = build_catalog_rows(Some(&cached), &rows);
+
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].acp_id, "codex-acp");
+    assert_eq!(catalog[0].other_sources.len(), 1);
+    assert_eq!(
+        catalog[0].other_sources[0].agent_key.source_type,
+        AgentSourceKind::Registry
+    );
 }

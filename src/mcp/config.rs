@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::acp::storage;
+use crate::mcp::probe::McpProbeResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -49,5 +50,30 @@ impl GlobalMcpConfig {
 
     pub fn enabled_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
         self.servers.iter().filter(|server| server.enabled)
+    }
+
+    pub fn upsert_server(&mut self, server: McpServerConfig) {
+        if let Some(existing) = self.servers.iter_mut().find(|item| item.id == server.id) {
+            *existing = server;
+        } else {
+            self.servers.push(server);
+        }
+    }
+
+    pub fn remove_server(&mut self, id: &str) -> bool {
+        let original_len = self.servers.len();
+        self.servers.retain(|server| server.id != id);
+        self.servers.len() != original_len
+    }
+
+    pub fn apply_probe_result(&mut self, id: &str, result: &McpProbeResult) -> bool {
+        let Some(server) = self.servers.iter_mut().find(|server| server.id == id) else {
+            return false;
+        };
+
+        server.last_tested_at = Some(result.tested_at);
+        server.last_status = Some(result.status.clone());
+        server.last_error = result.error.clone();
+        true
     }
 }

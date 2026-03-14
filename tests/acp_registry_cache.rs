@@ -2,11 +2,13 @@ use anyhow::{Result, anyhow};
 use orbitshell::acp::install::state::{ManagedAgentState, ManagedAgentsStateFile};
 use orbitshell::acp::registry::fetch::{
     FetchResponse, RegistryFetchClient, RegistrySnapshot, detect_available_updates,
-    load_cached_registry, load_then_refresh,
+    load_cached_registry, load_then_refresh, parse_registry_snapshot_json,
 };
 use orbitshell::acp::registry::model::{
     RegistryCacheMeta, RegistryCatalogEntry, RegistryDistribution, RegistryManifest,
+    RegistryPackageDistribution,
 };
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn temp_app_root() -> PathBuf {
@@ -46,16 +48,18 @@ fn manifest_with_version(version: &str) -> RegistryManifest {
         name: "Codex CLI".into(),
         description: "OpenAI ACP adapter".into(),
         version: version.into(),
-        command: "codex-acp".into(),
-        args: vec!["--stdio".into()],
-        env_keys: vec!["OPENAI_API_KEY".into()],
+        repository: Some("https://github.com/zed-industries/codex-acp".into()),
+        authors: vec!["OpenAI".into()],
+        license: Some("Apache-2.0".into()),
+        icon: Some("https://cdn.agentclientprotocol.com/registry/v1/latest/codex-acp.svg".into()),
         distribution: RegistryDistribution {
-            kind: "npx".into(),
-            package: Some("@zed-industries/codex-acp".into()),
-            executable: Some("codex-acp".into()),
-            url: None,
-            sha256: None,
-            archive_kind: None,
+            npx: Some(RegistryPackageDistribution {
+                package: format!("@zed-industries/codex-acp@{version}"),
+                args: vec!["--acp".into()],
+                env: BTreeMap::new(),
+            }),
+            uvx: None,
+            binary: BTreeMap::new(),
         },
     }
 }
@@ -252,4 +256,47 @@ fn refresh_marks_update_available_when_registry_version_is_newer() {
     assert_eq!(state.latest_registry_version.as_deref(), Some("1.0.0"));
     assert_eq!(state.last_checked_at, Some(1234));
     assert!(state.update_available);
+}
+
+#[test]
+fn parse_registry_snapshot_json_supports_official_agents_array_shape() {
+    let raw = r#"
+    {
+      "version": "1.0.0",
+      "agents": [
+        {
+          "id": "codex-acp",
+          "name": "Codex CLI",
+          "version": "0.10.0",
+          "description": "ACP adapter for OpenAI's coding assistant",
+          "repository": "https://github.com/zed-industries/codex-acp",
+          "authors": ["OpenAI"],
+          "license": "Apache-2.0",
+          "icon": "https://cdn.agentclientprotocol.com/registry/v1/latest/codex-acp.svg",
+          "distribution": {
+            "npx": {
+              "package": "@zed-industries/codex-acp@0.10.0",
+              "args": ["--acp"]
+            }
+          }
+        }
+      ]
+    }
+    "#;
+
+    let snapshot = parse_registry_snapshot_json(raw, Some("etag-1".into()), 99, 3600)
+        .expect("parse official registry payload");
+
+    assert_eq!(snapshot.index.len(), 1);
+    assert_eq!(snapshot.manifests.len(), 1);
+    assert_eq!(snapshot.index[0].id, "codex-acp");
+    assert_eq!(snapshot.index[0].version, "0.10.0");
+    assert_eq!(
+        snapshot.manifests[0]
+            .distribution
+            .npx
+            .as_ref()
+            .map(|dist| dist.package.as_str()),
+        Some("@zed-industries/codex-acp@0.10.0")
+    );
 }

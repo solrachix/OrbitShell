@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -15,6 +16,7 @@ pub struct BinaryInstallSpec {
     pub sha256: String,
     pub executable_path: PathBuf,
     pub archive_kind: Option<String>,
+    pub args: Vec<String>,
 }
 
 pub fn download_binary_artifact(url: &str) -> Result<Vec<u8>> {
@@ -62,6 +64,7 @@ pub fn install_binary_from_file(
         Some("zip") => extract_zip(&artifact_bytes, &version_root)?,
         Some("tar") => extract_tar(Cursor::new(&artifact_bytes), &version_root)?,
         Some("tar.gz") => extract_tar_gz(&artifact_bytes, &version_root)?,
+        Some("tar.bz2") => extract_tar_bz2(&artifact_bytes, &version_root)?,
         Some(other) => bail!("unsupported archive kind '{other}'"),
     }
 
@@ -78,12 +81,12 @@ pub fn install_binary_from_file(
         version: spec.version.clone(),
         install_root: version_root.clone(),
         resolved_command: resolved_command.clone(),
-        resolved_args: Vec::new(),
+        resolved_args: spec.args.clone(),
     });
     state.set_active_version(&spec.version);
     state.install_root = Some(version_root);
     state.resolved_command = Some(resolved_command);
-    state.resolved_args.clear();
+    state.resolved_args = spec.args.clone();
 
     Ok(executable_path)
 }
@@ -97,7 +100,7 @@ fn validate_binary_spec(spec: &BinaryInstallSpec) -> Result<()> {
     }
     if let Some(kind) = spec.archive_kind.as_deref() {
         match kind {
-            "zip" | "tar" | "tar.gz" => {}
+            "zip" | "tar" | "tar.gz" | "tar.bz2" => {}
             other => bail!("unsupported archive kind '{other}'"),
         }
     }
@@ -152,5 +155,10 @@ fn extract_tar<R: Read>(reader: R, output_dir: &Path) -> Result<()> {
 
 fn extract_tar_gz(bytes: &[u8], output_dir: &Path) -> Result<()> {
     let decoder = GzDecoder::new(Cursor::new(bytes));
+    extract_tar(decoder, output_dir)
+}
+
+fn extract_tar_bz2(bytes: &[u8], output_dir: &Path) -> Result<()> {
+    let decoder = BzDecoder::new(Cursor::new(bytes));
     extract_tar(decoder, output_dir)
 }
