@@ -1,5 +1,10 @@
 use crate::acp::install::state::ManagedAgentState;
+use crate::acp::install::state::ManagedAgentsStateFile;
+use crate::acp::manager::AgentRegistry;
 use crate::acp::manager::AgentSpec;
+use crate::acp::registry::cache;
+use crate::acp::storage;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -98,6 +103,48 @@ pub fn resolve_agent(rows: &[EffectiveAgentRow], agent_key: &AgentKey) -> Option
     rows.iter()
         .find(|row| row.agent_key == *agent_key)
         .map(|row| row.spec.clone())
+}
+
+pub fn load_effective_agent_rows(policy: ConflictPolicy) -> Result<Vec<EffectiveAgentRow>> {
+    let mut candidates = load_managed_candidates()?;
+    candidates.extend(AgentRegistry::load_global_custom_candidates()?);
+    candidates.extend(AgentRegistry::load_workspace_custom_candidates()?);
+    Ok(resolve_effective_agents(candidates, policy))
+}
+
+fn load_managed_candidates() -> Result<Vec<AgentCandidate>> {
+    let app_root = storage::app_root()?;
+    let managed = ManagedAgentsStateFile::load_default()?;
+    let mut candidates = Vec::new();
+
+    for state in managed.agents {
+        let Some(active_install) = state.active_install().cloned() else {
+            continue;
+        };
+        let Some(manifest) = cache::load_registry_manifest(&app_root, &state.id)? else {
+            continue;
+        };
+        let spec = AgentSpec {
+            id: manifest.id.clone(),
+            name: manifest.name.clone(),
+            command: active_install.resolved_command.clone(),
+            args: active_install.resolved_args.clone(),
+            env_keys: manifest.env_keys.clone(),
+            install: None,
+            auth: None,
+        };
+        candidates.push(AgentCandidate {
+            agent_key: AgentKey {
+                source_type: AgentSourceKind::Registry,
+                source_id: "managed".into(),
+                acp_id: manifest.id,
+            },
+            spec,
+            managed_state: Some(state),
+        });
+    }
+
+    Ok(candidates)
 }
 
 fn candidate_rank(source_type: AgentSourceKind, policy: ConflictPolicy) -> u8 {

@@ -1,5 +1,6 @@
 use crate::acp::manager::AgentSpec;
 use crate::acp::transport::AcpTransport;
+use crate::mcp::probe::{RuntimeMcpServer, runtime_mcp_servers_value};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -43,9 +44,9 @@ impl AcpClient {
             }
         });
         let mut noop = |_method: &str, _params: &Value| {};
-        let result = self
-            .transport
-            .request("initialize", params, DEFAULT_TIMEOUT, Some(&mut noop))?;
+        let result =
+            self.transport
+                .request("initialize", params, DEFAULT_TIMEOUT, Some(&mut noop))?;
         self.protocol_version = result
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -55,22 +56,21 @@ impl AcpClient {
         Ok(())
     }
 
-    pub fn ensure_session(&mut self, cwd: &str) -> Result<String> {
+    pub fn ensure_session(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[RuntimeMcpServer],
+    ) -> Result<String> {
         if let Some(session_id) = self.session_id.clone() {
             return Ok(session_id);
         }
         let mut noop = |_method: &str, _params: &Value| {};
-        let result = self
-            .transport
-            .request(
-                "session/new",
-                json!({
-                    "cwd": cwd,
-                    "mcpServers": []
-                }),
-                DEFAULT_TIMEOUT,
-                Some(&mut noop),
-            )?;
+        let result = self.transport.request(
+            "session/new",
+            session_new_params(cwd, mcp_servers),
+            DEFAULT_TIMEOUT,
+            Some(&mut noop),
+        )?;
         let session_id = result
             .get("sessionId")
             .and_then(Value::as_str)
@@ -127,6 +127,13 @@ impl AcpClient {
         self.transport
             .notify("session/cancel", json!({ "sessionId": session_id }))
     }
+}
+
+pub fn session_new_params(cwd: &str, mcp_servers: &[RuntimeMcpServer]) -> Value {
+    json!({
+        "cwd": cwd,
+        "mcpServers": runtime_mcp_servers_value(mcp_servers),
+    })
 }
 
 fn extract_update_text(params: &Value) -> Option<(String, bool)> {

@@ -1,5 +1,6 @@
 use crate::acp::client::AcpClient;
-use crate::acp::manager::{AgentCommandSpec, AgentRegistry, AgentSpec};
+use crate::acp::manager::{AgentCommandSpec, AgentSpec};
+use crate::acp::resolve::{AgentKey, ConflictPolicy, EffectiveAgentRow, load_effective_agent_rows};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::*;
@@ -8,10 +9,10 @@ use std::thread;
 
 pub struct AgentView {
     focus_handle: FocusHandle,
-    registry: AgentRegistry,
-    selected_agent: usize,
+    agent_rows: Vec<EffectiveAgentRow>,
+    selected_agent_key: Option<AgentKey>,
     client: Option<Arc<Mutex<AcpClient>>>,
-    client_agent_id: Option<String>,
+    client_agent_key: Option<AgentKey>,
     input: String,
     cursor: usize,
     lines: Vec<String>,
@@ -27,23 +28,27 @@ enum AgentStreamEvent {
 impl AgentView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut lines = Vec::new();
-        let registry = match AgentRegistry::load_default() {
+        let agent_rows = match load_effective_agent_rows(ConflictPolicy::LocalWins) {
             Ok(value) => value,
             Err(err) => {
-                lines.push(format!("[agent] failed to load agents.json: {err}"));
-                AgentRegistry::default()
+                lines.push(format!(
+                    "[agent] failed to load effective ACP agents: {err}"
+                ));
+                Vec::new()
             }
         };
-        if registry.agents.is_empty() {
-            lines.push("[agent] no configured agents. create `agents.json` to add one.".to_string());
+        if agent_rows.is_empty() {
+            lines
+                .push("[agent] no configured agents. create `agents.json` to add one.".to_string());
         }
+        let selected_agent_key = agent_rows.first().map(|row| row.agent_key.clone());
 
         Self {
             focus_handle: cx.focus_handle(),
-            registry,
-            selected_agent: 0,
+            agent_rows,
+            selected_agent_key,
             client: None,
-            client_agent_id: None,
+            client_agent_key: None,
             input: String::new(),
             cursor: 0,
             lines,
@@ -52,11 +57,41 @@ impl AgentView {
         }
     }
 
+    fn active_agent_row(&self) -> Option<&EffectiveAgentRow> {
+        let selected_key = self.selected_agent_key.as_ref()?;
+        self.agent_rows
+            .iter()
+            .find(|row| row.agent_key == *selected_key)
+            .or_else(|| self.agent_rows.first())
+    }
+
     fn active_agent(&self) -> Option<&AgentSpec> {
-        self.registry.agents.get(self.selected_agent)
+        self.active_agent_row().map(|row| &row.spec)
+    }
+
+    fn active_agent_index(&self) -> Option<usize> {
+        let selected_key = self.selected_agent_key.as_ref()?;
+        self.agent_rows
+            .iter()
+            .position(|row| row.agent_key == *selected_key)
+            .or(if self.agent_rows.is_empty() {
+                None
+            } else {
+                Some(0)
+            })
+    }
+
+    fn select_agent_index(&mut self, index: usize) {
+        self.selected_agent_key = self.agent_rows.get(index).map(|row| row.agent_key.clone());
+        self.client = None;
+        self.client_agent_key = None;
     }
 
     fn ensure_client(&mut self) -> Result<Arc<Mutex<AcpClient>>, String> {
+        let active_key = self
+            .active_agent_row()
+            .map(|row| row.agent_key.clone())
+            .ok_or_else(|| "no ACP agent configured".to_string())?;
         let agent = self
             .active_agent()
             .cloned()
@@ -70,9 +105,9 @@ impl AgentView {
 
         let should_recreate = self.client.is_none()
             || self
-                .client_agent_id
+                .client_agent_key
                 .as_ref()
-                .map(|id| id != &agent.id)
+                .map(|id| id != &active_key)
                 .unwrap_or(true);
         if should_recreate {
             let client = AcpClient::connect(&agent).map_err(|err| {
@@ -82,7 +117,7 @@ impl AgentView {
                 )
             })?;
             self.client = Some(Arc::new(Mutex::new(client)));
-            self.client_agent_id = Some(agent.id.clone());
+            self.client_agent_key = Some(active_key);
         }
 
         self.client
@@ -136,7 +171,12 @@ impl AgentView {
         format!("program '{command}' not found in PATH")
     }
 
-    fn run_agent_command(&mut self, cmd: AgentCommandSpec, label: &'static str, cx: &mut Context<Self>) {
+    fn run_agent_command(
+        &mut self,
+        cmd: AgentCommandSpec,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         if self.action_busy || self.busy {
             self.append_line("[agent] another action is already running.");
             cx.notify();
@@ -161,7 +201,8 @@ impl AgentView {
                     .spawn()
                 {
                     Ok(child) => {
-                        let _ = tx.unbounded_send(format!("[{label}] resolved command: {candidate}"));
+                        let _ =
+                            tx.unbounded_send(format!("[{label}] resolved command: {candidate}"));
                         child_opt = Some(child);
                         break;
                     }
@@ -223,8 +264,11 @@ impl AgentView {
                 }
                 let _ = view.update(&mut cx, |view, cx| {
                     view.action_busy = false;
-                    if let Ok(registry) = AgentRegistry::load_default() {
-                        view.registry = registry;
+                    view.agent_rows =
+                        load_effective_agent_rows(ConflictPolicy::LocalWins).unwrap_or_default();
+                    if view.selected_agent_key.is_none() {
+                        view.selected_agent_key =
+                            view.agent_rows.first().map(|row| row.agent_key.clone());
                     }
                     cx.notify();
                 });
@@ -314,7 +358,9 @@ impl AgentView {
         let (tx, mut rx) = mpsc::unbounded::<AgentStreamEvent>();
         thread::spawn(move || {
             let result = (|| -> Result<Option<String>, String> {
-                let mut guard = client.lock().map_err(|_| "ACP client lock poisoned".to_string())?;
+                let mut guard = client
+                    .lock()
+                    .map_err(|_| "ACP client lock poisoned".to_string())?;
                 if guard.protocol_version.is_none() {
                     guard.initialize().map_err(|err| err.to_string())?;
                 }
@@ -322,7 +368,10 @@ impl AgentView {
                     .map_err(|err| err.to_string())?
                     .to_string_lossy()
                     .to_string();
-                let session_id = guard.ensure_session(&cwd).map_err(|err| err.to_string())?;
+                let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
+                let session_id = guard
+                    .ensure_session(&cwd, &runtime_mcp)
+                    .map_err(|err| err.to_string())?;
                 let mut on_update = |text: String, append: bool| {
                     let _ = tx.unbounded_send(AgentStreamEvent::Update { text, append });
                 };
@@ -459,16 +508,14 @@ impl AgentView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.registry.agents.is_empty() {
+        if self.agent_rows.is_empty() {
             return;
         }
-        if self.selected_agent == 0 {
-            self.selected_agent = self.registry.agents.len().saturating_sub(1);
-        } else {
-            self.selected_agent -= 1;
-        }
-        self.client = None;
-        self.client_agent_id = None;
+        let next_index = match self.active_agent_index() {
+            Some(0) | None => self.agent_rows.len().saturating_sub(1),
+            Some(index) => index.saturating_sub(1),
+        };
+        self.select_agent_index(next_index);
         cx.notify();
     }
 
@@ -478,12 +525,14 @@ impl AgentView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.registry.agents.is_empty() {
+        if self.agent_rows.is_empty() {
             return;
         }
-        self.selected_agent = (self.selected_agent + 1) % self.registry.agents.len();
-        self.client = None;
-        self.client_agent_id = None;
+        let next_index = match self.active_agent_index() {
+            Some(index) => (index + 1) % self.agent_rows.len(),
+            None => 0,
+        };
+        self.select_agent_index(next_index);
         cx.notify();
     }
 }
@@ -497,9 +546,18 @@ impl Render for AgentView {
             .as_ref()
             .map(|agent| format!("Agent: {}", agent.name))
             .unwrap_or_else(|| "Agent: none".to_string());
-        let available = active.as_ref().map(|agent| agent.is_available()).unwrap_or(false);
-        let has_install = active.as_ref().and_then(|agent| agent.install.as_ref()).is_some();
-        let has_auth = active.as_ref().and_then(|agent| agent.auth.as_ref()).is_some();
+        let available = active
+            .as_ref()
+            .map(|agent| agent.is_available())
+            .unwrap_or(false);
+        let has_install = active
+            .as_ref()
+            .and_then(|agent| agent.install.as_ref())
+            .is_some();
+        let has_auth = active
+            .as_ref()
+            .and_then(|agent| agent.auth.as_ref())
+            .is_some();
 
         div()
             .track_focus(&self.focus_handle)
@@ -563,14 +621,22 @@ impl Render for AgentView {
                             } else {
                                 rgb(0x4a2b24)
                             })
-                            .bg(if available { rgb(0x122016) } else { rgb(0x201612) })
+                            .bg(if available {
+                                rgb(0x122016)
+                            } else {
+                                rgb(0x201612)
+                            })
                             .text_size(px(11.0))
                             .text_color(if available {
                                 rgb(0x8bd06f)
                             } else {
                                 rgb(0xffb366)
                             })
-                            .child(if available { "Installed" } else { "Not installed" }),
+                            .child(if available {
+                                "Installed"
+                            } else {
+                                "Not installed"
+                            }),
                     )
                     .child(if !available && has_install {
                         div()
@@ -628,56 +694,46 @@ impl Render for AgentView {
                     }),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .p(px(12.0))
-                    .child(
-                        div().flex_col().gap(px(6.0)).children(self.lines.iter().map(|line| {
+                div().flex_1().min_h(px(0.0)).p(px(12.0)).child(
+                    div()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .children(self.lines.iter().map(|line| {
                             div()
                                 .text_size(px(12.5))
                                 .font_family("Cascadia Code")
                                 .text_color(rgb(0xc9c9c9))
                                 .child(line.clone())
                         })),
-                    ),
+                ),
             )
             .child(
-                div()
-                    .flex_none()
-                    .px(px(12.0))
-                    .pb(px(12.0))
-                    .child(
-                        div()
-                            .h(px(38.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(0x111111))
-                            .border_1()
-                            .border_color(rgb(0x2a2a2a))
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .font_family("Cascadia Code")
-                            .text_size(px(13.0))
-                            .child(
-                                div()
-                                    .text_color(rgb(0x5d8cff))
-                                    .mr(px(8.0))
-                                    .child(">"),
-                            )
-                            .child(if self.input.is_empty() {
-                                div()
-                                    .text_color(rgb(0x5f5f5f))
-                                    .child("Digite um prompt e Enter para enviar")
-                            } else {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .child(div().text_color(rgb(0xe9e9e9)).child(left))
-                                    .child(div().w(px(2.0)).h(px(16.0)).bg(rgb(0x6b9eff)))
-                                    .child(div().text_color(rgb(0xe9e9e9)).child(right))
-                            }),
-                    ),
+                div().flex_none().px(px(12.0)).pb(px(12.0)).child(
+                    div()
+                        .h(px(38.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(0x111111))
+                        .border_1()
+                        .border_color(rgb(0x2a2a2a))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .font_family("Cascadia Code")
+                        .text_size(px(13.0))
+                        .child(div().text_color(rgb(0x5d8cff)).mr(px(8.0)).child(">"))
+                        .child(if self.input.is_empty() {
+                            div()
+                                .text_color(rgb(0x5f5f5f))
+                                .child("Digite um prompt e Enter para enviar")
+                        } else {
+                            div()
+                                .flex()
+                                .items_center()
+                                .child(div().text_color(rgb(0xe9e9e9)).child(left))
+                                .child(div().w(px(2.0)).h(px(16.0)).bg(rgb(0x6b9eff)))
+                                .child(div().text_color(rgb(0xe9e9e9)).child(right))
+                        }),
+                ),
             )
     }
 }

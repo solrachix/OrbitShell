@@ -365,7 +365,8 @@ impl SettingsView {
         } else {
             format!("{command} {}", args.join(" "))
         };
-        self.agent_action_lines.push(format!("[{label}] $ {rendered}"));
+        self.agent_action_lines
+            .push(format!("[{label}] $ {rendered}"));
 
         let (tx, mut rx) = mpsc::unbounded::<String>();
         thread::spawn(move || {
@@ -470,8 +471,10 @@ impl SettingsView {
             return;
         };
         let Some(install) = agent.install else {
-            self.agent_action_lines
-                .push(format!("[install] agent '{}' has no install command", agent.name));
+            self.agent_action_lines.push(format!(
+                "[install] agent '{}' has no install command",
+                agent.name
+            ));
             cx.notify();
             return;
         };
@@ -504,8 +507,11 @@ impl SettingsView {
         }
 
         self.agent_action_busy = true;
-        self.agent_action_lines
-            .push(format!("[test] ACP handshake for '{}' ({})", agent.name, agent.display_command()));
+        self.agent_action_lines.push(format!(
+            "[test] ACP handshake for '{}' ({})",
+            agent.name,
+            agent.display_command()
+        ));
 
         let (tx, mut rx) = mpsc::unbounded::<String>();
         thread::spawn(move || {
@@ -548,9 +554,11 @@ impl SettingsView {
                 }
             };
 
-            match client.ensure_session(&cwd) {
+            let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
+            match client.ensure_session(&cwd, &runtime_mcp) {
                 Ok(session_id) => {
-                    let _ = tx.unbounded_send(format!("[test] session/new OK (sessionId={session_id})"));
+                    let _ = tx
+                        .unbounded_send(format!("[test] session/new OK (sessionId={session_id})"));
                     let _ = tx.unbounded_send("[done] test finished successfully".to_string());
                 }
                 Err(err) => {
@@ -609,7 +617,11 @@ impl SettingsView {
             } else {
                 rgb(0xffb366)
             })
-            .child(if available { "Installed" } else { "Not installed" })
+            .child(if available {
+                "Installed"
+            } else {
+                "Not installed"
+            })
     }
 
     fn render_action_button(&self, label: &'static str) -> Div {
@@ -1109,105 +1121,129 @@ impl SettingsView {
                                 installed_count
                             )),
                     )
-                    .child(div().flex().flex_col().gap(px(8.0)).children(
-                        self.agent_registry.agents.iter().enumerate().map(|(index, agent)| {
-                            let available = agent.is_available();
-                            let can_install = agent.install.is_some() && !available;
-                            let can_auth = agent.auth.is_some();
-                            let install_handle = cx.entity().downgrade();
-                            let auth_handle = cx.entity().downgrade();
-                            let test_handle = cx.entity().downgrade();
+                    .child(
+                        div().flex().flex_col().gap(px(8.0)).children(
+                            self.agent_registry
+                                .agents
+                                .iter()
+                                .enumerate()
+                                .map(|(index, agent)| {
+                                    let available = agent.is_available();
+                                    let can_install = agent.install.is_some() && !available;
+                                    let can_auth = agent.auth.is_some();
+                                    let install_handle = cx.entity().downgrade();
+                                    let auth_handle = cx.entity().downgrade();
+                                    let test_handle = cx.entity().downgrade();
 
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px(px(10.0))
-                                .py(px(8.0))
-                                .rounded(px(8.0))
-                                .bg(rgb(0x101010))
-                                .border_1()
-                                .border_color(rgb(0x1f1f1f))
-                                .child(
                                     div()
                                         .flex()
-                                        .flex_col()
-                                        .gap(px(2.0))
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(10.0))
+                                        .py(px(8.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(0x101010))
+                                        .border_1()
+                                        .border_color(rgb(0x1f1f1f))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(2.0))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(8.0))
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .text_size(px(12.0))
+                                                                .text_color(rgb(0xd0d0d0))
+                                                                .truncate()
+                                                                .child(format!(
+                                                                    "{} ({})",
+                                                                    agent.name, agent.id
+                                                                )),
+                                                        )
+                                                        .child(self.render_agent_badge(agent)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(0x8a8a8a))
+                                                        .font_family("Cascadia Code")
+                                                        .truncate()
+                                                        .child(agent.display_command()),
+                                                ),
+                                        )
                                         .child(
                                             div()
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(8.0))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .text_size(px(12.0))
-                                                .text_color(rgb(0xd0d0d0))
-                                                .truncate()
-                                                .child(format!(
-                                                    "{} ({})",
-                                                    agent.name, agent.id
-                                                )),
+                                                .child(if can_install {
+                                                    self.render_action_button("Install")
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            move |_e, _w, cx| {
+                                                                cx.stop_propagation();
+                                                                let _ = install_handle.update(
+                                                                    cx,
+                                                                    |view, cx| {
+                                                                        view.on_install_agent(
+                                                                            index, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        )
+                                                } else {
+                                                    div()
+                                                })
+                                                .child(if can_auth {
+                                                    self.render_action_button("Authenticate")
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            move |_e, _w, cx| {
+                                                                cx.stop_propagation();
+                                                                let _ = auth_handle.update(
+                                                                    cx,
+                                                                    |view, cx| {
+                                                                        view.on_auth_agent(
+                                                                            index, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        )
+                                                } else {
+                                                    div()
+                                                })
+                                                .child(
+                                                    self.render_action_button("Test")
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            move |_e, _w, cx| {
+                                                                cx.stop_propagation();
+                                                                let _ = test_handle.update(
+                                                                    cx,
+                                                                    |view, cx| {
+                                                                        view.on_test_agent(
+                                                                            index, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        ),
+                                                ),
                                         )
-                                                .child(self.render_agent_badge(agent)),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(0x8a8a8a))
-                                                .font_family("Cascadia Code")
-                                                .truncate()
-                                                .child(agent.display_command()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.0))
-                                        .child(if can_install {
-                                            self.render_action_button("Install").on_mouse_down(
-                                                MouseButton::Left,
-                                                move |_e, _w, cx| {
-                                                    cx.stop_propagation();
-                                                    let _ = install_handle.update(cx, |view, cx| {
-                                                        view.on_install_agent(index, cx);
-                                                    });
-                                                },
-                                            )
-                                        } else {
-                                            div()
-                                        })
-                                        .child(if can_auth {
-                                            self.render_action_button("Authenticate").on_mouse_down(
-                                                MouseButton::Left,
-                                                move |_e, _w, cx| {
-                                                    cx.stop_propagation();
-                                                    let _ = auth_handle.update(cx, |view, cx| {
-                                                        view.on_auth_agent(index, cx);
-                                                    });
-                                                },
-                                            )
-                                        } else {
-                                            div()
-                                        })
-                                        .child(
-                                            self.render_action_button("Test").on_mouse_down(
-                                                MouseButton::Left,
-                                                move |_e, _w, cx| {
-                                                    cx.stop_propagation();
-                                                    let _ = test_handle.update(cx, |view, cx| {
-                                                        view.on_test_agent(index, cx);
-                                                    });
-                                                },
-                                            ),
-                                        ),
-                                )
-                        }),
-                    ))
+                                }),
+                        ),
+                    )
                     .child(if recent_logs.is_empty() {
                         div()
                     } else {
@@ -1220,16 +1256,13 @@ impl SettingsView {
                             .bg(rgb(0x0f0f0f))
                             .border_1()
                             .border_color(rgb(0x1f1f1f))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0x8a8a8a))
-                                    .child(if self.agent_action_busy {
-                                        "Action log (running...)"
-                                    } else {
-                                        "Action log"
-                                    }),
-                            )
+                            .child(div().text_size(px(11.0)).text_color(rgb(0x8a8a8a)).child(
+                                if self.agent_action_busy {
+                                    "Action log (running...)"
+                                } else {
+                                    "Action log"
+                                },
+                            ))
                             .child(
                                 div()
                                     .mt(px(8.0))

@@ -3,7 +3,8 @@ use crate::git::get_git_status;
 use crate::terminal::TerminalPty;
 use crate::{
     acp::client::AcpClient,
-    acp::manager::{AgentCommandSpec, AgentRegistry},
+    acp::manager::AgentCommandSpec,
+    acp::resolve::{AgentKey, ConflictPolicy, EffectiveAgentRow, load_effective_agent_rows},
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -54,10 +55,10 @@ pub struct TabView {
     total_output_lines: usize,
     follow_output: bool,
     input_mode: InputMode,
-    agent_registry: AgentRegistry,
-    agent_selected: usize,
+    agent_rows: Vec<EffectiveAgentRow>,
+    agent_selected_key: Option<AgentKey>,
     agent_client: Option<Arc<Mutex<AcpClient>>>,
-    agent_client_id: Option<String>,
+    agent_client_key: Option<AgentKey>,
     agent_busy: bool,
     agent_needs_auth: bool,
     selected_block: Option<usize>,
@@ -467,7 +468,8 @@ impl TabView {
     fn new_base(cx: &mut Context<Self>) -> Self {
         let (history, history_file) = Self::load_initial_history();
         let last_path_var = std::env::var("PATH").unwrap_or_default();
-        let agent_registry = AgentRegistry::load_default().unwrap_or_default();
+        let agent_rows = load_effective_agent_rows(ConflictPolicy::LocalWins).unwrap_or_default();
+        let agent_selected_key = agent_rows.first().map(|row| row.agent_key.clone());
         Self {
             blocks: Vec::new(),
             pty: None,
@@ -499,10 +501,10 @@ impl TabView {
             total_output_lines: 0,
             follow_output: true,
             input_mode: InputMode::Terminal,
-            agent_registry,
-            agent_selected: 0,
+            agent_rows,
+            agent_selected_key,
             agent_client: None,
-            agent_client_id: None,
+            agent_client_key: None,
             agent_busy: false,
             agent_needs_auth: false,
             selected_block: None,
@@ -897,17 +899,14 @@ impl TabView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_registry.agents.is_empty() {
+        if self.agent_rows.is_empty() {
             return;
         }
-        if self.agent_selected == 0 {
-            self.agent_selected = self.agent_registry.agents.len().saturating_sub(1);
-        } else {
-            self.agent_selected -= 1;
-        }
-        self.agent_client = None;
-        self.agent_client_id = None;
-        self.agent_needs_auth = false;
+        let next_index = match self.active_agent_index() {
+            Some(0) | None => self.agent_rows.len().saturating_sub(1),
+            Some(index) => index.saturating_sub(1),
+        };
+        self.select_agent_index(next_index);
         cx.notify();
     }
 
@@ -917,13 +916,14 @@ impl TabView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.agent_registry.agents.is_empty() {
+        if self.agent_rows.is_empty() {
             return;
         }
-        self.agent_selected = (self.agent_selected + 1) % self.agent_registry.agents.len();
-        self.agent_client = None;
-        self.agent_client_id = None;
-        self.agent_needs_auth = false;
+        let next_index = match self.active_agent_index() {
+            Some(index) => (index + 1) % self.agent_rows.len(),
+            None => 0,
+        };
+        self.select_agent_index(next_index);
         cx.notify();
     }
 
@@ -1115,7 +1115,9 @@ impl TabView {
                 .border_color(rgb(0x2a2a2a))
                 .child(lucide_icon(icon, 12.0, 0x8a8a8a))
         };
-        let agent_name = self.active_agent_name().unwrap_or_else(|| "No agent".to_string());
+        let agent_name = self
+            .active_agent_name()
+            .unwrap_or_else(|| "No agent".to_string());
         let agent_mode = self.input_mode == InputMode::Agent;
 
         div()
@@ -1152,7 +1154,11 @@ impl TabView {
                                     .w(px(28.0))
                                     .h(px(24.0))
                                     .rounded(px(6.0))
-                                    .bg(if agent_mode { rgb(0x141414) } else { rgb(0x1b283a) })
+                                    .bg(if agent_mode {
+                                        rgb(0x141414)
+                                    } else {
+                                        rgb(0x1b283a)
+                                    })
                                     .border_1()
                                     .border_color(if agent_mode {
                                         rgb(0x2a2a2a)
@@ -1177,7 +1183,11 @@ impl TabView {
                                     .w(px(28.0))
                                     .h(px(24.0))
                                     .rounded(px(6.0))
-                                    .bg(if agent_mode { rgb(0x1b283a) } else { rgb(0x141414) })
+                                    .bg(if agent_mode {
+                                        rgb(0x1b283a)
+                                    } else {
+                                        rgb(0x141414)
+                                    })
                                     .border_1()
                                     .border_color(if agent_mode {
                                         rgb(0x3f669c)
@@ -1376,12 +1386,10 @@ impl TabView {
                             .flex()
                             .items_center()
                             .gap(px(10.0))
-                            .child(
-                                action_button(Icon::Clipboard).on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(Self::on_copy_output),
-                                ),
-                            )
+                            .child(action_button(Icon::Clipboard).on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(Self::on_copy_output),
+                            ))
                             .child(action_button(Icon::Check))
                             .child(action_button(Icon::AtSign))
                             .child(action_button(Icon::Settings)),
@@ -1507,14 +1515,38 @@ impl TabView {
     }
 
     fn active_agent_name(&self) -> Option<String> {
-        self.agent_registry
-            .agents
-            .get(self.agent_selected)
-            .map(|a| a.name.clone())
+        self.active_agent_row().map(|row| row.name.clone())
     }
 
     fn active_agent_spec(&self) -> Option<crate::acp::manager::AgentSpec> {
-        self.agent_registry.agents.get(self.agent_selected).cloned()
+        self.active_agent_row().map(|row| row.spec.clone())
+    }
+
+    fn active_agent_row(&self) -> Option<&EffectiveAgentRow> {
+        let selected_key = self.agent_selected_key.as_ref()?;
+        self.agent_rows
+            .iter()
+            .find(|row| row.agent_key == *selected_key)
+            .or_else(|| self.agent_rows.first())
+    }
+
+    fn active_agent_index(&self) -> Option<usize> {
+        let selected_key = self.agent_selected_key.as_ref()?;
+        self.agent_rows
+            .iter()
+            .position(|row| row.agent_key == *selected_key)
+            .or(if self.agent_rows.is_empty() {
+                None
+            } else {
+                Some(0)
+            })
+    }
+
+    fn select_agent_index(&mut self, index: usize) {
+        self.agent_selected_key = self.agent_rows.get(index).map(|row| row.agent_key.clone());
+        self.agent_client = None;
+        self.agent_client_key = None;
+        self.agent_needs_auth = false;
     }
 
     fn is_auth_related_error(message: &str) -> bool {
@@ -1580,12 +1612,11 @@ impl TabView {
     }
 
     fn ensure_agent_client(&mut self) -> Result<Arc<Mutex<AcpClient>>, String> {
-        let spec = self
-            .agent_registry
-            .agents
-            .get(self.agent_selected)
+        let row = self
+            .active_agent_row()
             .cloned()
-            .ok_or_else(|| "no agent configured in agents.json".to_string())?;
+            .ok_or_else(|| "no effective ACP agent is available".to_string())?;
+        let spec = row.spec.clone();
         if !spec.is_available() {
             return Err(format!(
                 "agent '{}' command '{}' not found in PATH. Open Settings > ACP Registry and click Install.",
@@ -1595,9 +1626,9 @@ impl TabView {
 
         let recreate = self.agent_client.is_none()
             || self
-                .agent_client_id
+                .agent_client_key
                 .as_ref()
-                .map(|id| id != &spec.id)
+                .map(|id| id != &row.agent_key)
                 .unwrap_or(true);
         if recreate {
             let client = AcpClient::connect(&spec).map_err(|err| {
@@ -1607,7 +1638,7 @@ impl TabView {
                 )
             })?;
             self.agent_client = Some(Arc::new(Mutex::new(client)));
-            self.agent_client_id = Some(spec.id.clone());
+            self.agent_client_key = Some(row.agent_key.clone());
         }
         self.agent_client
             .as_ref()
@@ -1695,7 +1726,9 @@ impl TabView {
             }
         };
 
-        let agent_label = self.active_agent_name().unwrap_or_else(|| "Agent".to_string());
+        let agent_label = self
+            .active_agent_name()
+            .unwrap_or_else(|| "Agent".to_string());
         self.push_history(&prompt);
         self.blocks.push(Block {
             command: format!("{agent_label}> {prompt}"),
@@ -1728,7 +1761,9 @@ impl TabView {
         let (tx, mut rx) = mpsc::unbounded::<AgentPromptEvent>();
         thread::spawn(move || {
             let result = (|| -> Result<Option<String>, String> {
-                let mut guard = client.lock().map_err(|_| "agent lock poisoned".to_string())?;
+                let mut guard = client
+                    .lock()
+                    .map_err(|_| "agent lock poisoned".to_string())?;
                 if guard.protocol_version.is_none() {
                     guard.initialize().map_err(|err| err.to_string())?;
                 }
@@ -1736,7 +1771,10 @@ impl TabView {
                     .map_err(|err| err.to_string())?
                     .to_string_lossy()
                     .to_string();
-                let session_id = guard.ensure_session(&cwd).map_err(|err| err.to_string())?;
+                let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
+                let session_id = guard
+                    .ensure_session(&cwd, &runtime_mcp)
+                    .map_err(|err| err.to_string())?;
                 let mut on_update = |text: String, append: bool| {
                     let _ = tx.unbounded_send(AgentPromptEvent::Update { text, append });
                 };
@@ -1767,8 +1805,11 @@ impl TabView {
                                         }
                                         Ok(None) => {}
                                         Err(err) => {
-                                            view.agent_needs_auth = Self::is_auth_related_error(&err);
-                                            view.append_agent_update_line(&format!("[agent] {err}"));
+                                            view.agent_needs_auth =
+                                                Self::is_auth_related_error(&err);
+                                            view.append_agent_update_line(&format!(
+                                                "[agent] {err}"
+                                            ));
                                         }
                                     }
                                 }
@@ -2998,9 +3039,11 @@ impl TabView {
                     view.on_output_line_mouse_down_at(block_index, line_index, event, cx);
                 }),
             )
-            .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _window, cx| {
-                view.on_output_line_mouse_move_at(block_index, line_index, event, cx);
-            }));
+            .on_mouse_move(
+                cx.listener(move |view, event: &MouseMoveEvent, _window, cx| {
+                    view.on_output_line_mouse_move_at(block_index, line_index, event, cx);
+                }),
+            );
 
         if is_selected {
             row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
@@ -3009,7 +3052,13 @@ impl TabView {
         row
     }
 
-    fn render_block(&self, block: &Block, index: usize, active_index: usize, cx: &Context<Self>) -> Div {
+    fn render_block(
+        &self,
+        block: &Block,
+        index: usize,
+        active_index: usize,
+        cx: &Context<Self>,
+    ) -> Div {
         let has_command = !block.command.is_empty();
         let is_active = index == active_index && has_command;
         let is_selected_block = self.selected_block == Some(index);
@@ -3175,7 +3224,10 @@ impl Render for TabView {
                                 .id("terminal_output")
                                 .track_scroll(&self.scroll_handle)
                                 .on_scroll_wheel(cx.listener(Self::on_output_scroll_wheel))
-                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_output_mouse_up))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Self::on_output_mouse_up),
+                                )
                                 .on_mouse_up_out(
                                     MouseButton::Left,
                                     cx.listener(Self::on_output_mouse_up),

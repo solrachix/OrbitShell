@@ -1,5 +1,8 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use crate::acp::storage;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedInstalledVersion {
@@ -71,6 +74,26 @@ impl ManagedAgentState {
 }
 
 impl ManagedAgentsStateFile {
+    pub fn default_path() -> Result<PathBuf> {
+        Ok(storage::registry_state_root(&storage::app_root()?).join("managed-agents.json"))
+    }
+
+    pub fn load_default() -> Result<Self> {
+        Self::load_from_path(&Self::default_path()?)
+    }
+
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
+        Ok(storage::load_optional_json_file(path)?.unwrap_or_default())
+    }
+
+    pub fn save_default(&self) -> Result<()> {
+        self.save_to_path(&Self::default_path()?)
+    }
+
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
+        storage::save_json_file(path, self)
+    }
+
     pub fn find_mut(&mut self, id: &str) -> Option<&mut ManagedAgentState> {
         self.agents.iter_mut().find(|agent| agent.id == id)
     }
