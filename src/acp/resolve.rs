@@ -87,6 +87,19 @@ pub fn resolve_effective_agents(
     rows
 }
 
+pub fn list_alternate_sources(rows: &[EffectiveAgentRow], acp_id: &str) -> Vec<EffectiveAgentRow> {
+    rows.iter()
+        .filter(|row| row.acp_id == acp_id && row.is_alternate)
+        .cloned()
+        .collect()
+}
+
+pub fn resolve_agent(rows: &[EffectiveAgentRow], agent_key: &AgentKey) -> Option<AgentSpec> {
+    rows.iter()
+        .find(|row| row.agent_key == *agent_key)
+        .map(|row| row.spec.clone())
+}
+
 fn candidate_rank(source_type: AgentSourceKind, policy: ConflictPolicy) -> u8 {
     match policy {
         ConflictPolicy::LocalWins | ConflictPolicy::ShowBoth => match source_type {

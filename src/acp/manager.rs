@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::acp::resolve::{AgentCandidate, AgentKey, AgentSourceKind};
+use crate::acp::storage;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCommandSpec {
     pub command: String,
@@ -106,8 +109,8 @@ impl AgentRegistry {
                 parent.display()
             )
         })?;
-        let data =
-            serde_json::to_string_pretty(self).context("failed to serialize agent registry JSON")?;
+        let data = serde_json::to_string_pretty(self)
+            .context("failed to serialize agent registry JSON")?;
         fs::write(path, data)
             .with_context(|| format!("failed to write agent registry at {}", path.display()))?;
         Ok(())
@@ -118,8 +121,55 @@ impl AgentRegistry {
     }
 
     pub fn default_path() -> PathBuf {
+        Self::workspace_path()
+    }
+
+    pub fn workspace_path() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("agents.json")
+    }
+
+    pub fn global_path() -> Result<PathBuf> {
+        Ok(storage::app_root()?.join("agents.json"))
+    }
+
+    pub fn load_global_custom() -> Result<Self> {
+        let path = Self::global_path()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Self::load_from_path(&path)
+    }
+
+    pub fn load_workspace_custom_candidates() -> Result<Vec<AgentCandidate>> {
+        let source_id = Self::workspace_path().to_string_lossy().to_string();
+        Ok(Self::load_default()?.into_candidates(AgentSourceKind::WorkspaceCustom, source_id))
+    }
+
+    pub fn load_global_custom_candidates() -> Result<Vec<AgentCandidate>> {
+        let path = Self::global_path()?;
+        let source_id = path.to_string_lossy().to_string();
+        Ok(Self::load_global_custom()?.into_candidates(AgentSourceKind::GlobalCustom, source_id))
+    }
+
+    pub fn into_candidates(
+        self,
+        source_type: AgentSourceKind,
+        source_id: impl Into<String>,
+    ) -> Vec<AgentCandidate> {
+        let source_id = source_id.into();
+        self.agents
+            .into_iter()
+            .map(|spec| AgentCandidate {
+                agent_key: AgentKey {
+                    source_type,
+                    source_id: source_id.clone(),
+                    acp_id: spec.id.clone(),
+                },
+                spec,
+                managed_state: None,
+            })
+            .collect()
     }
 }
