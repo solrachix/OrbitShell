@@ -1,6 +1,12 @@
+use futures::StreamExt;
+use futures::channel::mpsc;
 use gpui::*;
 use lucide_icons::Icon;
+use std::path::PathBuf;
+use std::thread;
 
+use crate::acp::client::AcpClient;
+use crate::acp::manager::{AgentRegistry, AgentSpec};
 use crate::ui::icons::lucide_icon;
 use crate::ui::text_edit::TextEditState;
 
@@ -15,10 +21,21 @@ pub struct SettingsView {
     search_cursor: usize,
     search_selection: Option<(usize, usize)>,
     search_anchor: Option<usize>,
+    agent_registry: AgentRegistry,
+    agent_registry_path: PathBuf,
+    agent_registry_error: Option<String>,
+    agent_action_lines: Vec<String>,
+    agent_action_busy: bool,
 }
 
 impl SettingsView {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let agent_registry_path = AgentRegistry::default_path();
+        let (agent_registry, agent_registry_error) = match AgentRegistry::load_default() {
+            Ok(registry) => (registry, None),
+            Err(err) => (AgentRegistry::default(), Some(err.to_string())),
+        };
+
         Self {
             sections: vec![
                 "Account",
@@ -26,6 +43,7 @@ impl SettingsView {
                 "Appearance",
                 "Keyboard shortcuts",
                 "Referrals",
+                "ACP Registry",
                 "MCP servers",
                 "Privacy",
                 "About",
@@ -36,6 +54,11 @@ impl SettingsView {
             search_cursor: 0,
             search_selection: None,
             search_anchor: None,
+            agent_registry,
+            agent_registry_path,
+            agent_registry_error,
+            agent_action_lines: Vec::new(),
+            agent_action_busy: false,
         }
     }
 
@@ -280,7 +303,352 @@ impl SettingsView {
             .child(label.to_string())
     }
 
-    fn render_section_content(&self) -> Div {
+    fn on_reload_agent_registry(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match AgentRegistry::load_default() {
+            Ok(registry) => {
+                self.agent_registry = registry;
+                self.agent_registry_error = None;
+            }
+            Err(err) => {
+                self.agent_registry = AgentRegistry::default();
+                self.agent_registry_error = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_create_agent_registry(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let to_write = if self.agent_registry.agents.is_empty() {
+            AgentRegistry::load_default().unwrap_or_default()
+        } else {
+            self.agent_registry.clone()
+        };
+        match to_write.save_default() {
+            Ok(_) => {
+                self.agent_registry = to_write;
+                self.agent_registry_error = None;
+            }
+            Err(err) => {
+                self.agent_registry_error = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn run_agent_command(
+        &mut self,
+        command: String,
+        args: Vec<String>,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_action_busy {
+            self.agent_action_lines
+                .push("[info] another agent action is already running".to_string());
+            cx.notify();
+            return;
+        }
+
+        self.agent_action_busy = true;
+        let rendered = if args.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {}", args.join(" "))
+        };
+        self.agent_action_lines.push(format!("[{label}] $ {rendered}"));
+
+        let (tx, mut rx) = mpsc::unbounded::<String>();
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            use std::process::{Command, Stdio};
+
+            let candidates = Self::resolve_command_candidates(&command);
+            let mut child_opt = None;
+            let mut last_error: Option<std::io::Error> = None;
+            for candidate in candidates {
+                match Command::new(&candidate)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        let _ =
+                            tx.unbounded_send(format!("[{label}] resolved command: {candidate}"));
+                        child_opt = Some(child);
+                        break;
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                    }
+                }
+            }
+
+            let mut child = match child_opt {
+                Some(child) => child,
+                None => {
+                    let detail = last_error
+                        .map(|err| err.to_string())
+                        .unwrap_or_else(|| "spawn failed".to_string());
+                    let hint = Self::command_not_found_hint(&command);
+                    let _ = tx.unbounded_send(format!("[error] failed to spawn: {detail}"));
+                    let _ = tx.unbounded_send(format!("[hint] {hint}"));
+                    return;
+                }
+            };
+
+            if let Some(stdout) = child.stdout.take() {
+                let tx_out = tx.clone();
+                thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx_out.unbounded_send(line);
+                    }
+                });
+            }
+            if let Some(stderr) = child.stderr.take() {
+                let tx_err = tx.clone();
+                thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx_err.unbounded_send(format!("[stderr] {line}"));
+                    }
+                });
+            }
+
+            let status = child.wait();
+            let _ = tx.unbounded_send(format!("[done] {status:?}"));
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                while let Some(line) = rx.next().await {
+                    if view
+                        .update(&mut cx, |view, cx| {
+                            view.agent_action_lines.push(line);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                let _ = view.update(&mut cx, |view, cx| {
+                    view.agent_action_busy = false;
+                    match AgentRegistry::load_default() {
+                        Ok(registry) => {
+                            view.agent_registry = registry;
+                            view.agent_registry_error = None;
+                        }
+                        Err(err) => {
+                            view.agent_registry_error = Some(err.to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    fn on_install_agent(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_registry.agents.get(index).cloned() else {
+            return;
+        };
+        let Some(install) = agent.install else {
+            self.agent_action_lines
+                .push(format!("[install] agent '{}' has no install command", agent.name));
+            cx.notify();
+            return;
+        };
+        self.run_agent_command(install.command, install.args, "install", cx);
+    }
+
+    fn on_auth_agent(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_registry.agents.get(index).cloned() else {
+            return;
+        };
+        let Some(auth) = agent.auth else {
+            self.agent_action_lines
+                .push(format!("[auth] agent '{}' has no auth command", agent.name));
+            cx.notify();
+            return;
+        };
+        self.run_agent_command(auth.command, auth.args, "auth", cx);
+    }
+
+    fn on_test_agent(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_registry.agents.get(index).cloned() else {
+            return;
+        };
+
+        if self.agent_action_busy {
+            self.agent_action_lines
+                .push("[info] another agent action is already running".to_string());
+            cx.notify();
+            return;
+        }
+
+        self.agent_action_busy = true;
+        self.agent_action_lines
+            .push(format!("[test] ACP handshake for '{}' ({})", agent.name, agent.display_command()));
+
+        let (tx, mut rx) = mpsc::unbounded::<String>();
+        thread::spawn(move || {
+            if !agent.is_available() {
+                let _ = tx.unbounded_send(format!(
+                    "[test] FAIL: '{}' not found in PATH",
+                    agent.command
+                ));
+                let _ = tx.unbounded_send("[done] test finished with errors".to_string());
+                return;
+            }
+
+            let mut client = match AcpClient::connect(&agent) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tx.unbounded_send(format!("[test] FAIL: connect error: {err}"));
+                    let _ = tx.unbounded_send("[done] test finished with errors".to_string());
+                    return;
+                }
+            };
+
+            if let Err(err) = client.initialize() {
+                let _ = tx.unbounded_send(format!("[test] FAIL: initialize error: {err}"));
+                let _ = tx.unbounded_send("[done] test finished with errors".to_string());
+                return;
+            }
+
+            let protocol = client
+                .protocol_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let _ = tx.unbounded_send(format!("[test] initialize OK (protocol={protocol})"));
+
+            let cwd = match std::env::current_dir() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(err) => {
+                    let _ = tx.unbounded_send(format!("[test] FAIL: unable to resolve cwd: {err}"));
+                    let _ = tx.unbounded_send("[done] test finished with errors".to_string());
+                    return;
+                }
+            };
+
+            match client.ensure_session(&cwd) {
+                Ok(session_id) => {
+                    let _ = tx.unbounded_send(format!("[test] session/new OK (sessionId={session_id})"));
+                    let _ = tx.unbounded_send("[done] test finished successfully".to_string());
+                }
+                Err(err) => {
+                    let _ = tx.unbounded_send(format!("[test] FAIL: session/new error: {err}"));
+                    let _ = tx.unbounded_send("[done] test finished with errors".to_string());
+                }
+            }
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                while let Some(line) = rx.next().await {
+                    if view
+                        .update(&mut cx, |view, cx| {
+                            view.agent_action_lines.push(line);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                let _ = view.update(&mut cx, |view, cx| {
+                    view.agent_action_busy = false;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    fn render_agent_badge(&self, agent: &AgentSpec) -> Div {
+        let available = agent.is_available();
+        div()
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(999.0))
+            .text_size(px(11.0))
+            .border_1()
+            .border_color(if available {
+                rgb(0x244a2b)
+            } else {
+                rgb(0x4a2b24)
+            })
+            .bg(if available {
+                rgb(0x122016)
+            } else {
+                rgb(0x201612)
+            })
+            .text_color(if available {
+                rgb(0x8bd06f)
+            } else {
+                rgb(0xffb366)
+            })
+            .child(if available { "Installed" } else { "Not installed" })
+    }
+
+    fn render_action_button(&self, label: &'static str) -> Div {
+        div()
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(rgb(0x101010))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .text_size(px(12.0))
+            .text_color(rgb(0xd0d0d0))
+            .child(label)
+    }
+
+    fn resolve_command_candidates(command: &str) -> Vec<String> {
+        if !cfg!(windows) {
+            return vec![command.to_string()];
+        }
+        let path = std::path::Path::new(command);
+        if path.extension().is_some() {
+            return vec![command.to_string()];
+        }
+        vec![
+            command.to_string(),
+            format!("{command}.cmd"),
+            format!("{command}.exe"),
+        ]
+    }
+
+    fn command_not_found_hint(command: &str) -> String {
+        let lower = command.to_ascii_lowercase();
+        if lower == "npm" || lower == "npx" {
+            return "Node.js/npm not found in PATH. Install Node.js or restart the app so PATH is reloaded.".to_string();
+        }
+        format!("program '{command}' not found in PATH")
+    }
+
+    fn render_section_content(&self, cx: &Context<Self>) -> Div {
         let title = self.sections[self.active_section];
 
         let mut content = div().flex().flex_col().gap(px(16.0)).child(
@@ -626,6 +994,262 @@ impl SettingsView {
                             .child("Add MCP Server"),
                     );
             }
+            "ACP Registry" => {
+                let exists = self.agent_registry_path.exists();
+                let installed_count = self
+                    .agent_registry
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.is_available())
+                    .count();
+                let recent_logs: Vec<String> = self
+                    .agent_action_lines
+                    .iter()
+                    .rev()
+                    .take(14)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+
+                content = content
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x8a8a8a))
+                            .child("Configure ACP agents loaded from local agents.json"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child("File:"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xd0d0d0))
+                                    .font_family("Cascadia Code")
+                                    .truncate()
+                                    .child(self.agent_registry_path.to_string_lossy().to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if exists { rgb(0x8bd06f) } else { rgb(0xffb366) })
+                            .child(if exists {
+                                "Status: file found"
+                            } else {
+                                "Status: file missing (using in-memory defaults)"
+                            }),
+                    )
+                    .child(if let Some(err) = &self.agent_registry_error {
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xff7b72))
+                            .child(format!("Last error: {err}"))
+                    } else {
+                        div()
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(0x101010))
+                                    .border_1()
+                                    .border_color(rgb(0x2a2a2a))
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xd0d0d0))
+                                    .child("Reload")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::on_reload_agent_registry),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgb(0x101010))
+                                    .border_1()
+                                    .border_color(rgb(0x2a2a2a))
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xd0d0d0))
+                                    .child("Create agents.json")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::on_create_agent_registry),
+                                    ),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x9a9a9a))
+                            .child(format!(
+                                "Agents: {} total, {} installed",
+                                self.agent_registry.agents.len(),
+                                installed_count
+                            )),
+                    )
+                    .child(div().flex().flex_col().gap(px(8.0)).children(
+                        self.agent_registry.agents.iter().enumerate().map(|(index, agent)| {
+                            let available = agent.is_available();
+                            let can_install = agent.install.is_some() && !available;
+                            let can_auth = agent.auth.is_some();
+                            let install_handle = cx.entity().downgrade();
+                            let auth_handle = cx.entity().downgrade();
+                            let test_handle = cx.entity().downgrade();
+
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(10.0))
+                                .py(px(8.0))
+                                .rounded(px(8.0))
+                                .bg(rgb(0x101010))
+                                .border_1()
+                                .border_color(rgb(0x1f1f1f))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(0xd0d0d0))
+                                                .truncate()
+                                                .child(format!(
+                                                    "{} ({})",
+                                                    agent.name, agent.id
+                                                )),
+                                        )
+                                                .child(self.render_agent_badge(agent)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(0x8a8a8a))
+                                                .font_family("Cascadia Code")
+                                                .truncate()
+                                                .child(agent.display_command()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(if can_install {
+                                            self.render_action_button("Install").on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_e, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    let _ = install_handle.update(cx, |view, cx| {
+                                                        view.on_install_agent(index, cx);
+                                                    });
+                                                },
+                                            )
+                                        } else {
+                                            div()
+                                        })
+                                        .child(if can_auth {
+                                            self.render_action_button("Authenticate").on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_e, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    let _ = auth_handle.update(cx, |view, cx| {
+                                                        view.on_auth_agent(index, cx);
+                                                    });
+                                                },
+                                            )
+                                        } else {
+                                            div()
+                                        })
+                                        .child(
+                                            self.render_action_button("Test").on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_e, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    let _ = test_handle.update(cx, |view, cx| {
+                                                        view.on_test_agent(index, cx);
+                                                    });
+                                                },
+                                            ),
+                                        ),
+                                )
+                        }),
+                    ))
+                    .child(if recent_logs.is_empty() {
+                        div()
+                    } else {
+                        div()
+                            .mt(px(8.0))
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .p(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(0x0f0f0f))
+                            .border_1()
+                            .border_color(rgb(0x1f1f1f))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8a8a8a))
+                                    .child(if self.agent_action_busy {
+                                        "Action log (running...)"
+                                    } else {
+                                        "Action log"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(8.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .children(recent_logs.into_iter().map(|line| {
+                                        div()
+                                            .min_w(px(0.0))
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(0xbdbdbd))
+                                            .font_family("Cascadia Code")
+                                            .truncate()
+                                            .child(line)
+                                    })),
+                            )
+                    });
+            }
             "Privacy" => {
                 content = content
                     .child(
@@ -827,6 +1451,7 @@ impl Render for SettingsView {
                             .flex()
                             .flex_col()
                             .flex_1()
+                            .min_w(px(0.0))
                             .min_h(px(0.0))
                             .p(px(28.0))
                             .gap(px(18.0))
@@ -835,9 +1460,10 @@ impl Render for SettingsView {
                                     .flex()
                                     .flex_col()
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .min_h(px(0.0))
                                     .gap(px(16.0))
-                                    .child(self.render_section_content()),
+                                    .child(self.render_section_content(cx)),
                             ),
                     ),
             )

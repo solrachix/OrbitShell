@@ -1,6 +1,10 @@
 use crate::git::get_git_branches;
 use crate::git::get_git_status;
 use crate::terminal::TerminalPty;
+use crate::{
+    acp::client::AcpClient,
+    acp::manager::{AgentCommandSpec, AgentRegistry},
+};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::*;
@@ -8,12 +12,14 @@ use lucide_icons::Icon;
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ui::icons::lucide_icon;
 use crate::ui::recent::RecentEntry;
 use crate::ui::text_edit::TextEditState;
+use crate::ui::views::agent_view::AgentView;
 use crate::ui::views::settings_view::SettingsView;
 use crate::ui::views::welcome_view::{OpenRepositoryEvent, WelcomeView};
 
@@ -47,6 +53,17 @@ pub struct TabView {
     last_line_incomplete: bool,
     total_output_lines: usize,
     follow_output: bool,
+    input_mode: InputMode,
+    agent_registry: AgentRegistry,
+    agent_selected: usize,
+    agent_client: Option<Arc<Mutex<AcpClient>>>,
+    agent_client_id: Option<String>,
+    agent_busy: bool,
+    agent_needs_auth: bool,
+    selected_block: Option<usize>,
+    output_selection_anchor: Option<(usize, usize)>,
+    output_selection_head: Option<(usize, usize)>,
+    output_selecting: bool,
 }
 
 #[derive(Clone)]
@@ -111,8 +128,20 @@ const MAX_OUTPUT_LINES: usize = 5000;
 
 enum TabViewMode {
     Terminal,
+    Agent(Entity<AgentView>),
     Welcome(Entity<WelcomeView>),
     Settings(Entity<SettingsView>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Terminal,
+    Agent,
+}
+
+enum AgentPromptEvent {
+    Update { text: String, append: bool },
+    Done(Result<Option<String>, String>),
 }
 
 impl TabView {
@@ -175,6 +204,217 @@ impl TabView {
         button
     }
 
+    fn on_copy_output(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_selected_output(cx);
+    }
+
+    fn copy_selected_output(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_output_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+
+        let fallback_index = self
+            .selected_block
+            .or_else(|| self.blocks.len().checked_sub(1));
+        if let Some(index) = fallback_index {
+            self.copy_block_at(index, cx);
+        }
+    }
+
+    fn copy_block_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(block) = self.blocks.get(index) else {
+            return;
+        };
+        let text = self.block_to_text(block);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.selected_block = Some(index);
+        }
+    }
+
+    fn block_context_text(&self, block: &Block) -> Option<String> {
+        let ctx = block.context.as_ref()?;
+        let mut line = ctx.cwd.clone();
+        if let Some(ref branch) = ctx.git_branch {
+            if let Some(files) = ctx.git_files {
+                line = format!("{line}  git:({branch})  {files} files");
+                if let Some(added) = ctx.git_added {
+                    if added > 0 {
+                        line = format!("{line}  +{added}");
+                    }
+                }
+                if let Some(deleted) = ctx.git_deleted {
+                    if deleted > 0 {
+                        line = format!("{line}  -{deleted}");
+                    }
+                }
+                if let Some(modified) = ctx.git_modified {
+                    if modified > 0 {
+                        line = format!("{line}  ~{modified}");
+                    }
+                }
+            } else {
+                line = format!("{line}  git:({branch})");
+            }
+        }
+        Some(line)
+    }
+
+    fn block_to_text(&self, block: &Block) -> String {
+        let mut parts = Vec::new();
+        if let Some(context_line) = self.block_context_text(block) {
+            parts.push(context_line);
+        }
+        if !block.command.is_empty() {
+            parts.push(block.command.clone());
+        }
+        parts.extend(block.output_lines.clone());
+        parts.join("\n")
+    }
+
+    fn clear_output_selection(&mut self) {
+        self.output_selection_anchor = None;
+        self.output_selection_head = None;
+        self.output_selecting = false;
+    }
+
+    fn shift_output_indices_after_front_block_removal(&mut self) {
+        self.selected_block = self.selected_block.and_then(|index| index.checked_sub(1));
+
+        let shift = |point: Option<(usize, usize)>| -> Option<(usize, usize)> {
+            match point {
+                Some((0, _)) => None,
+                Some((block_index, line_index)) => Some((block_index - 1, line_index)),
+                None => None,
+            }
+        };
+
+        self.output_selection_anchor = shift(self.output_selection_anchor);
+        self.output_selection_head = shift(self.output_selection_head);
+        if self.output_selection_anchor.is_none() || self.output_selection_head.is_none() {
+            self.clear_output_selection();
+        }
+    }
+
+    fn normalize_output_selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.output_selection_anchor?;
+        let head = self.output_selection_head?;
+        if anchor == head {
+            return None;
+        }
+        if Self::line_position_key(anchor) <= Self::line_position_key(head) {
+            Some((anchor, head))
+        } else {
+            Some((head, anchor))
+        }
+    }
+
+    fn line_position_key((block_index, line_index): (usize, usize)) -> (usize, usize) {
+        (block_index, line_index)
+    }
+
+    fn is_output_line_selected(&self, block_index: usize, line_index: usize) -> bool {
+        let Some((start, end)) = self.normalize_output_selection() else {
+            return false;
+        };
+        let current = (block_index, line_index);
+        Self::line_position_key(current) >= Self::line_position_key(start)
+            && Self::line_position_key(current) <= Self::line_position_key(end)
+    }
+
+    fn selected_output_text(&self) -> Option<String> {
+        let (start, end) = self.normalize_output_selection()?;
+        let mut lines = Vec::new();
+
+        for block_index in start.0..=end.0 {
+            let Some(block) = self.blocks.get(block_index) else {
+                continue;
+            };
+            if block.output_lines.is_empty() {
+                continue;
+            }
+
+            let from = if block_index == start.0 { start.1 } else { 0 };
+            if from >= block.output_lines.len() {
+                continue;
+            }
+            let to = if block_index == end.0 {
+                end.1.min(block.output_lines.len().saturating_sub(1))
+            } else {
+                block.output_lines.len().saturating_sub(1)
+            };
+            if from > to {
+                continue;
+            }
+            lines.extend(block.output_lines[from..=to].iter().cloned());
+        }
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    fn on_select_block(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.selected_block = Some(index);
+        self.clear_output_selection();
+        cx.notify();
+    }
+
+    fn on_output_line_mouse_down_at(
+        &mut self,
+        block_index: usize,
+        line_index: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let position = (block_index, line_index);
+        if event.modifiers.shift {
+            if self.output_selection_anchor.is_none() {
+                self.output_selection_anchor = Some(position);
+            }
+            self.output_selection_head = Some(position);
+        } else {
+            self.output_selection_anchor = Some(position);
+            self.output_selection_head = Some(position);
+        }
+        self.selected_block = Some(block_index);
+        self.output_selecting = true;
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_output_line_mouse_move_at(
+        &mut self,
+        block_index: usize,
+        line_index: usize,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.output_selecting || !event.dragging() {
+            return;
+        }
+        self.output_selection_head = Some((block_index, line_index));
+        self.selected_block = Some(block_index);
+        cx.notify();
+    }
+
+    fn on_output_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.output_selecting = false;
+    }
+
     fn format_path(path: &Path) -> String {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -217,9 +457,17 @@ impl TabView {
         view
     }
 
+    pub fn new_agent(cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new_base(cx);
+        let agent = cx.new(|cx| AgentView::new(cx));
+        view.mode = TabViewMode::Agent(agent);
+        view
+    }
+
     fn new_base(cx: &mut Context<Self>) -> Self {
         let (history, history_file) = Self::load_initial_history();
         let last_path_var = std::env::var("PATH").unwrap_or_default();
+        let agent_registry = AgentRegistry::load_default().unwrap_or_default();
         Self {
             blocks: Vec::new(),
             pty: None,
@@ -250,6 +498,17 @@ impl TabView {
             last_line_incomplete: false,
             total_output_lines: 0,
             follow_output: true,
+            input_mode: InputMode::Terminal,
+            agent_registry,
+            agent_selected: 0,
+            agent_client: None,
+            agent_client_id: None,
+            agent_busy: false,
+            agent_needs_auth: false,
+            selected_block: None,
+            output_selection_anchor: None,
+            output_selection_head: None,
+            output_selecting: false,
         }
     }
 
@@ -284,6 +543,8 @@ impl TabView {
             .unwrap_or_else(|| "~".to_string());
         self.git_status = cwd.as_ref().and_then(|path| get_git_status(path));
         self.blocks.clear();
+        self.selected_block = None;
+        self.clear_output_selection();
         self.total_output_lines = 0;
         self.input.clear();
         self.cursor = 0;
@@ -346,6 +607,26 @@ impl TabView {
         }
         let ctrl = event.keystroke.modifiers.control;
         let shift = event.keystroke.modifiers.shift;
+        if ctrl && shift && event.keystroke.key.eq_ignore_ascii_case("c") {
+            self.copy_selected_output(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if ctrl && event.keystroke.key.eq_ignore_ascii_case("i") {
+            self.toggle_input_mode(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if ctrl
+            && event.keystroke.key.eq_ignore_ascii_case("c")
+            && self.input_mode == InputMode::Agent
+            && self.agent_busy
+        {
+            self.cancel_agent_prompt();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
             self.select_all_input();
             cx.notify();
@@ -372,7 +653,7 @@ impl TabView {
             return;
         }
 
-        if ctrl && event.keystroke.key.len() == 1 {
+        if self.input_mode == InputMode::Terminal && ctrl && event.keystroke.key.len() == 1 {
             if let Some(ref mut pty) = self.pty {
                 let key = event.keystroke.key.as_bytes()[0];
                 if key.is_ascii_alphabetic() {
@@ -588,6 +869,64 @@ impl TabView {
         cx.notify();
     }
 
+    fn on_set_terminal_mode(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_mode != InputMode::Terminal {
+            self.toggle_input_mode(cx);
+        }
+    }
+
+    fn on_set_agent_mode(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_mode != InputMode::Agent {
+            self.toggle_input_mode(cx);
+        }
+    }
+
+    fn on_prev_agent(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_registry.agents.is_empty() {
+            return;
+        }
+        if self.agent_selected == 0 {
+            self.agent_selected = self.agent_registry.agents.len().saturating_sub(1);
+        } else {
+            self.agent_selected -= 1;
+        }
+        self.agent_client = None;
+        self.agent_client_id = None;
+        self.agent_needs_auth = false;
+        cx.notify();
+    }
+
+    fn on_next_agent(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_registry.agents.is_empty() {
+            return;
+        }
+        self.agent_selected = (self.agent_selected + 1) % self.agent_registry.agents.len();
+        self.agent_client = None;
+        self.agent_client_id = None;
+        self.agent_needs_auth = false;
+        cx.notify();
+    }
+
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let Some(ref mut overlay) = self.overlay else {
             return false;
@@ -761,7 +1100,7 @@ impl TabView {
         }
     }
 
-    fn render_input_bar(&self, window: &Window, cx: &Context<Self>) -> Div {
+    fn render_input_bar(&mut self, window: &Window, cx: &Context<Self>) -> Div {
         let is_focused = self.focus_handle.is_focused(window);
         let action_button = |icon: Icon| {
             div()
@@ -776,6 +1115,8 @@ impl TabView {
                 .border_color(rgb(0x2a2a2a))
                 .child(lucide_icon(icon, 12.0, 0x8a8a8a))
         };
+        let agent_name = self.active_agent_name().unwrap_or_else(|| "No agent".to_string());
+        let agent_mode = self.input_mode == InputMode::Agent;
 
         div()
             .flex()
@@ -795,6 +1136,144 @@ impl TabView {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .px(px(4.0))
+                            .py(px(4.0))
+                            .rounded(px(8.0))
+                            .bg(rgb(0x141414))
+                            .border_1()
+                            .border_color(rgb(0x2a2a2a))
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .bg(if agent_mode { rgb(0x141414) } else { rgb(0x1b283a) })
+                                    .border_1()
+                                    .border_color(if agent_mode {
+                                        rgb(0x2a2a2a)
+                                    } else {
+                                        rgb(0x3f669c)
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(lucide_icon(
+                                        Icon::Terminal,
+                                        13.0,
+                                        if agent_mode { 0x7f7f7f } else { 0x8eb8ff },
+                                    ))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(Self::on_set_terminal_mode),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .h(px(24.0))
+                                    .rounded(px(6.0))
+                                    .bg(if agent_mode { rgb(0x1b283a) } else { rgb(0x141414) })
+                                    .border_1()
+                                    .border_color(if agent_mode {
+                                        rgb(0x3f669c)
+                                    } else {
+                                        rgb(0x2a2a2a)
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(lucide_icon(
+                                        Icon::Bot,
+                                        13.0,
+                                        if agent_mode { 0x8eb8ff } else { 0x7f7f7f },
+                                    ))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(Self::on_set_agent_mode),
+                                    ),
+                            ),
+                    )
+                    .child(if agent_mode {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(8.0))
+                            .py(px(5.0))
+                            .rounded(px(6.0))
+                            .bg(rgb(0x141414))
+                            .border_1()
+                            .border_color(rgb(0x2a2a2a))
+                            .child(
+                                div()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(0x191919))
+                                    .border_1()
+                                    .border_color(rgb(0x2a2a2a))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xbdbdbd))
+                                    .child("<")
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(Self::on_prev_agent),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xcfcfcf))
+                                    .child(agent_name),
+                            )
+                            .child(if self.agent_needs_auth {
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(2.0))
+                                    .rounded(px(5.0))
+                                    .bg(rgb(0x2a1a14))
+                                    .border_1()
+                                    .border_color(rgb(0x8b4a2b))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(0xffc18f))
+                                    .child("Authenticate")
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(Self::on_authenticate_agent),
+                                    )
+                            } else {
+                                div()
+                            })
+                            .child(
+                                div()
+                                    .w(px(18.0))
+                                    .h(px(18.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(0x191919))
+                                    .border_1()
+                                    .border_color(rgb(0x2a2a2a))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xbdbdbd))
+                                    .child(">")
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(Self::on_next_agent),
+                                    ),
+                            )
+                    } else {
+                        div()
+                    })
                     .child(
                         div()
                             .flex()
@@ -897,8 +1376,12 @@ impl TabView {
                             .flex()
                             .items_center()
                             .gap(px(10.0))
-                            .child(action_button(Icon::Bot))
-                            .child(action_button(Icon::Clipboard))
+                            .child(
+                                action_button(Icon::Clipboard).on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(Self::on_copy_output),
+                                ),
+                            )
                             .child(action_button(Icon::Check))
                             .child(action_button(Icon::AtSign))
                             .child(action_button(Icon::Settings)),
@@ -945,10 +1428,15 @@ impl TabView {
                 )
         };
 
+        let placeholder_text = if self.input_mode == InputMode::Agent {
+            "Ask the agent..."
+        } else {
+            "Type a command..."
+        };
         let placeholder = div()
             .text_size(px(15.0))
             .text_color(rgb(0x666666))
-            .child("Type a command...");
+            .child(placeholder_text);
 
         let ghost_div = div()
             .text_size(px(15.0))
@@ -1008,11 +1496,321 @@ impl TabView {
         row
     }
 
+    fn toggle_input_mode(&mut self, cx: &mut Context<Self>) {
+        if self.input_mode == InputMode::Terminal {
+            self.input_mode = InputMode::Agent;
+            self.follow_output = true;
+        } else {
+            self.input_mode = InputMode::Terminal;
+        }
+        cx.notify();
+    }
+
+    fn active_agent_name(&self) -> Option<String> {
+        self.agent_registry
+            .agents
+            .get(self.agent_selected)
+            .map(|a| a.name.clone())
+    }
+
+    fn active_agent_spec(&self) -> Option<crate::acp::manager::AgentSpec> {
+        self.agent_registry.agents.get(self.agent_selected).cloned()
+    }
+
+    fn is_auth_related_error(message: &str) -> bool {
+        let s = message.to_ascii_lowercase();
+        s.contains("login")
+            || s.contains("authenticate")
+            || s.contains("not logged in")
+            || s.contains("unauthorized")
+            || s.contains("401")
+            || s.contains("auth required")
+    }
+
+    fn quote_shell_token(token: &str) -> String {
+        if token.is_empty() {
+            return "\"\"".to_string();
+        }
+        let needs_quotes = token
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'');
+        if !needs_quotes {
+            return token.to_string();
+        }
+        format!("\"{}\"", token.replace('"', "`\""))
+    }
+
+    fn format_shell_command(cmd: &AgentCommandSpec) -> String {
+        let mut parts = Vec::with_capacity(cmd.args.len() + 1);
+        parts.push(Self::quote_shell_token(&cmd.command));
+        for arg in &cmd.args {
+            parts.push(Self::quote_shell_token(arg));
+        }
+        parts.join(" ")
+    }
+
+    fn run_agent_auth_flow(&mut self, cx: &mut Context<Self>) {
+        let Some(spec) = self.active_agent_spec() else {
+            self.append_agent_update_line("[agent] no selected agent.");
+            cx.notify();
+            return;
+        };
+        let Some(auth_cmd) = spec.auth else {
+            self.append_agent_update_line("[agent] this agent has no auth command configured.");
+            cx.notify();
+            return;
+        };
+
+        if self.pty.is_none() {
+            self.start_terminal_with_path(cx, None);
+        }
+        self.input_mode = InputMode::Terminal;
+        self.agent_needs_auth = false;
+        let command = Self::format_shell_command(&auth_cmd);
+        self.run_command(command, cx);
+    }
+
+    fn on_authenticate_agent(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_agent_auth_flow(cx);
+    }
+
+    fn ensure_agent_client(&mut self) -> Result<Arc<Mutex<AcpClient>>, String> {
+        let spec = self
+            .agent_registry
+            .agents
+            .get(self.agent_selected)
+            .cloned()
+            .ok_or_else(|| "no agent configured in agents.json".to_string())?;
+        if !spec.is_available() {
+            return Err(format!(
+                "agent '{}' command '{}' not found in PATH. Open Settings > ACP Registry and click Install.",
+                spec.name, spec.command
+            ));
+        }
+
+        let recreate = self.agent_client.is_none()
+            || self
+                .agent_client_id
+                .as_ref()
+                .map(|id| id != &spec.id)
+                .unwrap_or(true);
+        if recreate {
+            let client = AcpClient::connect(&spec).map_err(|err| {
+                format!(
+                    "failed to spawn agent command '{}'. Check agents.json (Windows often needs `.cmd` shim like `codex.cmd`). Details: {err}",
+                    spec.command
+                )
+            })?;
+            self.agent_client = Some(Arc::new(Mutex::new(client)));
+            self.agent_client_id = Some(spec.id.clone());
+        }
+        self.agent_client
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "failed to initialize agent client".to_string())
+    }
+
+    fn append_agent_update_line(&mut self, text: &str) {
+        self.append_agent_update(text, false);
+    }
+
+    fn append_agent_update(&mut self, text: &str, append_to_last: bool) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.blocks.is_empty() {
+            self.blocks.push(Block {
+                command: String::new(),
+                output_lines: Vec::new(),
+                has_error: false,
+                context: None,
+            });
+        }
+        if let Some(block) = self.blocks.last_mut() {
+            if append_to_last && !normalized.contains('\n') {
+                if let Some(last) = block.output_lines.last_mut() {
+                    last.push_str(&normalized);
+                } else if !normalized.is_empty() {
+                    if is_error_line(normalized.trim()) {
+                        block.has_error = true;
+                    }
+                    block.output_lines.push(normalized.clone());
+                    self.total_output_lines += 1;
+                }
+                self.trim_output_lines();
+                if self.follow_output {
+                    self.scroll_handle.scroll_to_bottom();
+                }
+                return;
+            }
+
+            for line in normalized.lines() {
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if is_error_line(trimmed) {
+                    block.has_error = true;
+                }
+                block.output_lines.push(trimmed.to_string());
+                self.total_output_lines += 1;
+            }
+        }
+        self.trim_output_lines();
+        if self.follow_output {
+            self.scroll_handle.scroll_to_bottom();
+        }
+    }
+
+    fn run_agent_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.agent_busy {
+            return;
+        }
+        let client = match self.ensure_agent_client() {
+            Ok(client) => client,
+            Err(err) => {
+                self.agent_needs_auth = Self::is_auth_related_error(&err);
+                self.blocks.push(Block {
+                    command: format!("agent> {prompt}"),
+                    output_lines: vec![format!("[agent] {err}")],
+                    has_error: true,
+                    context: Some(BlockContext {
+                        cwd: self.current_path.clone(),
+                        git_branch: self.git_status.as_ref().map(|g| g.branch.clone()),
+                        git_files: self.git_status.as_ref().map(|g| g.files_changed),
+                        git_added: self.git_status.as_ref().map(|g| g.added),
+                        git_deleted: self.git_status.as_ref().map(|g| g.deleted),
+                        git_modified: self.git_status.as_ref().map(|g| g.modified),
+                    }),
+                });
+                self.selected_block = self.blocks.len().checked_sub(1);
+                self.clear_output_selection();
+                self.total_output_lines += 1;
+                self.trim_output_lines();
+                cx.notify();
+                return;
+            }
+        };
+
+        let agent_label = self.active_agent_name().unwrap_or_else(|| "Agent".to_string());
+        self.push_history(&prompt);
+        self.blocks.push(Block {
+            command: format!("{agent_label}> {prompt}"),
+            output_lines: vec![],
+            has_error: false,
+            context: Some(BlockContext {
+                cwd: self.current_path.clone(),
+                git_branch: self.git_status.as_ref().map(|g| g.branch.clone()),
+                git_files: self.git_status.as_ref().map(|g| g.files_changed),
+                git_added: self.git_status.as_ref().map(|g| g.added),
+                git_deleted: self.git_status.as_ref().map(|g| g.deleted),
+                git_modified: self.git_status.as_ref().map(|g| g.modified),
+            }),
+        });
+        self.selected_block = self.blocks.len().checked_sub(1);
+        self.clear_output_selection();
+        self.follow_output = true;
+        self.agent_busy = true;
+        self.agent_needs_auth = false;
+        self.input.clear();
+        self.cursor = 0;
+        self.history_open = false;
+        self.history_items.clear();
+        self.suggestions.clear();
+        self.suggest_index = 0;
+        self.clear_selection();
+        self.overlay = None;
+        self.scroll_handle.scroll_to_bottom();
+
+        let (tx, mut rx) = mpsc::unbounded::<AgentPromptEvent>();
+        thread::spawn(move || {
+            let result = (|| -> Result<Option<String>, String> {
+                let mut guard = client.lock().map_err(|_| "agent lock poisoned".to_string())?;
+                if guard.protocol_version.is_none() {
+                    guard.initialize().map_err(|err| err.to_string())?;
+                }
+                let cwd = std::env::current_dir()
+                    .map_err(|err| err.to_string())?
+                    .to_string_lossy()
+                    .to_string();
+                let session_id = guard.ensure_session(&cwd).map_err(|err| err.to_string())?;
+                let mut on_update = |text: String, append: bool| {
+                    let _ = tx.unbounded_send(AgentPromptEvent::Update { text, append });
+                };
+                guard
+                    .prompt(&session_id, &prompt, &mut on_update)
+                    .map_err(|err| err.to_string())
+            })();
+            let _ = tx.unbounded_send(AgentPromptEvent::Done(result));
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                while let Some(event) = rx.next().await {
+                    if view
+                        .update(&mut cx, |view, cx| {
+                            match event {
+                                AgentPromptEvent::Update { text, append } => {
+                                    view.append_agent_update(&text, append)
+                                }
+                                AgentPromptEvent::Done(result) => {
+                                    view.agent_busy = false;
+                                    match result {
+                                        Ok(Some(final_text)) => {
+                                            view.agent_needs_auth =
+                                                Self::is_auth_related_error(&final_text);
+                                            view.append_agent_update_line(&final_text);
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            view.agent_needs_auth = Self::is_auth_related_error(&err);
+                                            view.append_agent_update_line(&format!("[agent] {err}"));
+                                        }
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn cancel_agent_prompt(&mut self) {
+        if !self.agent_busy {
+            return;
+        }
+        self.agent_busy = false;
+        self.append_agent_update_line("[agent] cancel requested");
+        let Some(client) = self.agent_client.as_ref().cloned() else {
+            return;
+        };
+        thread::spawn(move || {
+            let Ok(client) = client.lock() else {
+                return;
+            };
+            if let Some(session_id) = client.session_id.as_ref() {
+                let _ = client.cancel(session_id);
+            }
+        });
+    }
+
     fn commit_input(&mut self, cx: &mut Context<Self>) {
         let command = self.input.trim().to_string();
         if command.is_empty() {
-            if let Some(ref mut pty) = self.pty {
-                let _ = pty.write(b"\r\n");
+            if self.input_mode == InputMode::Terminal {
+                if let Some(ref mut pty) = self.pty {
+                    let _ = pty.write(b"\r\n");
+                }
             }
             self.input.clear();
             self.cursor = 0;
@@ -1021,7 +1819,11 @@ impl TabView {
             return;
         }
 
-        self.run_command(command, cx);
+        if self.input_mode == InputMode::Agent {
+            self.run_agent_prompt(command, cx);
+        } else {
+            self.run_command(command, cx);
+        }
     }
 
     fn run_command(&mut self, command: String, cx: &mut Context<Self>) {
@@ -1050,6 +1852,8 @@ impl TabView {
                 git_modified: self.git_status.as_ref().map(|g| g.modified),
             }),
         });
+        self.selected_block = self.blocks.len().checked_sub(1);
+        self.clear_output_selection();
         self.last_line_incomplete = false;
 
         if let Some(ref mut pty) = self.pty {
@@ -1994,6 +2798,10 @@ impl TabView {
                 has_error: false,
                 context: None,
             });
+            self.selected_block = Some(0);
+        }
+        if self.selected_block.is_none() {
+            self.selected_block = self.blocks.len().checked_sub(1);
         }
         self.blocks.last_mut().expect("blocks is not empty")
     }
@@ -2136,6 +2944,7 @@ impl TabView {
         while to_remove > 0 && !self.blocks.is_empty() {
             if self.blocks[0].output_lines.is_empty() {
                 self.blocks.remove(0);
+                self.shift_output_indices_after_front_block_removal();
                 continue;
             }
             let remove_count = to_remove.min(self.blocks[0].output_lines.len());
@@ -2144,6 +2953,7 @@ impl TabView {
             to_remove -= remove_count;
             if self.blocks[0].output_lines.is_empty() {
                 self.blocks.remove(0);
+                self.shift_output_indices_after_front_block_removal();
             }
         }
     }
@@ -2158,7 +2968,14 @@ impl TabView {
                 && trimmed.contains("Name")
     }
 
-    fn render_output_line(&self, line: &str, has_error: bool) -> Div {
+    fn render_output_line(
+        &self,
+        line: &str,
+        has_error: bool,
+        block_index: usize,
+        line_index: usize,
+        cx: &Context<Self>,
+    ) -> Div {
         let color = if has_error && is_error_line(line) {
             rgb(0xff7b72)
         } else if Self::is_dir_header_line(line) {
@@ -2167,14 +2984,39 @@ impl TabView {
             rgb(0xdddddd)
         };
 
-        div().text_color(color).child(line.to_string())
+        let is_selected = self.is_output_line_selected(block_index, line_index);
+        let mut row = div()
+            .min_w(px(0.0))
+            .text_color(color)
+            .truncate()
+            .cursor(CursorStyle::IBeam)
+            .px(px(2.0))
+            .child(line.to_string())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
+                    view.on_output_line_mouse_down_at(block_index, line_index, event, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _window, cx| {
+                view.on_output_line_mouse_move_at(block_index, line_index, event, cx);
+            }));
+
+        if is_selected {
+            row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
+        }
+
+        row
     }
 
-    fn render_block(&self, block: &Block, index: usize, active_index: usize) -> Div {
+    fn render_block(&self, block: &Block, index: usize, active_index: usize, cx: &Context<Self>) -> Div {
         let has_command = !block.command.is_empty();
         let is_active = index == active_index && has_command;
+        let is_selected_block = self.selected_block == Some(index);
         let block_bg = if block.has_error {
             rgb(0x2a1515)
+        } else if is_selected_block {
+            rgb(0x11283d)
         } else if is_active {
             rgb(0x0e2a33)
         } else {
@@ -2191,33 +3033,12 @@ impl TabView {
             rgb(0x0a0a0a)
         };
 
-        let context_line = if let Some(ref ctx) = block.context {
-            let mut line = ctx.cwd.clone();
-            if let Some(ref branch) = ctx.git_branch {
-                if let Some(files) = ctx.git_files {
-                    line = format!("{line}  git:({branch})  {files} files");
-                    if let Some(added) = ctx.git_added {
-                        if added > 0 {
-                            line = format!("{line}  +{added}");
-                        }
-                    }
-                    if let Some(deleted) = ctx.git_deleted {
-                        if deleted > 0 {
-                            line = format!("{line}  -{deleted}");
-                        }
-                    }
-                    if let Some(modified) = ctx.git_modified {
-                        if modified > 0 {
-                            line = format!("{line}  ~{modified}");
-                        }
-                    }
-                } else {
-                    line = format!("{line}  git:({branch})");
-                }
-            }
+        let context_line = if let Some(line) = self.block_context_text(block) {
             div()
+                .min_w(px(0.0))
                 .text_size(px(11.0))
                 .text_color(rgb(0x7a7a7a))
+                .truncate()
                 .child(line)
         } else {
             div()
@@ -2225,6 +3046,7 @@ impl TabView {
 
         let header = if has_command {
             div()
+                .min_w(px(0.0))
                 .text_size(px(13.0))
                 .text_color(if block.has_error {
                     rgb(0xffa3a3)
@@ -2232,10 +3054,28 @@ impl TabView {
                     rgb(0xffe29a)
                 })
                 .font_weight(FontWeight::BOLD)
+                .truncate()
                 .child(block.command.clone())
         } else {
             div()
         };
+
+        let copy_button = div()
+            .flex_none()
+            .px(px(6.0))
+            .py(px(4.0))
+            .rounded(px(5.0))
+            .bg(rgb(0x141414))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .child(lucide_icon(Icon::Clipboard, 12.0, 0xb8b8b8))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                    view.copy_block_at(index, cx);
+                    cx.stop_propagation();
+                }),
+            );
 
         let output = if block.output_lines.is_empty() {
             div()
@@ -2244,7 +3084,10 @@ impl TabView {
                 block
                     .output_lines
                     .iter()
-                    .map(|line| self.render_output_line(line, block.has_error)),
+                    .enumerate()
+                    .map(|(line_index, line)| {
+                        self.render_output_line(line, block.has_error, index, line_index, cx)
+                    }),
             )
         };
 
@@ -2256,14 +3099,29 @@ impl TabView {
             .border_t_1()
             .border_color(divider_color)
             .bg(block_bg)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _event: &MouseDownEvent, _window, cx| {
+                    view.on_select_block(index, cx);
+                }),
+            )
             .child(div().w(px(3.0)).bg(accent_color))
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .flex_col()
                     .gap(px(6.0))
                     .child(context_line)
-                    .child(header)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(div().flex_1().min_w(px(0.0)).child(header))
+                            .child(copy_button),
+                    )
                     .child(output),
             )
     }
@@ -2317,6 +3175,11 @@ impl Render for TabView {
                                 .id("terminal_output")
                                 .track_scroll(&self.scroll_handle)
                                 .on_scroll_wheel(cx.listener(Self::on_output_scroll_wheel))
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_output_mouse_up))
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(Self::on_output_mouse_up),
+                                )
                                 .overflow_scroll()
                                 .scrollbar_width(px(16.0))
                                 .size_full()
@@ -2329,7 +3192,9 @@ impl Render for TabView {
                                         .blocks
                                         .iter()
                                         .enumerate()
-                                        .map(|(i, block)| self.render_block(block, i, active_index))
+                                        .map(|(i, block)| {
+                                            self.render_block(block, i, active_index, cx)
+                                        })
                                         .collect();
                                     div()
                                         .flex_col()
@@ -2360,6 +3225,8 @@ impl Render for TabView {
                 });
         } else if let TabViewMode::Welcome(ref welcome) = self.mode {
             root = root.child(div().flex_1().min_h(px(0.0)).child(welcome.clone()));
+        } else if let TabViewMode::Agent(ref agent) = self.mode {
+            root = root.child(div().flex_1().min_h(px(0.0)).child(agent.clone()));
         } else if let TabViewMode::Settings(ref settings) = self.mode {
             root = root.child(div().flex_1().min_h(px(0.0)).child(settings.clone()));
         }

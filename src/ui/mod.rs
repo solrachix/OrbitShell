@@ -14,6 +14,7 @@ pub struct Workspace {
 }
 
 pub mod views {
+    pub mod agent_view;
     pub mod settings_view;
     pub mod sidebar_view;
     pub mod tab_bar;
@@ -122,6 +123,38 @@ impl Workspace {
 
         let _ = self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab("Settings".to_string(), "Settings".to_string(), cx);
+            tab_bar.set_sidebar_visible(self.sidebar_visible, cx);
+            tab_bar.set_active(self.active_tab, cx);
+        });
+        cx.notify();
+    }
+
+    fn add_agent_tab(&mut self, cx: &mut Context<Self>) {
+        let tab = cx.new(|cx| views::tab_view::TabView::new_agent(cx));
+        let tab_id = tab.entity_id();
+        cx.subscribe(
+            &tab,
+            move |workspace, _tab, event: &views::tab_view::TabViewEvent, cx| {
+                workspace.on_tab_view_event(tab_id, event, cx);
+            },
+        )
+        .detach();
+
+        let path = self
+            .tab_paths
+            .get(self.active_tab)
+            .cloned()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        self.tabs.push(tab);
+        self.tab_ids.push(tab_id);
+        self.tab_paths.push(path);
+        self.tab_is_welcome.push(true);
+        self.active_tab = self.tabs.len().saturating_sub(1);
+
+        let _ = self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab("Agent".to_string(), "ACP".to_string(), cx);
             tab_bar.set_sidebar_visible(self.sidebar_visible, cx);
             tab_bar.set_active(self.active_tab, cx);
         });
@@ -260,6 +293,25 @@ impl Workspace {
                         });
                     }),
             )
+            .child({
+                let handle = cx.entity().downgrade();
+                div()
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xe6e6e6))
+                    .child("Agent")
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = handle.update(cx, |view, cx| {
+                            view.user_menu_open = false;
+                            view.add_agent_tab(cx);
+                        });
+                    })
+            })
             .child({
                 let handle = cx.entity().downgrade();
                 div()
