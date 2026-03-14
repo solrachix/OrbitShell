@@ -1,3 +1,9 @@
+use anyhow::{Result, anyhow};
+use orbitshell::acp::install::state::{ManagedAgentState, ManagedAgentsStateFile};
+use orbitshell::acp::registry::fetch::{
+    FetchResponse, RegistryFetchClient, RegistrySnapshot, detect_available_updates,
+    load_cached_registry, load_then_refresh,
+};
 use orbitshell::acp::registry::model::{
     RegistryCacheMeta, RegistryCatalogEntry, RegistryDistribution, RegistryManifest,
 };
@@ -14,6 +20,46 @@ fn temp_app_root() -> PathBuf {
     orbitshell::acp::storage::app_root_from(std::env::temp_dir().join(unique))
 }
 
+#[derive(Clone)]
+enum FakeFetchMode {
+    Snapshot(RegistrySnapshot),
+    Fail(String),
+}
+
+#[derive(Clone)]
+struct FakeFetchClient {
+    mode: FakeFetchMode,
+}
+
+impl RegistryFetchClient for FakeFetchClient {
+    fn fetch_snapshot(&self, _etag: Option<&str>) -> Result<FetchResponse> {
+        match &self.mode {
+            FakeFetchMode::Snapshot(snapshot) => Ok(FetchResponse::Snapshot(snapshot.clone())),
+            FakeFetchMode::Fail(message) => Err(anyhow!(message.clone())),
+        }
+    }
+}
+
+fn manifest_with_version(version: &str) -> RegistryManifest {
+    RegistryManifest {
+        id: "codex-acp".into(),
+        name: "Codex CLI".into(),
+        description: "OpenAI ACP adapter".into(),
+        version: version.into(),
+        command: "codex-acp".into(),
+        args: vec!["--stdio".into()],
+        env_keys: vec!["OPENAI_API_KEY".into()],
+        distribution: RegistryDistribution {
+            kind: "npx".into(),
+            package: Some("@zed-industries/codex-acp".into()),
+            executable: Some("codex-acp".into()),
+            url: None,
+            sha256: None,
+            archive_kind: None,
+        },
+    }
+}
+
 #[test]
 fn registry_cache_round_trips_index_meta_and_manifest() {
     let app_root = temp_app_root();
@@ -28,23 +74,7 @@ fn registry_cache_round_trips_index_meta_and_manifest() {
         etag: Some("W/\"etag-1\"".into()),
         ttl_seconds: 3600,
     };
-    let manifest = RegistryManifest {
-        id: "codex-acp".into(),
-        name: "Codex CLI".into(),
-        description: "OpenAI ACP adapter".into(),
-        version: "0.10.0".into(),
-        command: "codex-acp".into(),
-        args: vec!["--stdio".into()],
-        env_keys: vec!["OPENAI_API_KEY".into()],
-        distribution: RegistryDistribution {
-            kind: "npx".into(),
-            package: Some("@zed-industries/codex-acp".into()),
-            executable: Some("codex-acp".into()),
-            url: None,
-            sha256: None,
-            archive_kind: None,
-        },
-    };
+    let manifest = manifest_with_version("0.10.0");
 
     orbitshell::acp::registry::cache::save_registry_index(&app_root, &index)
         .expect("save registry index");
@@ -82,4 +112,144 @@ fn registry_cache_round_trips_index_meta_and_manifest() {
     );
 
     std::fs::remove_dir_all(app_root.parent().expect("app root parent")).expect("cleanup temp dir");
+}
+
+#[test]
+fn load_then_refresh_replaces_cached_registry_with_remote_snapshot() {
+    let app_root = temp_app_root();
+    let cached_index = vec![RegistryCatalogEntry {
+        id: "codex-acp".into(),
+        name: "Codex CLI".into(),
+        description: "cached".into(),
+        version: "0.9.0".into(),
+    }];
+    orbitshell::acp::registry::cache::save_registry_index(&app_root, &cached_index)
+        .expect("save cached index");
+    orbitshell::acp::registry::cache::save_registry_meta(
+        &app_root,
+        &RegistryCacheMeta {
+            last_fetch: Some(1),
+            etag: Some("etag-cached".into()),
+            ttl_seconds: 60,
+        },
+    )
+    .expect("save cached meta");
+    orbitshell::acp::registry::cache::save_registry_manifest(
+        &app_root,
+        &manifest_with_version("0.9.0"),
+    )
+    .expect("save cached manifest");
+
+    let cached = load_cached_registry(&app_root)
+        .expect("load cached registry")
+        .expect("cached registry should exist");
+    assert_eq!(cached.index[0].version, "0.9.0");
+
+    let result = load_then_refresh(
+        &app_root,
+        &FakeFetchClient {
+            mode: FakeFetchMode::Snapshot(RegistrySnapshot {
+                index: vec![RegistryCatalogEntry {
+                    id: "codex-acp".into(),
+                    name: "Codex CLI".into(),
+                    description: "remote".into(),
+                    version: "1.0.0".into(),
+                }],
+                manifests: vec![manifest_with_version("1.0.0")],
+                etag: Some("etag-remote".into()),
+                fetched_at: 999,
+                ttl_seconds: 3600,
+            }),
+        },
+        None,
+    )
+    .expect("refresh registry");
+
+    assert!(!result.used_cache);
+    assert_eq!(result.data.index[0].version, "1.0.0");
+    assert_eq!(
+        result
+            .data
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.etag.as_deref()),
+        Some("etag-remote")
+    );
+
+    std::fs::remove_dir_all(app_root.parent().expect("app root parent")).expect("cleanup temp dir");
+}
+
+#[test]
+fn load_then_refresh_keeps_cached_registry_when_refresh_fails() {
+    let app_root = temp_app_root();
+    let cached_index = vec![RegistryCatalogEntry {
+        id: "codex-acp".into(),
+        name: "Codex CLI".into(),
+        description: "cached".into(),
+        version: "0.9.0".into(),
+    }];
+    orbitshell::acp::registry::cache::save_registry_index(&app_root, &cached_index)
+        .expect("save cached index");
+    orbitshell::acp::registry::cache::save_registry_meta(
+        &app_root,
+        &RegistryCacheMeta {
+            last_fetch: Some(5),
+            etag: Some("etag-cached".into()),
+            ttl_seconds: 60,
+        },
+    )
+    .expect("save cached meta");
+    orbitshell::acp::registry::cache::save_registry_manifest(
+        &app_root,
+        &manifest_with_version("0.9.0"),
+    )
+    .expect("save cached manifest");
+
+    let result = load_then_refresh(
+        &app_root,
+        &FakeFetchClient {
+            mode: FakeFetchMode::Fail("network down".into()),
+        },
+        None,
+    )
+    .expect("fall back to cache");
+
+    assert!(result.used_cache);
+    assert_eq!(result.data.index[0].version, "0.9.0");
+    assert!(
+        result
+            .refresh_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("network down")
+    );
+
+    std::fs::remove_dir_all(app_root.parent().expect("app root parent")).expect("cleanup temp dir");
+}
+
+#[test]
+fn refresh_marks_update_available_when_registry_version_is_newer() {
+    let mut managed = ManagedAgentsStateFile {
+        agents: vec![ManagedAgentState {
+            id: "codex-acp".into(),
+            installed_version: Some("0.9.0".into()),
+            ..Default::default()
+        }],
+    };
+
+    detect_available_updates(
+        &mut managed,
+        &[RegistryCatalogEntry {
+            id: "codex-acp".into(),
+            name: "Codex CLI".into(),
+            description: "remote".into(),
+            version: "1.0.0".into(),
+        }],
+        Some(1234),
+    );
+
+    let state = &managed.agents[0];
+    assert_eq!(state.latest_registry_version.as_deref(), Some("1.0.0"));
+    assert_eq!(state.last_checked_at, Some(1234));
+    assert!(state.update_available);
 }

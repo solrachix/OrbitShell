@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedAgentState {
     pub id: String,
     pub installed_version: Option<String>,
@@ -26,4 +26,10 @@ pub struct ManagedAgentState {
 pub struct ManagedAgentsStateFile {
     #[serde(default)]
     pub agents: Vec<ManagedAgentState>,
+}
+
+impl ManagedAgentsStateFile {
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut ManagedAgentState> {
+        self.agents.iter_mut().find(|agent| agent.id == id)
+    }
 }
