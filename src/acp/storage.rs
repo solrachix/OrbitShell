@@ -14,6 +14,22 @@ pub fn app_root_from(base: PathBuf) -> PathBuf {
     base.join(APP_ROOT_DIR)
 }
 
+pub fn registry_root(app_root: &Path) -> PathBuf {
+    app_root.join("registry")
+}
+
+pub fn registry_cache_root(app_root: &Path) -> PathBuf {
+    registry_root(app_root).join("cache")
+}
+
+pub fn registry_state_root(app_root: &Path) -> PathBuf {
+    registry_root(app_root).join("state")
+}
+
+pub fn registry_installs_root(app_root: &Path) -> PathBuf {
+    registry_root(app_root).join("installs")
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -36,7 +52,7 @@ pub fn load_optional_json_file<T: DeserializeOwned>(path: &Path) -> Result<Optio
     load_json_file(path).map(Some)
 }
 
-pub fn save_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub fn save_json_file<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     ensure_parent_dir(path)?;
     let raw = serde_json::to_string_pretty(value).context("failed to serialize JSON value")?;
     fs::write(path, raw).with_context(|| format!("failed to write JSON file {}", path.display()))
