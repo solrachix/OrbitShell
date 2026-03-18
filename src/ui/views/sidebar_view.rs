@@ -238,22 +238,26 @@ impl SidebarView {
                         12.0,
                         0x777777,
                     )
+                    .cursor(CursorStyle::PointingHand)
                 } else {
                     div().w(px(12.0)).h(px(12.0))
                 })
-                .child(lucide_icon(
-                    if entry.is_dir {
-                        if is_expanded {
-                            Icon::FolderOpen
+                .child(
+                    lucide_icon(
+                        if entry.is_dir {
+                            if is_expanded {
+                                Icon::FolderOpen
+                            } else {
+                                Icon::Folder
+                            }
                         } else {
-                            Icon::Folder
-                        }
-                    } else {
-                        Icon::File
-                    },
-                    14.0,
-                    0x9a9a9a,
-                ))
+                            Icon::File
+                        },
+                        14.0,
+                        0x9a9a9a,
+                    )
+                    .cursor(CursorStyle::PointingHand),
+                )
                 .child(
                     div()
                         .text_size(px(13.0))
@@ -862,15 +866,18 @@ impl SidebarView {
                                     .gap(px(6.0))
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .child(lucide_icon(
-                                        if expanded {
-                                            Icon::ChevronDown
-                                        } else {
-                                            Icon::ChevronRight
-                                        },
-                                        12.0,
-                                        0x8a8a8a,
-                                    ))
+                                    .child(
+                                        lucide_icon(
+                                            if expanded {
+                                                Icon::ChevronDown
+                                            } else {
+                                                Icon::ChevronRight
+                                            },
+                                            12.0,
+                                            0x8a8a8a,
+                                        )
+                                        .cursor(CursorStyle::PointingHand),
+                                    )
                                     .child(lucide_icon(Icon::File, 13.0, 0xe09b4f))
                                     .child(
                                         div()
@@ -1114,8 +1121,14 @@ impl Render for SidebarView {
                             .py(px(6.0))
                             .rounded(px(6.0))
                             .bg(rgb(0x262626))
-                            .child(lucide_icon(Icon::ChevronDown, 12.0, 0xcccccc))
-                            .child(lucide_icon(Icon::FolderOpen, 14.0, 0xcccccc))
+                            .child(
+                                lucide_icon(Icon::ChevronDown, 12.0, 0xcccccc)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
+                            .child(
+                                lucide_icon(Icon::FolderOpen, 14.0, 0xcccccc)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
                             .child(
                                 div().text_size(px(14.0)).text_color(rgb(0xeeeeee)).child(
                                     self.current_path
@@ -1181,7 +1194,10 @@ impl Render for SidebarView {
                                         .flex()
                                         .items_center()
                                         .gap(px(6.0))
-                                        .child(lucide_icon(Icon::GitBranch, 12.0, 0x6b9eff))
+                                        .child(
+                                            lucide_icon(Icon::GitBranch, 12.0, 0x6b9eff)
+                                                .cursor(CursorStyle::PointingHand),
+                                        )
                                         .child(
                                             div()
                                                 .text_size(px(12.0))
@@ -1247,16 +1263,19 @@ impl SidebarView {
                                 .gap(px(8.0))
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .child(lucide_icon(
-                                    Icon::File,
-                                    12.0,
-                                    match item.kind.as_str() {
-                                        "A" => 0x8bd06f,
-                                        "D" => 0xff7b72,
-                                        "M" => 0xe3b341,
-                                        _ => 0x9a9a9a,
-                                    },
-                                ))
+                                .child(
+                                    lucide_icon(
+                                        Icon::File,
+                                        12.0,
+                                        match item.kind.as_str() {
+                                            "A" => 0x8bd06f,
+                                            "D" => 0xff7b72,
+                                            "M" => 0xe3b341,
+                                            _ => 0x9a9a9a,
+                                        },
+                                    )
+                                    .cursor(CursorStyle::PointingHand),
+                                )
                                 .child(
                                     div()
                                         .flex()

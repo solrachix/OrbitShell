@@ -285,6 +285,8 @@ impl Workspace {
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
                     .child("Settings")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
                         let _ = handle_settings_settings.update(cx, |view, cx| {
@@ -304,6 +306,8 @@ impl Workspace {
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
                     .child("Agent")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
                         let _ = handle.update(cx, |view, cx| {
@@ -323,6 +327,8 @@ impl Workspace {
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
                     .child("Keyboard Shortcuts")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
                         let _ = handle.update(cx, |view, cx| {
@@ -346,6 +352,8 @@ impl Workspace {
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
                     .child("Invite a friend")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
                         let _ = handle_settings_invite.update(cx, |view, cx| {
@@ -368,6 +376,8 @@ impl Workspace {
                     .rounded(px(6.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .child("Feedback"),
             )
             .child(
@@ -379,6 +389,8 @@ impl Workspace {
                     .rounded(px(6.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                     .child("Log out"),
             );
 

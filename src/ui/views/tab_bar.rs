@@ -493,6 +493,8 @@ impl TabBar {
             .border_1()
             .border_color(rgb(0x2a2a2a))
             .occlude()
+            .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+            .cursor(CursorStyle::PointingHand)
             .child(lucide_icon(icon, 12.0, fg))
     }
 }
@@ -550,6 +552,8 @@ impl Render for TabBar {
                             })
                             .occlude()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_toggle_sidebar))
+                            .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                            .cursor(CursorStyle::PointingHand)
                             .child(lucide_icon(
                                 Icon::PanelLeft,
                                 14.0,
@@ -672,6 +676,10 @@ impl Render for TabBar {
                                                 });
                                             }
                                         })
+                                        .hover(|this| {
+                                            this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a))
+                                        })
+                                        .cursor(CursorStyle::PointingHand)
                                         .child(lucide_icon(Icon::X, 12.0, 0x666666)),
                                 );
 
@@ -757,6 +765,8 @@ impl Render for TabBar {
                             .border_color(rgb(0x2a2a2a))
                             .occlude()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_new_tab))
+                            .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                            .cursor(CursorStyle::PointingHand)
                             .child(lucide_icon(Icon::Plus, 14.0, 0x9a9a9a)),
                     )
                     .child(div()),

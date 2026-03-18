@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use futures::channel::mpsc;
+use gpui::prelude::*;
 use gpui::*;
 use lucide_icons::Icon;
 use std::fs;
@@ -40,6 +41,23 @@ const ACCENT_BORDER: u32 = 0x6b9eff66;
 const ACP_REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 
+#[derive(Clone, Debug)]
+pub struct CatalogAgentRowUI {
+    pub acp_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: Option<String>,
+    pub install_status: CatalogInstallStatus,
+    pub can_install: bool,
+    pub can_update: bool,
+    pub can_remove: bool,
+    pub can_auth: bool,
+    pub can_test: bool,
+    pub other_sources: Option<String>,
+    pub source_type: Option<crate::acp::resolve::AgentSourceKind>,
+    pub display_command: Option<String>,
+}
+
 pub struct SettingsView {
     sections: Vec<&'static str>,
     active_section: usize,
@@ -60,6 +78,16 @@ pub struct SettingsView {
     mcp_error: Option<String>,
     mcp_action_lines: Vec<String>,
     mcp_action_busy: bool,
+    acp_scroll: ScrollHandle,
+    mcp_scroll: ScrollHandle,
+    all_catalog_rows: Vec<CatalogAgentRow>,
+    visible_catalog_rows: Vec<CatalogAgentRowUI>,
+    acp_search_query: String,
+    acp_search_cursor: usize,
+    acp_search_selection: Option<(usize, usize)>,
+    acp_search_anchor: Option<usize>,
+    acp_search_focus: FocusHandle,
+    acp_installed_count: usize,
 }
 
 impl SettingsView {
@@ -102,7 +130,18 @@ impl SettingsView {
             mcp_error,
             mcp_action_lines: Vec::new(),
             mcp_action_busy: false,
+            acp_scroll: ScrollHandle::new(),
+            mcp_scroll: ScrollHandle::new(),
+            all_catalog_rows: Vec::new(),
+            visible_catalog_rows: Vec::new(),
+            acp_search_query: String::new(),
+            acp_search_cursor: 0,
+            acp_search_selection: None,
+            acp_search_anchor: None,
+            acp_search_focus: cx.focus_handle(),
+            acp_installed_count: 0,
         };
+        view.update_catalog_rows();
         view.refresh_registry_in_background(cx);
         view
     }
@@ -114,138 +153,235 @@ impl SettingsView {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ctrl = event.keystroke.modifiers.control;
         let shift = event.keystroke.modifiers.shift;
 
+        let acp_focused = self.acp_search_focus.is_focused(window);
+        let menu_focused = self.focus_handle.is_focused(window);
+
+        if !acp_focused && !menu_focused {
+            return;
+        }
+
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
-            TextEditState::select_all(
-                &self.search_query,
-                &mut self.search_cursor,
-                &mut self.search_selection,
-                &mut self.search_anchor,
-            );
+            let (query, cursor, selection, anchor) = if acp_focused {
+                (
+                    &mut self.acp_search_query,
+                    &mut self.acp_search_cursor,
+                    &mut self.acp_search_selection,
+                    &mut self.acp_search_anchor,
+                )
+            } else {
+                (
+                    &mut self.search_query,
+                    &mut self.search_cursor,
+                    &mut self.search_selection,
+                    &mut self.search_anchor,
+                )
+            };
+            TextEditState::select_all(query, cursor, selection, anchor);
             cx.notify();
+            if acp_focused {
+                self.update_visible_rows();
+            }
             cx.stop_propagation();
             return;
         }
 
         match event.keystroke.key.as_str() {
             "backspace" => {
-                if TextEditState::delete_selection_if_any(
-                    &mut self.search_query,
-                    &mut self.search_cursor,
-                    &mut self.search_selection,
-                    &mut self.search_anchor,
-                ) {
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                }
-                if self.search_cursor > 0 {
-                    TextEditState::pop_char_before_cursor(
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (query, cursor, selection, anchor) = if acp_focused {
+                    (
+                        &mut self.acp_search_query,
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
                         &mut self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    );
+                    )
+                };
+
+                if TextEditState::delete_selection_if_any(query, cursor, selection, anchor) {
                     cx.notify();
+                    if acp_focused {
+                        self.update_visible_rows();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                if *cursor > 0 {
+                    TextEditState::pop_char_before_cursor(query, cursor, selection, anchor);
+                    cx.notify();
+                    if acp_focused {
+                        self.update_visible_rows();
+                    }
                 }
                 cx.stop_propagation();
             }
             "left" | "arrowleft" => {
-                if shift {
-                    let anchor = self.search_anchor.unwrap_or(self.search_cursor);
-                    self.search_cursor = self.search_cursor.saturating_sub(1);
-                    TextEditState::set_selection_from_anchor(
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (cursor, selection, anchor) = if acp_focused {
+                    (
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
+                        &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                        anchor,
-                        self.search_cursor,
+                    )
+                };
+
+                if shift {
+                    let anchor_val = anchor.unwrap_or(*cursor);
+                    *cursor = cursor.saturating_sub(1);
+                    TextEditState::set_selection_from_anchor(
+                        selection, anchor, anchor_val, *cursor,
                     );
                 } else {
-                    if let Some((a, b)) = TextEditState::normalized_selection(self.search_selection)
-                    {
-                        self.search_cursor = a.min(b);
+                    if let Some((a, b)) = TextEditState::normalized_selection(*selection) {
+                        *cursor = a.min(b);
                     } else {
-                        self.search_cursor = self.search_cursor.saturating_sub(1);
+                        *cursor = cursor.saturating_sub(1);
                     }
-                    TextEditState::clear_selection(
-                        &mut self.search_selection,
-                        &mut self.search_anchor,
-                    );
+                    TextEditState::clear_selection(selection, anchor);
                 }
                 cx.notify();
                 cx.stop_propagation();
             }
             "right" | "arrowright" => {
-                let max = self.search_query.chars().count();
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (query, cursor, selection, anchor) = if acp_focused {
+                    (
+                        &self.acp_search_query,
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
+                        &self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    )
+                };
+
+                let max = query.chars().count();
                 if shift {
-                    let anchor = self.search_anchor.unwrap_or(self.search_cursor);
-                    self.search_cursor = (self.search_cursor + 1).min(max);
+                    let anchor_val = anchor.unwrap_or(*cursor);
+                    *cursor = (*cursor + 1).min(max);
                     TextEditState::set_selection_from_anchor(
-                        &mut self.search_selection,
-                        &mut self.search_anchor,
-                        anchor,
-                        self.search_cursor,
+                        selection, anchor, anchor_val, *cursor,
                     );
-                } else if let Some((a, b)) =
-                    TextEditState::normalized_selection(self.search_selection)
-                {
-                    self.search_cursor = a.max(b);
-                    TextEditState::clear_selection(
-                        &mut self.search_selection,
-                        &mut self.search_anchor,
-                    );
-                } else if self.search_cursor < max {
-                    self.search_cursor += 1;
+                } else if let Some((a, b)) = TextEditState::normalized_selection(*selection) {
+                    *cursor = a.max(b);
+                    TextEditState::clear_selection(selection, anchor);
+                } else if *cursor < max {
+                    *cursor += 1;
                 }
                 cx.notify();
                 cx.stop_propagation();
             }
             "home" => {
-                self.search_cursor = 0;
-                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (cursor, selection, anchor) = if acp_focused {
+                    (
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    )
+                };
+                *cursor = 0;
+                TextEditState::clear_selection(selection, anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             "end" => {
-                self.search_cursor = self.search_query.chars().count();
-                TextEditState::clear_selection(&mut self.search_selection, &mut self.search_anchor);
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (query, cursor, selection, anchor) = if acp_focused {
+                    (
+                        &self.acp_search_query,
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
+                        &self.search_query,
+                        &mut self.search_cursor,
+                        &mut self.search_selection,
+                        &mut self.search_anchor,
+                    )
+                };
+                *cursor = query.chars().count();
+                TextEditState::clear_selection(selection, anchor);
                 cx.notify();
                 cx.stop_propagation();
             }
             _ => {
-                if let Some(text) = event.keystroke.key_char.as_deref() {
-                    if !text.is_empty() && !ctrl {
-                        TextEditState::insert_text(
-                            &mut self.search_query,
-                            &mut self.search_cursor,
-                            &mut self.search_selection,
-                            &mut self.search_anchor,
-                            text,
-                        );
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                } else if event.keystroke.key.len() == 1 && !ctrl {
-                    let key = event.keystroke.key.clone();
-                    TextEditState::insert_text(
+                let acp_focused = self.acp_search_focus.is_focused(window);
+                let (query, cursor, selection, anchor) = if acp_focused {
+                    (
+                        &mut self.acp_search_query,
+                        &mut self.acp_search_cursor,
+                        &mut self.acp_search_selection,
+                        &mut self.acp_search_anchor,
+                    )
+                } else {
+                    (
                         &mut self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                        &key,
-                    );
+                    )
+                };
+
+                if let Some(text) = event.keystroke.key_char.as_deref() {
+                    if !text.is_empty() && !ctrl {
+                        TextEditState::insert_text(query, cursor, selection, anchor, text);
+                        cx.notify();
+                        if acp_focused {
+                            self.update_visible_rows();
+                        }
+                        cx.stop_propagation();
+                    }
+                } else if event.keystroke.key.len() == 1 && !ctrl {
+                    let key = event.keystroke.key.clone();
+                    TextEditState::insert_text(query, cursor, selection, anchor, &key);
                     cx.notify();
+                    if acp_focused {
+                        self.update_visible_rows();
+                    }
                     cx.stop_propagation();
                 }
             }
         }
     }
 
-    fn render_search_input(&self, is_focused: bool) -> Div {
-        let placeholder = self.search_query.is_empty();
+    fn render_search_input(
+        &self,
+        query: &str,
+        cursor: usize,
+        selection: Option<(usize, usize)>,
+        is_focused: bool,
+    ) -> Div {
+        let placeholder = query.is_empty();
         let caret = div()
             .w(px(2.0))
             .h(px(16.0))
@@ -294,10 +430,9 @@ impl SettingsView {
                 );
         }
 
-        if let Some((a, b)) =
-            TextEditState::normalized_selection(self.search_selection).filter(|(a, b)| a != b)
+        if let Some((a, b)) = TextEditState::normalized_selection(selection).filter(|(a, b)| a != b)
         {
-            let (pre, rest) = split_string(&self.search_query, a);
+            let (pre, rest) = split_string(query, a);
             let (sel, post) = split_string(&rest, b.saturating_sub(a));
             return div()
                 .flex()
@@ -309,7 +444,7 @@ impl SettingsView {
                 .child(text_normal(post));
         }
 
-        let (left, right) = TextEditState::split_at_cursor(&self.search_query, self.search_cursor);
+        let (left, right) = TextEditState::split_at_cursor(query, cursor);
         div()
             .flex()
             .items_center()
@@ -359,9 +494,101 @@ impl SettingsView {
             load_effective_agent_rows(ConflictPolicy::LocalWins).unwrap_or_default();
     }
 
-    fn visible_catalog_rows(&self) -> Vec<CatalogAgentRow> {
-        let rows = build_catalog_rows(Some(&self.registry_data), &self.effective_agents);
-        filter_catalog_rows(&rows, self.catalog_filter, &self.search_query)
+    fn update_catalog_rows(&mut self) {
+        self.all_catalog_rows =
+            build_catalog_rows(Some(&self.registry_data), &self.effective_agents);
+        self.update_visible_rows();
+    }
+
+    fn update_visible_rows(&mut self) {
+        let filtered = filter_catalog_rows(
+            &self.all_catalog_rows,
+            self.catalog_filter,
+            &self.acp_search_query,
+        );
+
+        self.visible_catalog_rows = filtered
+            .into_iter()
+            .map(|row| {
+                let can_install = matches!(row.install_status, CatalogInstallStatus::NotInstalled)
+                    && (row
+                        .selected_source
+                        .as_ref()
+                        .and_then(|source| source.spec.install.as_ref())
+                        .is_some()
+                        || row
+                            .registry_manifest
+                            .as_ref()
+                            .and_then(|manifest| manifest.preferred_install_strategy())
+                            .is_some());
+                let can_update =
+                    matches!(row.install_status, CatalogInstallStatus::UpdateAvailable)
+                        && row.registry_manifest.is_some();
+                let can_remove = row
+                    .selected_source
+                    .as_ref()
+                    .map(|source| {
+                        matches!(
+                            source.source_type,
+                            crate::acp::resolve::AgentSourceKind::Registry
+                        )
+                    })
+                    .unwrap_or(false);
+                let can_auth = row
+                    .selected_source
+                    .as_ref()
+                    .and_then(|source| source.spec.auth.as_ref())
+                    .is_some();
+                let can_test = row.selected_source.is_some();
+                let other_sources = if row.other_sources.is_empty() {
+                    None
+                } else {
+                    Some(
+                        row.other_sources
+                            .iter()
+                            .map(|source| match source.source_type {
+                                crate::acp::resolve::AgentSourceKind::Registry => {
+                                    "Registry".to_string()
+                                }
+                                crate::acp::resolve::AgentSourceKind::GlobalCustom => {
+                                    "Custom".to_string()
+                                }
+                                crate::acp::resolve::AgentSourceKind::WorkspaceCustom => {
+                                    "Workspace".to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                };
+
+                let source_type = row.selected_source.as_ref().map(|s| s.source_type);
+                let display_command = row
+                    .selected_source
+                    .as_ref()
+                    .map(|s| s.spec.display_command());
+
+                CatalogAgentRowUI {
+                    acp_id: row.acp_id,
+                    name: row.name,
+                    description: row.description,
+                    version: row.version,
+                    install_status: row.install_status,
+                    can_install,
+                    can_update,
+                    can_remove,
+                    can_auth,
+                    can_test,
+                    other_sources,
+                    source_type,
+                    display_command,
+                }
+            })
+            .collect();
+    }
+
+    fn visible_catalog_rows(&self) -> &[CatalogAgentRowUI] {
+        &self.visible_catalog_rows
     }
 
     fn refresh_registry_in_background(&mut self, cx: &mut Context<Self>) {
@@ -412,6 +639,7 @@ impl SettingsView {
                         view.effective_agents =
                             load_effective_agent_rows(ConflictPolicy::LocalWins)
                                 .unwrap_or_default();
+                        view.update_catalog_rows();
                         cx.notify();
                     });
                 }
@@ -458,7 +686,9 @@ impl SettingsView {
                 while let Some(line) = rx.next().await {
                     if view
                         .update(&mut cx, |view, cx| {
-                            view.agent_action_lines.push(line);
+                            if let Some(line) = sanitize_action_log_line(&line) {
+                                view.agent_action_lines.push(line);
+                            }
                             cx.notify();
                         })
                         .is_err()
@@ -470,6 +700,7 @@ impl SettingsView {
                 let _ = view.update(&mut cx, |view, cx| {
                     view.agent_action_busy = false;
                     view.reload_catalog_state();
+                    view.update_catalog_rows();
                     cx.notify();
                 });
             }
@@ -557,7 +788,15 @@ impl SettingsView {
     }
 
     fn on_install_agent(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_catalog_rows().get(index).cloned() else {
+        let Some(ui_row) = self.visible_catalog_rows().get(index) else {
+            return;
+        };
+        let Some(row) = self
+            .all_catalog_rows
+            .iter()
+            .find(|r| r.acp_id == ui_row.acp_id)
+            .cloned()
+        else {
             return;
         };
 
@@ -590,7 +829,15 @@ impl SettingsView {
     }
 
     fn on_update_agent(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_catalog_rows().get(index).cloned() else {
+        let Some(ui_row) = self.visible_catalog_rows().get(index) else {
+            return;
+        };
+        let Some(row) = self
+            .all_catalog_rows
+            .iter()
+            .find(|r| r.acp_id == ui_row.acp_id)
+            .cloned()
+        else {
             return;
         };
         let Some(manifest) = row.registry_manifest.clone() else {
@@ -608,7 +855,15 @@ impl SettingsView {
     }
 
     fn on_remove_agent(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_catalog_rows().get(index).cloned() else {
+        let Some(ui_row) = self.visible_catalog_rows().get(index) else {
+            return;
+        };
+        let Some(row) = self
+            .all_catalog_rows
+            .iter()
+            .find(|r| r.acp_id == ui_row.acp_id)
+            .cloned()
+        else {
             return;
         };
 
@@ -620,7 +875,15 @@ impl SettingsView {
     }
 
     fn on_auth_agent(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_catalog_rows().get(index).cloned() else {
+        let Some(ui_row) = self.visible_catalog_rows().get(index) else {
+            return;
+        };
+        let Some(row) = self
+            .all_catalog_rows
+            .iter()
+            .find(|r| r.acp_id == ui_row.acp_id)
+            .cloned()
+        else {
             return;
         };
         let Some(agent) = row.selected_source.map(|source| source.spec) else {
@@ -644,7 +907,15 @@ impl SettingsView {
     }
 
     fn on_test_agent(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_catalog_rows().get(index).cloned() else {
+        let Some(ui_row) = self.visible_catalog_rows().get(index) else {
+            return;
+        };
+        let Some(row) = self
+            .all_catalog_rows
+            .iter()
+            .find(|r| r.acp_id == ui_row.acp_id)
+            .cloned()
+        else {
             return;
         };
         let Some(agent) = row.selected_source.map(|source| source.spec) else {
@@ -1056,12 +1327,11 @@ impl SettingsView {
             .child(label)
     }
 
-    fn render_source_badge(&self, row: &CatalogAgentRow) -> Div {
-        let (label, fg, bg, border) = match row
-            .selected_source
-            .as_ref()
-            .map(|source| source.source_type)
-        {
+    fn render_source_badge(
+        &self,
+        source_type: Option<crate::acp::resolve::AgentSourceKind>,
+    ) -> Div {
+        let (label, fg, bg, border) = match source_type {
             Some(crate::acp::resolve::AgentSourceKind::Registry) | None => {
                 ("Registry", 0x5fb0ff, 0x112033, 0x244b7d)
             }
@@ -1138,15 +1408,21 @@ impl SettingsView {
         format!("program '{command}' not found in PATH")
     }
 
-    fn render_section_content(&self, cx: &Context<Self>) -> Div {
+    fn render_section_content(&self, window: &Window, cx: &Context<Self>) -> Div {
         let title = self.sections[self.active_section];
 
-        let mut content = div().flex().flex_col().gap(px(16.0)).child(
-            div()
-                .text_size(px(20.0))
-                .text_color(rgb(0xffffff))
-                .child(title),
-        );
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap(px(16.0))
+            .child(
+                div()
+                    .text_size(px(20.0))
+                    .text_color(rgb(0xffffff))
+                    .child(title),
+            );
 
         match title {
             "Account" => {
@@ -1525,12 +1801,16 @@ impl SettingsView {
                     )
                     .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
                     .child(
-                        div().flex().flex_col().gap(px(8.0)).children(
-                            self.mcp_config
-                                .servers
-                                .iter()
-                                .enumerate()
-                                .map(|(index, server)| {
+                        div()
+                            .id("mcp_list")
+                            .track_scroll(&self.mcp_scroll)
+                            .overflow_scroll()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .children(self.mcp_config.servers.iter().enumerate().map(
+                                |(index, server)| {
                                     let toggle_handle = cx.entity().downgrade();
                                     let duplicate_handle = cx.entity().downgrade();
                                     let delete_handle = cx.entity().downgrade();
@@ -1684,8 +1964,8 @@ impl SettingsView {
                                                         ),
                                                 ),
                                         )
-                                }),
-                        ),
+                                },
+                            )),
                     )
                     .child(if recent_logs.is_empty() {
                         div()
@@ -1716,18 +1996,12 @@ impl SettingsView {
                     });
             }
             "ACP Registry" => {
-                let all_rows =
-                    build_catalog_rows(Some(&self.registry_data), &self.effective_agents);
-                let visible_rows = self.visible_catalog_rows();
-                let installed_count = all_rows
-                    .iter()
-                    .filter(|row| {
-                        matches!(
-                            row.install_status,
-                            CatalogInstallStatus::Installed | CatalogInstallStatus::UpdateAvailable
-                        )
-                    })
-                    .count();
+                let refresh_handle = cx.entity().downgrade();
+                let all_handle = cx.entity().downgrade();
+                let installed_handle = cx.entity().downgrade();
+                let not_installed_handle = cx.entity().downgrade();
+                let update_handle = cx.entity().downgrade();
+
                 let recent_logs: Vec<String> = self
                     .agent_action_lines
                     .iter()
@@ -1738,37 +2012,8 @@ impl SettingsView {
                     .into_iter()
                     .rev()
                     .collect();
-                let registry_status = if self.registry_refresh_busy {
-                    "Refreshing registry...".to_string()
-                } else if let Some(err) = &self.registry_refresh_error {
-                    format!("Using cached registry after refresh error: {err}")
-                } else if self.registry_used_cache {
-                    "Using cached registry".to_string()
-                } else {
-                    "Registry is up to date".to_string()
-                };
-                let refresh_handle = cx.entity().downgrade();
-                let all_handle = cx.entity().downgrade();
-                let installed_handle = cx.entity().downgrade();
-                let not_installed_handle = cx.entity().downgrade();
-                let update_handle = cx.entity().downgrade();
 
                 content = content
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Unified ACP catalog from the official registry plus your global and workspace agents."),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x9a9a9a))
-                            .child(registry_status),
-                    )
                     .child(
                         div()
                             .flex()
@@ -1778,12 +2023,8 @@ impl SettingsView {
                             .child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child(format!(
-                                        "Agents: {} total, {} installed",
-                                        all_rows.len(),
-                                        installed_count
-                                    )),
+                                    .text_color(rgb(0x8a8a8a))
+                                    .child("Unified ACP catalog from the official registry plus your global and workspace agents."),
                             )
                             .child(
                                 self.render_action_button("Refresh")
@@ -1795,6 +2036,32 @@ impl SettingsView {
                                     }),
                             ),
                     )
+                    .child({
+                        let acp_focus_handle = self.acp_search_focus.clone();
+                        div()
+                            .id("acp_search_input")
+                            .track_focus(&acp_focus_handle)
+                            .rounded(px(8.0))
+                            .bg(rgb(0x131313))
+                            .border_1()
+                            .border_color(if self.acp_search_focus.is_focused(window) {
+                                rgb(ACCENT)
+                            } else {
+                                rgb(0x2a2a2a)
+                            })
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&acp_focus_handle);
+                            })
+                            .child(self.render_search_input(
+                                &self.acp_search_query,
+                                self.acp_search_cursor,
+                                self.acp_search_selection,
+                                self.acp_search_focus.is_focused(window),
+                            ))
+                    })
                     .child(
                         div()
                             .flex()
@@ -1809,6 +2076,7 @@ impl SettingsView {
                                     cx.stop_propagation();
                                     let _ = all_handle.update(cx, |view, cx| {
                                         view.catalog_filter = CatalogFilter::All;
+                                        view.update_visible_rows();
                                         cx.notify();
                                     });
                                 }),
@@ -1822,6 +2090,7 @@ impl SettingsView {
                                     cx.stop_propagation();
                                     let _ = installed_handle.update(cx, |view, cx| {
                                         view.catalog_filter = CatalogFilter::Installed;
+                                        view.update_visible_rows();
                                         cx.notify();
                                     });
                                 }),
@@ -1835,6 +2104,7 @@ impl SettingsView {
                                     cx.stop_propagation();
                                     let _ = not_installed_handle.update(cx, |view, cx| {
                                         view.catalog_filter = CatalogFilter::NotInstalled;
+                                        view.update_visible_rows();
                                         cx.notify();
                                     });
                                 }),
@@ -1848,72 +2118,44 @@ impl SettingsView {
                                     cx.stop_propagation();
                                     let _ = update_handle.update(cx, |view, cx| {
                                         view.catalog_filter = CatalogFilter::UpdateAvailable;
+                                        view.update_visible_rows();
                                         cx.notify();
                                     });
                                 }),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child(format!(
+                                        "Agents: {} total, {} installed",
+                                        self.all_catalog_rows.len(),
+                                        self.acp_installed_count
+                                    )),
                             ),
                     )
-                    .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
                     .child(
-                        div().flex().flex_col().gap(px(8.0)).children(
-                            visible_rows
-                                .iter()
-                                .enumerate()
-                                .map(|(index, row)| {
-                                    let can_install = matches!(
-                                        row.install_status,
-                                        CatalogInstallStatus::NotInstalled
-                                    ) && (row
-                                        .selected_source
-                                        .as_ref()
-                                        .and_then(|source| source.spec.install.as_ref())
-                                        .is_some()
-                                        || row
-                                            .registry_manifest
-                                            .as_ref()
-                                            .and_then(|manifest| manifest.preferred_install_strategy())
-                                            .is_some());
-                                    let can_update = matches!(
-                                        row.install_status,
-                                        CatalogInstallStatus::UpdateAvailable
-                                    ) && row.registry_manifest.is_some();
-                                    let can_remove = row
-                                        .selected_source
-                                        .as_ref()
-                                        .map(|source| {
-                                            matches!(
-                                                source.source_type,
-                                                crate::acp::resolve::AgentSourceKind::Registry
-                                            )
-                                        })
-                                        .unwrap_or(false);
-                                    let can_auth = row
-                                        .selected_source
-                                        .as_ref()
-                                        .and_then(|source| source.spec.auth.as_ref())
-                                        .is_some();
-                                    let can_test = row.selected_source.is_some();
-                                    let other_sources = if row.other_sources.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            row.other_sources
-                                                .iter()
-                                                .map(|source| match source.source_type {
-                                                    crate::acp::resolve::AgentSourceKind::Registry => {
-                                                        "Registry".to_string()
-                                                    }
-                                                    crate::acp::resolve::AgentSourceKind::GlobalCustom => {
-                                                        "Custom".to_string()
-                                                    }
-                                                    crate::acp::resolve::AgentSourceKind::WorkspaceCustom => {
-                                                        "Workspace".to_string()
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(", "),
-                                        )
-                                    };
+                        div()
+                            .id("acp_list")
+                            .track_scroll(&self.acp_scroll)
+                            .overflow_scroll()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .children(
+                                self.visible_catalog_rows()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, row)| {
+                                    let can_install = row.can_install;
+                                    let can_update = row.can_update;
+                                    let can_remove = row.can_remove;
+                                    let can_auth = row.can_auth;
+                                    let can_test = row.can_test;
+                                    let other_sources = row.other_sources.clone();
+
                                     let install_handle = cx.entity().downgrade();
                                     let update_action_handle = cx.entity().downgrade();
                                     let remove_handle = cx.entity().downgrade();
@@ -1949,7 +2191,7 @@ impl SettingsView {
                                                                 .truncate()
                                                                 .child(format!("{} ({})", row.name, row.acp_id)),
                                                         )
-                                                        .child(self.render_source_badge(row))
+                                                        .child(self.render_source_badge(row.source_type))
                                                         .child(self.render_status_badge(row.install_status)),
                                                 )
                                                 .child(
@@ -1973,14 +2215,12 @@ impl SettingsView {
                                                         .text_color(rgb(0x6f6f6f))
                                                         .font_family("Cascadia Code")
                                                         .truncate()
-                                                        .child(if let Some(source) = &row.selected_source {
-                                                            source.spec.display_command()
-                                                        } else {
+                                                .child(row.display_command.clone().unwrap_or_else(|| {
                                                             row.version
                                                                 .as_ref()
                                                                 .map(|version| format!("registry v{version}"))
                                                                 .unwrap_or_else(|| "registry".to_string())
-                                                        }),
+                                                        })),
                                                 )
                                                 .child(if let Some(other_sources) = other_sources {
                                                     div()
@@ -2133,7 +2373,6 @@ impl SettingsView {
                                             .text_size(px(11.0))
                                             .text_color(rgb(0xbdbdbd))
                                             .font_family("Cascadia Code")
-                                            .truncate()
                                             .child(line)
                                     })),
                             )
@@ -2234,6 +2473,54 @@ fn split_string(input: &str, idx: usize) -> (String, String) {
     (left, right)
 }
 
+fn sanitize_action_log_line(line: &str) -> Option<String> {
+    let stripped = strip_ansi(line)
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == '\t')
+        .collect::<String>();
+    let normalized = stripped.trim().to_string();
+    if normalized.is_empty() || normalized.chars().all(|ch| ch == '.') {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if let Some(next) = chars.peek() {
+                match *next {
+                    '[' => {
+                        chars.next();
+                        for c in chars.by_ref() {
+                            if ('@'..='~').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    ']' => {
+                        chars.next();
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                                break;
+                            }
+                            prev = c;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_focused = self.focus_handle.is_focused(window);
@@ -2290,7 +2577,12 @@ impl Render for SettingsView {
                                         cx.stop_propagation();
                                         window.focus(&focus_handle);
                                     })
-                                    .child(self.render_search_input(is_focused)),
+                                    .child(self.render_search_input(
+                                        &self.search_query,
+                                        self.search_cursor,
+                                        self.search_selection,
+                                        is_focused,
+                                    )),
                             )
                             .child(div().flex().flex_col().gap(px(4.0)).children(
                                 self.sections.iter().enumerate().map(|(i, label)| {
@@ -2352,7 +2644,7 @@ impl Render for SettingsView {
                                     .min_w(px(0.0))
                                     .min_h(px(0.0))
                                     .gap(px(16.0))
-                                    .child(self.render_section_content(cx)),
+                                    .child(self.render_section_content(window, cx)),
                             ),
                     ),
             )

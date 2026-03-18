@@ -187,7 +187,10 @@ impl TabView {
             .flex()
             .items_center()
             .justify_center()
-            .child(lucide_icon(Icon::ArrowDownToLine, 16.0, 0xdddddd))
+            .child(
+                lucide_icon(Icon::ArrowDownToLine, 16.0, 0xdddddd)
+                    .cursor(CursorStyle::PointingHand),
+            )
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                 cx.stop_propagation();
                 let _ = handle.update(cx, |view, cx| {
@@ -1113,7 +1116,7 @@ impl TabView {
                 .bg(rgb(0x141414))
                 .border_1()
                 .border_color(rgb(0x2a2a2a))
-                .child(lucide_icon(icon, 12.0, 0x8a8a8a))
+                .child(lucide_icon(icon, 12.0, 0x8a8a8a).cursor(CursorStyle::PointingHand))
         };
         let agent_name = self
             .active_agent_name()
@@ -1168,11 +1171,14 @@ impl TabView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(lucide_icon(
-                                        Icon::Terminal,
-                                        13.0,
-                                        if agent_mode { 0x7f7f7f } else { 0x8eb8ff },
-                                    ))
+                                    .child(
+                                        lucide_icon(
+                                            Icon::Terminal,
+                                            13.0,
+                                            if agent_mode { 0x7f7f7f } else { 0x8eb8ff },
+                                        )
+                                        .cursor(CursorStyle::PointingHand),
+                                    )
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(Self::on_set_terminal_mode),
@@ -1197,11 +1203,14 @@ impl TabView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(lucide_icon(
-                                        Icon::Bot,
-                                        13.0,
-                                        if agent_mode { 0x8eb8ff } else { 0x7f7f7f },
-                                    ))
+                                    .child(
+                                        lucide_icon(
+                                            Icon::Bot,
+                                            13.0,
+                                            if agent_mode { 0x8eb8ff } else { 0x7f7f7f },
+                                        )
+                                        .cursor(CursorStyle::PointingHand),
+                                    )
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(Self::on_set_agent_mode),
@@ -1299,7 +1308,10 @@ impl TabView {
                                 gpui::MouseButton::Left,
                                 cx.listener(Self::on_open_path_picker),
                             )
-                            .child(lucide_icon(Icon::Folder, 12.0, 0x6b9eff))
+                            .child(
+                                lucide_icon(Icon::Folder, 12.0, 0x6b9eff)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
                             .child(
                                 div()
                                     .text_size(px(12.0))
@@ -1322,7 +1334,10 @@ impl TabView {
                                 gpui::MouseButton::Left,
                                 cx.listener(Self::on_open_branch_picker),
                             )
-                            .child(lucide_icon(Icon::GitBranch, 12.0, 0x6b9eff))
+                            .child(
+                                lucide_icon(Icon::GitBranch, 12.0, 0x6b9eff)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
                             .child(
                                 div()
                                     .text_size(px(12.0))
@@ -1334,7 +1349,10 @@ impl TabView {
                                     .flex()
                                     .items_center()
                                     .gap(px(4.0))
-                                    .child(lucide_icon(Icon::FileText, 12.0, 0x9a9a9a))
+                                    .child(
+                                        lucide_icon(Icon::FileText, 12.0, 0x9a9a9a)
+                                            .cursor(CursorStyle::PointingHand),
+                                    )
                                     .child(
                                         div()
                                             .text_size(px(11.0))
@@ -1377,7 +1395,10 @@ impl TabView {
                             .items_center()
                             .gap(px(8.0))
                             .flex_1()
-                            .child(lucide_icon(Icon::ChevronRight, 16.0, 0x6b9eff))
+                            .child(
+                                lucide_icon(Icon::ChevronRight, 16.0, 0x6b9eff)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
                             .child(self.render_input_text(is_focused)),
                     )
                     .child(
@@ -2028,7 +2049,7 @@ impl TabView {
                 } else {
                     rgb(0x1f1f1f)
                 })
-                .child(lucide_icon(icon, 14.0, 0x9a9a9a))
+                .child(lucide_icon(icon, 14.0, 0x9a9a9a).cursor(CursorStyle::PointingHand))
                 .child(
                     div()
                         .text_size(px(13.0))
@@ -2115,7 +2136,9 @@ impl TabView {
                 } else {
                     rgb(0x1f1f1f)
                 })
-                .child(lucide_icon(Icon::GitBranch, 14.0, 0x9a9a9a))
+                .child(
+                    lucide_icon(Icon::GitBranch, 14.0, 0x9a9a9a).cursor(CursorStyle::PointingHand),
+                )
                 .child(
                     div()
                         .text_size(px(13.0))
@@ -3117,6 +3140,8 @@ impl TabView {
             .bg(rgb(0x141414))
             .border_1()
             .border_color(rgb(0x2a2a2a))
+            .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+            .cursor(CursorStyle::PointingHand)
             .child(lucide_icon(Icon::Clipboard, 12.0, 0xb8b8b8))
             .on_mouse_down(
                 MouseButton::Left,

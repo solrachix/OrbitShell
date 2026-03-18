@@ -206,7 +206,7 @@ impl WelcomeView {
             .gap(px(12.0))
             .p(px(12.0))
             .rounded(px(6.0))
-            .child(lucide_icon(icon, 12.0, 0x888888))
+            .child(lucide_icon(icon, 12.0, 0x888888).cursor(CursorStyle::PointingHand))
             .child(
                 div()
                     .flex()
@@ -301,6 +301,8 @@ impl Render for WelcomeView {
                         Some(entry.last_opened),
                         cx,
                     )
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
                 })
                 .collect()
         };
@@ -319,21 +321,33 @@ impl Render for WelcomeView {
                 div()
                     .flex()
                     .gap(px(16.0))
-                    .child(action_button(
-                        Icon::Plus,
-                        "Create new project",
-                        cx.listener(Self::on_create_project),
-                    ))
-                    .child(action_button(
-                        Icon::FolderOpen,
-                        "Open repository",
-                        cx.listener(Self::on_open_repository),
-                    ))
-                    .child(action_button(
-                        Icon::GitBranch,
-                        "Clone repository",
-                        cx.listener(Self::on_clone_repository),
-                    )),
+                    .child(
+                        action_button(
+                            Icon::Plus,
+                            "Create new project",
+                            cx.listener(Self::on_create_project),
+                        )
+                        .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                        .cursor(CursorStyle::PointingHand),
+                    )
+                    .child(
+                        action_button(
+                            Icon::FolderOpen,
+                            "Open repository",
+                            cx.listener(Self::on_open_repository),
+                        )
+                        .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                        .cursor(CursorStyle::PointingHand),
+                    )
+                    .child(
+                        action_button(
+                            Icon::GitBranch,
+                            "Clone repository",
+                            cx.listener(Self::on_clone_repository),
+                        )
+                        .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                        .cursor(CursorStyle::PointingHand),
+                    ),
             )
             .child(
                 // Recent section
@@ -408,15 +422,18 @@ impl WelcomeView {
                             .border_1()
                             .border_color(rgb(0x1a1a1a))
                             .shadow_lg()
-                            .child(lucide_icon(
-                                if overlay == &WelcomeOverlay::CloneRepository {
-                                    Icon::GitBranch
-                                } else {
-                                    Icon::Sparkles
-                                },
-                                18.0,
-                                0x888888,
-                            ))
+                            .child(
+                                lucide_icon(
+                                    if overlay == &WelcomeOverlay::CloneRepository {
+                                        Icon::GitBranch
+                                    } else {
+                                        Icon::Sparkles
+                                    },
+                                    18.0,
+                                    0x888888,
+                                )
+                                .cursor(CursorStyle::PointingHand),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -463,7 +480,10 @@ impl WelcomeView {
                                     } else {
                                         rgb(0x000000)
                                     })
-                                    .child(lucide_icon(Icon::MessageSquarePlus, 14.0, 0x666666))
+                                    .child(
+                                        lucide_icon(Icon::MessageSquarePlus, 14.0, 0x666666)
+                                            .cursor(CursorStyle::PointingHand),
+                                    )
                                     .child(
                                         div()
                                             .text_size(px(13.0))
@@ -501,7 +521,7 @@ fn action_button(
         .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
             on_click(event, window, cx)
         })
-        .child(lucide_icon(icon, 20.0, 0xcccccc))
+        .child(lucide_icon(icon, 20.0, 0xcccccc).cursor(CursorStyle::PointingHand))
         .child(
             div()
                 .text_size(px(12.0))
