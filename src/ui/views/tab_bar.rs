@@ -1,4 +1,5 @@
 use gpui::AnimationExt as _;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use lucide_icons::Icon;
 use std::time::Duration;
@@ -770,8 +771,8 @@ impl Render for TabBar {
                             .child(lucide_icon(Icon::Plus, 14.0, 0x9a9a9a)),
                     )
                     .child(div()),
-            )
-            // drag area spacer
+            );
+        let root = root
             .child(
                 div()
                     .flex_1()
@@ -780,9 +781,16 @@ impl Render for TabBar {
                     .bg(rgb(0x1a1a1a))
                     .occlude()
                     .cursor(CursorStyle::OpenHand)
-                    .window_control_area(WindowControlArea::Drag),
+                    .when(cfg!(target_os = "linux"), |div| {
+                        div.on_mouse_down(MouseButton::Left, |_event, window, cx| {
+                            cx.stop_propagation();
+                            window.start_window_move();
+                        })
+                    })
+                    .when(!cfg!(target_os = "linux"), |div| {
+                        div.window_control_area(WindowControlArea::Drag)
+                    }),
             )
-            // window controls + user menu
             .child(
                 div()
                     .flex()
@@ -790,7 +798,6 @@ impl Render for TabBar {
                     .items_center()
                     .gap(px(10.0))
                     .child(
-                        // user avatar
                         div()
                             .flex()
                             .items_center()

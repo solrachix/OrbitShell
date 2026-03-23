@@ -8,7 +8,6 @@ fn main() {
             .add_fonts(vec![Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES)])
             .ok();
         let mut options = WindowOptions::default();
-        // Use a custom client-decorated window so our TabBar acts as the title bar.
         options.titlebar = Some(TitlebarOptions {
             title: Some("OrbitShell".into()),
             appears_transparent: true,
