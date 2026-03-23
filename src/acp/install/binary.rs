@@ -82,11 +82,15 @@ pub fn install_binary_from_file(
         install_root: version_root.clone(),
         resolved_command: resolved_command.clone(),
         resolved_args: spec.args.clone(),
+        launcher_command: None,
+        launcher_args: Vec::new(),
     });
     state.set_active_version(&spec.version);
     state.install_root = Some(version_root);
     state.resolved_command = Some(resolved_command);
     state.resolved_args = spec.args.clone();
+    state.launcher_command = None;
+    state.launcher_args.clear();
 
     Ok(executable_path)
 }

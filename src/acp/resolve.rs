@@ -1,3 +1,4 @@
+use crate::acp::install::runner::choose_installed_npx_launch;
 use crate::acp::install::state::{ManagedAgentState, ManagedAgentsStateFile};
 use crate::acp::manager::{AgentRegistry, AgentSpec};
 use crate::acp::registry::cache;
@@ -250,11 +251,12 @@ fn load_managed_candidates() -> Result<Vec<AgentCandidate>> {
         let Some(manifest) = cache::load_registry_manifest(&app_root, &state.id)? else {
             continue;
         };
+        let (command, args) = resolved_managed_command(&manifest, &state, &active_install);
         let spec = AgentSpec {
             id: manifest.id.clone(),
             name: manifest.name.clone(),
-            command: active_install.resolved_command.clone(),
-            args: active_install.resolved_args.clone(),
+            command,
+            args,
             fixed_env: managed_distribution_env(&manifest, &state),
             env_keys: Vec::new(),
             install: None,
@@ -272,6 +274,32 @@ fn load_managed_candidates() -> Result<Vec<AgentCandidate>> {
     }
 
     Ok(candidates)
+}
+
+fn resolved_managed_command(
+    manifest: &RegistryManifest,
+    state: &ManagedAgentState,
+    active_install: &crate::acp::install::state::ManagedInstalledVersion,
+) -> (String, Vec<String>) {
+    if let Some(command) = active_install.launcher_command.as_ref() {
+        return (command.clone(), active_install.launcher_args.clone());
+    }
+
+    if let Some(command) = state.launcher_command.as_ref() {
+        return (command.clone(), state.launcher_args.clone());
+    }
+
+    if matches!(state.distribution_kind.as_deref(), Some("npx"))
+        && let Some(dist) = manifest.distribution.npx.as_ref()
+        && let Ok(launch) = choose_installed_npx_launch(&dist.package, &dist.args)
+    {
+        return (launch.command, launch.args);
+    }
+
+    (
+        active_install.resolved_command.clone(),
+        active_install.resolved_args.clone(),
+    )
 }
 
 fn managed_distribution_env(

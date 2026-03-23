@@ -1,7 +1,9 @@
 pub mod client;
 pub mod install;
 pub mod manager;
+pub mod model_discovery;
 pub mod registry;
 pub mod resolve;
+pub mod runtime_prefs;
 pub mod storage;
 pub mod transport;

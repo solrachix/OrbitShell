@@ -6,7 +6,7 @@ use orbitshell::acp::registry::fetch::{
 };
 use orbitshell::acp::registry::model::{
     RegistryCacheMeta, RegistryCatalogEntry, RegistryDistribution, RegistryManifest,
-    RegistryPackageDistribution,
+    RegistryModelCatalogEntry, RegistryPackageDistribution,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -61,6 +61,12 @@ fn manifest_with_version(version: &str) -> RegistryManifest {
             uvx: None,
             binary: BTreeMap::new(),
         },
+        model_catalog: vec![RegistryModelCatalogEntry {
+            id: "gpt-5.3".into(),
+            label: "GPT-5.3".into(),
+            description: Some("Stable default".into()),
+            is_default: true,
+        }],
     }
 }
 
@@ -278,7 +284,21 @@ fn parse_registry_snapshot_json_supports_official_agents_array_shape() {
               "package": "@zed-industries/codex-acp@0.10.0",
               "args": ["--acp"]
             }
-          }
+          },
+          "modelCatalog": [
+            {
+              "id": "gpt-5.3",
+              "label": "GPT-5.3",
+              "description": "Stable default",
+              "isDefault": true
+            },
+            {
+              "id": "gpt-5.4",
+              "label": "GPT-5.4",
+              "description": "Preview",
+              "isDefault": false
+            }
+          ]
         }
       ]
     }
@@ -299,4 +319,8 @@ fn parse_registry_snapshot_json_supports_official_agents_array_shape() {
             .map(|dist| dist.package.as_str()),
         Some("@zed-industries/codex-acp@0.10.0")
     );
+    assert_eq!(snapshot.manifests[0].model_catalog.len(), 2);
+    assert_eq!(snapshot.manifests[0].model_catalog[0].id, "gpt-5.3");
+    assert!(snapshot.manifests[0].model_catalog[0].is_default);
+    assert_eq!(snapshot.manifests[0].model_catalog[1].label, "GPT-5.4");
 }

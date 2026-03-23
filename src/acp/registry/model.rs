@@ -51,6 +51,17 @@ pub struct RegistryDistribution {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryModelCatalogEntry {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "isDefault", default)]
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegistryManifest {
     pub id: String,
     pub name: String,
@@ -67,6 +78,8 @@ pub struct RegistryManifest {
     pub icon: Option<String>,
     #[serde(default)]
     pub distribution: RegistryDistribution,
+    #[serde(rename = "modelCatalog", default)]
+    pub model_catalog: Vec<RegistryModelCatalogEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

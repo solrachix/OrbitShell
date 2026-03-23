@@ -11,6 +11,10 @@ pub struct ManagedInstalledVersion {
     pub resolved_command: String,
     #[serde(default)]
     pub resolved_args: Vec<String>,
+    #[serde(default)]
+    pub launcher_command: Option<String>,
+    #[serde(default)]
+    pub launcher_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +27,10 @@ pub struct ManagedAgentState {
     pub resolved_command: Option<String>,
     #[serde(default)]
     pub resolved_args: Vec<String>,
+    #[serde(default)]
+    pub launcher_command: Option<String>,
+    #[serde(default)]
+    pub launcher_args: Vec<String>,
     pub active_version: Option<String>,
     #[serde(default)]
     pub installed_versions: Vec<ManagedInstalledVersion>,

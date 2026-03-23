@@ -34,6 +34,11 @@ pub struct AgentSpec {
 
 impl AgentSpec {
     pub fn is_available(&self) -> bool {
+        let command_path = Path::new(&self.command);
+        if command_path.is_absolute() || self.command.contains(['\\', '/']) {
+            return command_path.is_file();
+        }
+
         let probe = if cfg!(windows) { "where" } else { "which" };
         Command::new(probe)
             .arg(&self.command)

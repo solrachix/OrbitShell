@@ -1,4 +1,4 @@
-use crate::acp::client::AcpClient;
+use crate::acp::client::{AcpClient, AcpResponseText, PermissionDecision, PermissionRequest};
 use crate::acp::manager::{AgentCommandSpec, AgentSpec};
 use crate::acp::resolve::{AgentKey, ConflictPolicy, EffectiveAgentRow, load_effective_agent_rows};
 use futures::StreamExt;
@@ -16,13 +16,20 @@ pub struct AgentView {
     input: String,
     cursor: usize,
     lines: Vec<String>,
+    streaming: Option<String>,
     busy: bool,
     action_busy: bool,
 }
 
 enum AgentStreamEvent {
     Update { text: String, append: bool },
-    Done(Result<Option<String>, String>),
+    Done(Result<Option<AcpResponseText>, String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentStreamOp {
+    Append,
+    Replace,
 }
 
 impl AgentView {
@@ -52,6 +59,7 @@ impl AgentView {
             input: String::new(),
             cursor: 0,
             lines,
+            streaming: None,
             busy: false,
             action_busy: false,
         }
@@ -312,17 +320,41 @@ impl AgentView {
     }
 
     fn append_line(&mut self, line: impl Into<String>) {
+        self.flush_streaming();
         self.lines.push(line.into());
     }
 
-    fn append_stream_update(&mut self, text: String, append: bool) {
-        if append {
-            if let Some(last) = self.lines.last_mut() {
-                last.push_str(&text);
-                return;
+    fn flush_streaming(&mut self) {
+        if let Some(buf) = self.streaming.take() {
+            if !buf.trim().is_empty() {
+                self.lines.push(buf);
             }
         }
-        self.lines.push(text);
+    }
+
+    fn push_stream_update(&mut self, text: String, append: bool) {
+        let normalized = strip_ansi(&text).replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.trim().is_empty() {
+            return;
+        }
+
+        if !append {
+            self.flush_streaming();
+            self.lines.push(normalized);
+            return;
+        }
+
+        let prev = self.streaming.as_deref().unwrap_or("");
+        match classify_stream_chunk(prev, &normalized) {
+            AgentStreamOp::Replace => {
+                self.streaming = Some(normalized);
+            }
+            AgentStreamOp::Append => {
+                self.streaming
+                    .get_or_insert_with(String::new)
+                    .push_str(&normalized);
+            }
+        }
     }
 
     fn submit_prompt(&mut self, cx: &mut Context<Self>) {
@@ -357,7 +389,7 @@ impl AgentView {
 
         let (tx, mut rx) = mpsc::unbounded::<AgentStreamEvent>();
         thread::spawn(move || {
-            let result = (|| -> Result<Option<String>, String> {
+            let result = (|| -> Result<Option<AcpResponseText>, String> {
                 let mut guard = client
                     .lock()
                     .map_err(|_| "ACP client lock poisoned".to_string())?;
@@ -369,14 +401,22 @@ impl AgentView {
                     .to_string_lossy()
                     .to_string();
                 let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
-                let session_id = guard
-                    .ensure_session(&cwd, &runtime_mcp)
+                let bootstrap = guard
+                    .ensure_session(&cwd, &runtime_mcp, None)
                     .map_err(|err| err.to_string())?;
                 let mut on_update = |text: String, append: bool| {
                     let _ = tx.unbounded_send(AgentStreamEvent::Update { text, append });
                 };
+                let mut on_permission_request = |_request: PermissionRequest| {
+                    Ok::<PermissionDecision, anyhow::Error>(PermissionDecision::Cancelled)
+                };
                 guard
-                    .prompt(&session_id, &prompt, &mut on_update)
+                    .prompt(
+                        &bootstrap.session_id,
+                        &prompt,
+                        &mut on_update,
+                        &mut on_permission_request,
+                    )
                     .map_err(|err| err.to_string())
             })();
             let _ = tx.unbounded_send(AgentStreamEvent::Done(result));
@@ -390,12 +430,15 @@ impl AgentView {
                         .update(&mut cx, |view, cx| {
                             match event {
                                 AgentStreamEvent::Update { text, append } => {
-                                    view.append_stream_update(text, append);
+                                    view.push_stream_update(text, append);
                                 }
                                 AgentStreamEvent::Done(result) => {
                                     view.busy = false;
+                                    view.flush_streaming();
                                     match result {
-                                        Ok(Some(final_text)) => view.append_line(final_text),
+                                        Ok(Some(final_text)) => {
+                                            view.append_line(final_text.text().to_string())
+                                        }
                                         Ok(None) => {}
                                         Err(err) => view.append_line(format!("[agent] {err}")),
                                     }
@@ -698,13 +741,16 @@ impl Render for AgentView {
                     div()
                         .flex_col()
                         .gap(px(6.0))
-                        .children(self.lines.iter().map(|line| {
-                            div()
-                                .text_size(px(12.5))
-                                .font_family("Cascadia Code")
-                                .text_color(rgb(0xc9c9c9))
-                                .child(line.clone())
-                        })),
+                        .children(
+                            self.lines
+                                .iter()
+                                .flat_map(|line| render_wrapped_agent_text(line)),
+                        )
+                        .children(
+                            self.streaming
+                                .iter()
+                                .flat_map(|line| render_wrapped_agent_text(line)),
+                        ),
                 ),
             )
             .child(
@@ -762,4 +808,149 @@ fn split_at_cursor(input: &str, cursor: usize) -> (String, String) {
         }
     }
     (left, right)
+}
+
+fn classify_stream_chunk(previous: &str, new: &str) -> AgentStreamOp {
+    let lower = new.trim_start().to_ascii_lowercase();
+    let looks_like_snapshot = new.starts_with("```")
+        || lower.starts_with("directory:")
+        || lower.starts_with("mode")
+        || (!previous.is_empty() && new.len() > previous.len() && new.starts_with(previous))
+        || (new.contains('\n') && new.ends_with('\n'));
+
+    if looks_like_snapshot {
+        AgentStreamOp::Replace
+    } else {
+        AgentStreamOp::Append
+    }
+}
+
+fn render_wrapped_agent_text(line: &str) -> Vec<Div> {
+    wrap_agent_text_lines(line, 96)
+        .into_iter()
+        .map(|wrapped| {
+            div()
+                .min_w(px(0.0))
+                .text_size(px(12.5))
+                .font_family("Cascadia Code")
+                .text_color(rgb(0xc9c9c9))
+                .child(wrapped)
+        })
+        .collect()
+}
+
+fn wrap_agent_text_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut wrapped = Vec::new();
+
+    for line in normalized.split('\n') {
+        wrapped.extend(wrap_agent_line(line, max_chars));
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn wrap_agent_line(line: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_len = 0usize;
+
+    for ch in line.chars() {
+        chunk.push(ch);
+        chunk_len += 1;
+
+        if chunk_len >= max_chars {
+            wrapped.push(std::mem::take(&mut chunk));
+            chunk_len = 0;
+        }
+    }
+
+    if !chunk.is_empty() {
+        wrapped.push(chunk);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+
+        out.push(ch);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentStreamOp, classify_stream_chunk, strip_ansi, wrap_agent_line, wrap_agent_text_lines,
+    };
+
+    #[test]
+    fn classify_stream_chunk_detects_snapshot_prefix_growth() {
+        assert_eq!(
+            classify_stream_chunk(
+                "Directory: C:\\repo\nassets",
+                "Directory: C:\\repo\nassets\ndocs"
+            ),
+            AgentStreamOp::Replace
+        );
+    }
+
+    #[test]
+    fn classify_stream_chunk_keeps_small_inline_delta_as_append() {
+        assert_eq!(
+            classify_stream_chunk("Vou listar", " o diretório"),
+            AgentStreamOp::Append
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_sequences() {
+        assert_eq!(strip_ansi("\u{1b}[32;1mMode\u{1b}[0m"), "Mode");
+    }
+
+    #[test]
+    fn wrap_agent_line_preserves_multiple_rows() {
+        assert_eq!(
+            wrap_agent_line("abcdefgh", 3),
+            vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_agent_text_lines_splits_embedded_newlines_before_wrapping() {
+        assert_eq!(
+            wrap_agent_text_lines("abc\ndefghi", 3),
+            vec!["abc".to_string(), "def".to_string(), "ghi".to_string(),]
+        );
+    }
 }

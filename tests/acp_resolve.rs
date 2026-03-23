@@ -2,7 +2,8 @@ use orbitshell::acp::install::state::ManagedAgentState;
 use orbitshell::acp::manager::AgentSpec;
 use orbitshell::acp::registry::fetch::CachedRegistryData;
 use orbitshell::acp::registry::model::{
-    RegistryCatalogEntry, RegistryDistribution, RegistryManifest, RegistryPackageDistribution,
+    RegistryCatalogEntry, RegistryDistribution, RegistryManifest, RegistryModelCatalogEntry,
+    RegistryPackageDistribution,
 };
 use orbitshell::acp::resolve::{
     AgentCandidate, AgentKey, AgentSourceKind, CatalogFilter, CatalogInstallStatus, ConflictPolicy,
@@ -70,7 +71,7 @@ fn registry_manifest(id: &str, name: &str, version: &str, description: &str) -> 
         repository: None,
         authors: Vec::new(),
         license: None,
-        icon: None,
+        icon: Some(format!("https://cdn.example.com/{id}.svg")),
         distribution: RegistryDistribution {
             npx: Some(RegistryPackageDistribution {
                 package: format!("{id}@{version}"),
@@ -80,6 +81,12 @@ fn registry_manifest(id: &str, name: &str, version: &str, description: &str) -> 
             uvx: None,
             binary: BTreeMap::new(),
         },
+        model_catalog: vec![RegistryModelCatalogEntry {
+            id: "gpt-5.3".into(),
+            label: "GPT-5.3".into(),
+            description: Some("Stable".into()),
+            is_default: true,
+        }],
     }
 }
 
@@ -333,5 +340,33 @@ fn catalog_rows_keep_other_sources_for_disclosure() {
     assert_eq!(
         catalog[0].other_sources[0].agent_key.source_type,
         AgentSourceKind::Registry
+    );
+}
+
+#[test]
+fn catalog_rows_propagate_registry_icon_url() {
+    let cached = CachedRegistryData {
+        index: vec![registry_entry(
+            "codex-acp",
+            "Codex CLI",
+            "0.10.0",
+            "ACP adapter for OpenAI",
+        )],
+        meta: None,
+        manifests: BTreeMap::from([(
+            "codex-acp".into(),
+            registry_manifest("codex-acp", "Codex CLI", "0.10.0", "ACP adapter for OpenAI"),
+        )]),
+    };
+
+    let catalog = build_catalog_rows(Some(&cached), &[]);
+
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(
+        catalog[0]
+            .registry_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.icon.as_deref()),
+        Some("https://cdn.example.com/codex-acp.svg")
     );
 }

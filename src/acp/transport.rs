@@ -11,8 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncomingRequest {
+    pub id: u64,
+    pub method: String,
+    pub params: Value,
+}
+
+#[derive(Debug)]
 pub enum IncomingEvent {
     Json(Value),
+    Request(IncomingRequest),
     Stderr(String),
     Closed,
 }
@@ -137,7 +146,7 @@ impl AcpTransport {
                         }
                         match serde_json::from_str::<Value>(trimmed) {
                             Ok(json) => {
-                                let _ = tx.send(IncomingEvent::Json(json));
+                                let _ = tx.send(classify_incoming_json_message(&json));
                             }
                             Err(_) => {
                                 let _ = tx.send(IncomingEvent::Stderr(content));
@@ -181,16 +190,51 @@ impl AcpTransport {
             .context("failed to write ACP notification")
     }
 
-    pub fn request<F>(
+    pub fn respond_result(&self, id: u64, result: Value) -> Result<()> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        });
+        self.stdin_tx
+            .send(payload.to_string())
+            .context("failed to write ACP response")
+    }
+
+    pub fn respond_error(
+        &self,
+        id: u64,
+        code: i64,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Result<()> {
+        let mut error = json!({
+            "code": code,
+            "message": message.into(),
+        });
+        if let Some(data) = data
+            && let Some(object) = error.as_object_mut()
+        {
+            object.insert("data".into(), data);
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": error
+        });
+        self.stdin_tx
+            .send(payload.to_string())
+            .context("failed to write ACP error response")
+    }
+
+    pub fn request(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
-        mut on_notification: Option<&mut F>,
-    ) -> Result<Value>
-    where
-        F: FnMut(&str, &Value),
-    {
+        mut on_notification: Option<&mut dyn FnMut(&str, &Value)>,
+        mut on_request: Option<&mut dyn FnMut(&IncomingRequest) -> Result<()>>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -230,8 +274,8 @@ impl AcpTransport {
                 IncomingEvent::Json(msg) => {
                     if let Some(method_name) = msg.get("method").and_then(Value::as_str) {
                         if let Some(params) = msg.get("params") {
-                            if let Some(handler) = &mut on_notification {
-                                handler(method_name, params);
+                            if let Some(handler) = on_notification.as_mut() {
+                                (*handler)(method_name, params);
                             }
                         }
                         continue;
@@ -242,18 +286,83 @@ impl AcpTransport {
                         continue;
                     }
                 }
+                IncomingEvent::Request(request) => {
+                    if let Some(handler) = on_request.as_mut() {
+                        (*handler)(&request)?;
+                    } else {
+                        return Err(anyhow!(
+                            "unexpected inbound ACP request '{}' while waiting for method '{method}'",
+                            request.method
+                        ));
+                    }
+                }
                 IncomingEvent::Stderr(line) => {
                     if !line.trim().is_empty() {
                         last_diagnostic = Some(line.clone());
                     }
-                    if let Some(handler) = &mut on_notification {
-                        handler("stderr", &Value::String(line));
+                    if let Some(handler) = on_notification.as_mut() {
+                        (*handler)("stderr", &Value::String(line));
                     }
                 }
                 IncomingEvent::Closed => {
                     return Err(anyhow!("ACP agent process closed unexpectedly"));
                 }
             }
+        }
+    }
+}
+
+pub fn classify_incoming_json_message(msg: &Value) -> IncomingEvent {
+    if let Some(id) = msg.get("id").and_then(Value::as_u64)
+        && let Some(method) = msg.get("method").and_then(Value::as_str)
+    {
+        return IncomingEvent::Request(IncomingRequest {
+            id,
+            method: method.to_string(),
+            params: msg.get("params").cloned().unwrap_or(Value::Null),
+        });
+    }
+
+    IncomingEvent::Json(msg.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_incoming_json_message;
+    use serde_json::json;
+
+    #[test]
+    fn classify_json_request_distinguishes_request_from_notification() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "title": "Approve access"
+            }
+        });
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "message": "hello"
+            }
+        });
+
+        match classify_incoming_json_message(&request) {
+            super::IncomingEvent::Request(request) => {
+                assert_eq!(request.id, 99);
+                assert_eq!(request.method, "session/request_permission");
+                assert_eq!(request.params["title"], "Approve access");
+            }
+            other => panic!("expected request event, got {other:?}"),
+        }
+
+        match classify_incoming_json_message(&notification) {
+            super::IncomingEvent::Json(value) => {
+                assert_eq!(value["method"], "session/update");
+            }
+            other => panic!("expected notification json event, got {other:?}"),
         }
     }
 }

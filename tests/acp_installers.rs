@@ -1,6 +1,7 @@
 use orbitshell::acp::install::binary::{BinaryInstallSpec, install_binary_from_file};
 use orbitshell::acp::install::runner::{
-    LaunchCommand, build_npx_launch, build_uvx_launch, remove_launch_wrapper, write_launch_wrapper,
+    LaunchCommand, build_npx_launch, build_uvx_launch, choose_npx_launch, npx_launch_candidates,
+    remove_launch_wrapper, write_launch_wrapper,
 };
 use orbitshell::acp::install::state::{ManagedAgentState, ManagedInstalledVersion};
 use sha2::{Digest, Sha256};
@@ -9,13 +10,40 @@ use std::io::Write;
 #[test]
 fn npx_wrapper_pins_package_version() {
     let launch = build_npx_launch("@zed-industries/codex-acp", "0.10.0");
-    assert!(launch.command.contains("npx"));
     assert!(
         launch
             .args
             .iter()
             .any(|arg| arg.contains("@zed-industries/codex-acp@0.10.0"))
     );
+}
+
+#[test]
+fn npx_launch_candidates_are_ordered_with_windows_fallbacks_first() {
+    let candidates = npx_launch_candidates("@zed-industries/codex-acp@0.10.0", &[]);
+    if cfg!(windows) {
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].command, "npm.cmd");
+        assert_eq!(candidates[1].command, "npx.cmd");
+        assert_eq!(candidates[2].command, "npx");
+    } else {
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].command, "npx");
+    }
+}
+
+#[test]
+fn choose_npx_launch_picks_first_working_candidate() {
+    let selected = choose_npx_launch("@zed-industries/codex-acp@0.10.0", &[], |candidate| {
+        Ok(candidate.command == if cfg!(windows) { "npx.cmd" } else { "npx" })
+    })
+    .expect("select launch");
+
+    if cfg!(windows) {
+        assert_eq!(selected.command, "npx.cmd");
+    } else {
+        assert_eq!(selected.command, "npx");
+    }
 }
 
 #[test]
@@ -71,18 +99,23 @@ fn active_version_is_driven_by_recorded_installations() {
         install_root: "C:/tmp/0.9.0".into(),
         resolved_command: "npx".into(),
         resolved_args: vec!["pkg@0.9.0".into()],
+        launcher_command: Some("npm.cmd".into()),
+        launcher_args: vec!["exec".into()],
     });
     state.record_installed_version(ManagedInstalledVersion {
         version: "1.0.0".into(),
         install_root: "C:/tmp/1.0.0".into(),
         resolved_command: "npx".into(),
         resolved_args: vec!["pkg@1.0.0".into()],
+        launcher_command: Some("npx.cmd".into()),
+        launcher_args: vec!["-y".into()],
     });
     state.set_active_version("1.0.0");
 
     let active = state.active_install().expect("active install");
     assert_eq!(active.version, "1.0.0");
     assert_eq!(active.resolved_command, "npx");
+    assert_eq!(active.launcher_command.as_deref(), Some("npx.cmd"));
 }
 
 #[test]

@@ -2,22 +2,30 @@ use crate::git::get_git_branches;
 use crate::git::get_git_status;
 use crate::terminal::TerminalPty;
 use crate::{
-    acp::client::AcpClient,
+    acp::client::{
+        AcpClient, AcpResponseText, PermissionDecision, PermissionOption, PermissionRequest,
+    },
     acp::manager::AgentCommandSpec,
+    acp::model_discovery::{self, AcpModelOption},
+    acp::registry::fetch::load_cached_registry,
+    acp::registry::model::RegistryManifest,
     acp::resolve::{AgentKey, ConflictPolicy, EffectiveAgentRow, load_effective_agent_rows},
+    acp::runtime_prefs::RuntimePreferences,
+    acp::storage,
 };
+use anyhow::anyhow;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::*;
 use lucide_icons::Icon;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ui::icons::lucide_icon;
+use crate::ui::icons::{lucide_icon, registry_avatar};
 use crate::ui::recent::RecentEntry;
 use crate::ui::text_edit::TextEditState;
 use crate::ui::views::agent_view::AgentView;
@@ -54,6 +62,7 @@ pub struct TabView {
     last_line_incomplete: bool,
     total_output_lines: usize,
     follow_output: bool,
+    last_scroll_to_bottom_at: Instant,
     input_mode: InputMode,
     agent_rows: Vec<EffectiveAgentRow>,
     agent_selected_key: Option<AgentKey>,
@@ -61,6 +70,11 @@ pub struct TabView {
     agent_client_key: Option<AgentKey>,
     agent_busy: bool,
     agent_needs_auth: bool,
+    runtime_preferences: Arc<Mutex<RuntimePreferences>>,
+    registry_manifests: BTreeMap<String, RegistryManifest>,
+    discovered_models: Vec<AcpModelOption>,
+    model_options_loading: bool,
+    selected_model_override: Option<String>,
     selected_block: Option<usize>,
     output_selection_anchor: Option<(usize, usize)>,
     output_selection_head: Option<(usize, usize)>,
@@ -73,6 +87,12 @@ struct Block {
     output_lines: Vec<String>,
     has_error: bool,
     context: Option<BlockContext>,
+    agent_placeholder_active: bool,
+    pending_permission: Option<AgentPermissionPrompt>,
+    agent_stream_text: String,
+    agent_stream_line_index: Option<usize>,
+    agent_response: Option<AcpResponseText>,
+    agent_response_line_count: usize,
 }
 
 #[derive(Clone)]
@@ -87,7 +107,7 @@ struct BlockContext {
 
 struct PathPickerState {
     cwd: PathBuf,
-    query: String,
+    query: PickerQueryState,
     entries: Vec<PathEntry>,
     selected: usize,
 }
@@ -99,19 +119,329 @@ struct PathEntry {
 }
 
 struct BranchPickerState {
-    query: String,
+    query: PickerQueryState,
     all_branches: Vec<String>,
     branches: Vec<String>,
     selected: usize,
+}
+
+struct AgentPickerState {
+    all_options: Vec<EffectiveAgentRow>,
+    query: PickerQueryState,
+    options: Vec<EffectiveAgentRow>,
+    selected: usize,
+}
+
+struct ModelPickerState {
+    all_options: Vec<AcpModelOption>,
+    query: PickerQueryState,
+    options: Vec<AcpModelOption>,
+    selected: usize,
+}
+
+#[derive(Clone, Default)]
+struct PickerQueryState {
+    text: String,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    anchor: Option<usize>,
 }
 
 struct TooltipView {
     text: String,
 }
 
+fn build_agent_picker_state(
+    agent_rows: &[EffectiveAgentRow],
+    selected_key: Option<&AgentKey>,
+) -> Option<AgentPickerState> {
+    if agent_rows.is_empty() {
+        return None;
+    }
+
+    let selected = selected_key
+        .and_then(|key| agent_rows.iter().position(|row| row.agent_key == *key))
+        .unwrap_or(0);
+
+    Some(AgentPickerState {
+        all_options: agent_rows.to_vec(),
+        query: PickerQueryState::default(),
+        options: agent_rows.to_vec(),
+        selected,
+    })
+}
+
+fn build_model_picker_state(
+    catalog: &[AcpModelOption],
+    selected_model_id: Option<&str>,
+) -> Option<ModelPickerState> {
+    if catalog.is_empty() {
+        return None;
+    }
+
+    let selected = selected_model_id
+        .and_then(|id| catalog.iter().position(|model| model.id == id))
+        .or_else(|| catalog.iter().position(|model| model.is_default))
+        .unwrap_or(0);
+
+    Some(ModelPickerState {
+        all_options: catalog.to_vec(),
+        query: PickerQueryState::default(),
+        options: catalog.to_vec(),
+        selected,
+    })
+}
+
 enum Overlay {
     Path(PathPickerState),
     Branch(BranchPickerState),
+    Agent(AgentPickerState),
+    #[allow(dead_code)]
+    Model(ModelPickerState),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PickerKind {
+    Path,
+    Branch,
+    Agent,
+    Model,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PickerMode {
+    ImmediateSearch,
+    ConditionalSearch,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InitialFocusTarget {
+    SearchInput,
+    List,
+}
+
+#[allow(dead_code)]
+fn picker_has_search_input(kind: PickerKind, option_count: usize) -> bool {
+    matches!(kind, PickerKind::Path | PickerKind::Branch) || option_count >= 6
+}
+
+#[allow(dead_code)]
+fn picker_typeahead_enabled(kind: PickerKind, option_count: usize) -> bool {
+    matches!(kind, PickerKind::Agent | PickerKind::Model) && option_count <= 5
+}
+
+#[allow(dead_code)]
+fn picker_header_is_static(kind: PickerKind, option_count: usize) -> bool {
+    matches!(kind, PickerKind::Agent | PickerKind::Model) && option_count <= 5
+}
+
+#[allow(dead_code)]
+fn picker_initial_focus_target(kind: PickerKind) -> InitialFocusTarget {
+    match kind {
+        PickerKind::Path | PickerKind::Branch => InitialFocusTarget::SearchInput,
+        PickerKind::Agent | PickerKind::Model => InitialFocusTarget::List,
+    }
+}
+
+fn clickable_cursor() -> CursorStyle {
+    CursorStyle::PointingHand
+}
+
+fn text_input_cursor() -> CursorStyle {
+    CursorStyle::IBeam
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RowState {
+    is_selected: bool,
+    is_highlighted: bool,
+    is_disabled: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TriggerState {
+    expanded: bool,
+    disabled: bool,
+    loading: bool,
+    has_search_input: bool,
+}
+
+#[allow(dead_code)]
+fn compute_row_state(selected: bool, highlighted: bool, disabled: bool) -> RowState {
+    RowState {
+        is_selected: selected,
+        is_highlighted: highlighted,
+        is_disabled: disabled,
+    }
+}
+
+#[allow(dead_code)]
+fn compute_trigger_state(
+    expanded: bool,
+    disabled: bool,
+    loading: bool,
+    has_search_input: bool,
+) -> TriggerState {
+    TriggerState {
+        expanded,
+        disabled,
+        loading,
+        has_search_input,
+    }
+}
+
+impl PickerQueryState {
+    fn normalized_selection(&self) -> Option<(usize, usize)> {
+        TextEditState::normalized_selection(self.selection)
+    }
+
+    fn has_selection(&self) -> bool {
+        TextEditState::has_selection(self.selection)
+    }
+
+    fn clear_selection(&mut self) {
+        TextEditState::clear_selection(&mut self.selection, &mut self.anchor);
+    }
+
+    fn set_selection_from_anchor(&mut self, anchor: usize, cursor: usize) {
+        TextEditState::set_selection_from_anchor(
+            &mut self.selection,
+            &mut self.anchor,
+            anchor,
+            cursor,
+        );
+    }
+
+    fn select_all(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        TextEditState::select_all(
+            &self.text,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.anchor,
+        );
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        TextEditState::insert_text(
+            &mut self.text,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.anchor,
+            text,
+        );
+    }
+
+    fn pop_char_before_cursor(&mut self) {
+        if self.has_selection() {
+            let _ = TextEditState::delete_selection_if_any(
+                &mut self.text,
+                &mut self.cursor,
+                &mut self.selection,
+                &mut self.anchor,
+            );
+            return;
+        }
+        TextEditState::pop_char_before_cursor(
+            &mut self.text,
+            &mut self.cursor,
+            &mut self.selection,
+            &mut self.anchor,
+        );
+    }
+
+    fn delete_char_after_cursor(&mut self) {
+        if self.has_selection() {
+            let _ = TextEditState::delete_selection_if_any(
+                &mut self.text,
+                &mut self.cursor,
+                &mut self.selection,
+                &mut self.anchor,
+            );
+            return;
+        }
+
+        let max = self.text.chars().count();
+        if self.cursor >= max {
+            return;
+        }
+
+        let mut out = String::new();
+        for (i, ch) in self.text.chars().enumerate() {
+            if i != self.cursor {
+                out.push(ch);
+            }
+        }
+        self.text = out;
+        self.clear_selection();
+    }
+
+    fn move_left(&mut self, shift: bool) {
+        if shift {
+            let new_cursor = self.cursor.saturating_sub(1);
+            let anchor = self.anchor.unwrap_or(self.cursor);
+            self.cursor = new_cursor;
+            self.set_selection_from_anchor(anchor, self.cursor);
+            return;
+        }
+
+        if let Some((a, _)) = self.normalized_selection() {
+            self.cursor = a;
+            self.clear_selection();
+            return;
+        }
+
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self, shift: bool) {
+        let max = self.text.chars().count();
+        if shift {
+            let new_cursor = (self.cursor + 1).min(max);
+            let anchor = self.anchor.unwrap_or(self.cursor);
+            self.cursor = new_cursor;
+            self.set_selection_from_anchor(anchor, self.cursor);
+            return;
+        }
+
+        if let Some((_, b)) = self.normalized_selection() {
+            self.cursor = b;
+            self.clear_selection();
+            return;
+        }
+
+        self.cursor = (self.cursor + 1).min(max);
+    }
+
+    fn move_home(&mut self, shift: bool) {
+        if shift {
+            let anchor = self.anchor.unwrap_or(self.cursor);
+            self.cursor = 0;
+            self.set_selection_from_anchor(anchor, self.cursor);
+        } else {
+            self.cursor = 0;
+            self.clear_selection();
+        }
+    }
+
+    fn move_end(&mut self, shift: bool) {
+        let end = self.text.chars().count();
+        if shift {
+            let anchor = self.anchor.unwrap_or(self.cursor);
+            self.cursor = end;
+            self.set_selection_from_anchor(anchor, self.cursor);
+        } else {
+            self.cursor = end;
+            self.clear_selection();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +456,7 @@ pub enum TabViewEvent {
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
+const MAX_RENDERED_OUTPUT_LINES_PER_BLOCK: usize = 400;
 
 enum TabViewMode {
     Terminal,
@@ -141,11 +472,259 @@ enum InputMode {
 }
 
 enum AgentPromptEvent {
-    Update { text: String, append: bool },
-    Done(Result<Option<String>, String>),
+    Status(String),
+    ClientReady {
+        client: Arc<Mutex<AcpClient>>,
+        agent_key: AgentKey,
+    },
+    PermissionRequest(AgentPermissionEvent),
+    Update {
+        text: String,
+        append: bool,
+    },
+    Models(Vec<AcpModelOption>),
+    Done(Result<Option<AcpResponseText>, String>),
+}
+
+enum ModelButtonState {
+    Loading,
+    Ready(String),
+    Unavailable,
+}
+
+#[derive(Clone)]
+struct AgentPermissionPrompt {
+    request: PermissionRequest,
+    response_tx: std::sync::mpsc::Sender<PermissionDecision>,
+}
+
+#[derive(Clone)]
+struct AgentPermissionEvent {
+    request: PermissionRequest,
+    response_tx: std::sync::mpsc::Sender<PermissionDecision>,
+}
+
+const AGENT_CONNECTING_PLACEHOLDER: &str = "[agent] connecting...";
+const AGENT_STARTING_SESSION_PLACEHOLDER: &str = "[agent] starting session...";
+const AGENT_SENDING_PROMPT_PLACEHOLDER: &str = "[agent] sending prompt...";
+
+fn model_trigger_label(state: &ModelButtonState) -> (String, bool) {
+    match state {
+        ModelButtonState::Loading => ("Loading models...".into(), true),
+        ModelButtonState::Ready(label) => (label.clone(), false),
+        ModelButtonState::Unavailable => ("No models available".into(), true),
+    }
+}
+
+fn update_agent_placeholder_block(block: &mut Block, text: &str) -> bool {
+    if !block.agent_placeholder_active {
+        return false;
+    }
+
+    if let Some(last) = block.output_lines.last_mut() {
+        *last = text.to_string();
+        if is_error_line(text.trim()) {
+            block.has_error = true;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn streaming_snapshot_delta(previous: &str, next: &str) -> Option<String> {
+    if next == previous {
+        return None;
+    }
+    if let Some(rest) = next.strip_prefix(previous) {
+        return Some(rest.to_string());
+    }
+    Some(next.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentStreamOp {
+    Append,
+    Replace,
+    NewLines,
+    Ignore,
+}
+
+fn is_likely_stream_snapshot(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+
+    trimmed.starts_with("```")
+        || lower.starts_with("directory:")
+        || lower.starts_with("mode")
+        || lower.contains("\ndirectory:")
+        || lower.contains("\nmode")
+        || (text.contains('\n') && text.ends_with('\n'))
+}
+
+fn classify_agent_stream_op(previous: &str, next: &str, append_to_last: bool) -> AgentStreamOp {
+    if next == previous {
+        return AgentStreamOp::Ignore;
+    }
+
+    if append_to_last {
+        if !previous.is_empty() && (next.starts_with(previous) || is_likely_stream_snapshot(next)) {
+            return AgentStreamOp::Replace;
+        }
+
+        return AgentStreamOp::Append;
+    }
+
+    if !previous.is_empty() && (next.starts_with(previous) || is_likely_stream_snapshot(next)) {
+        return AgentStreamOp::Replace;
+    }
+
+    AgentStreamOp::NewLines
+}
+
+fn agent_stream_rendered_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn append_agent_stream_delta(block: &mut Block, delta: &str, total_output_lines: &mut usize) {
+    if delta.is_empty() {
+        return;
+    }
+
+    let mut segments: Vec<&str> = delta.split('\n').collect();
+    let ends_with_newline = delta.ends_with('\n');
+    if ends_with_newline && matches!(segments.last(), Some(&"")) {
+        segments.pop();
+    }
+
+    let mut insert_index = block.agent_stream_line_index;
+    for (index, segment) in segments.iter().enumerate() {
+        if index == 0 {
+            let line_index = insert_index.unwrap_or_else(|| {
+                block.output_lines.push(String::new());
+                let line_index = block.output_lines.len() - 1;
+                *total_output_lines += 1;
+                line_index
+            });
+            if let Some(last) = block.output_lines.get_mut(line_index) {
+                last.push_str(segment);
+                if is_error_line(last.trim()) {
+                    block.has_error = true;
+                }
+                block.agent_stream_line_index = Some(line_index);
+                insert_index = Some(line_index);
+                continue;
+            }
+        }
+
+        let trimmed = segment.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_error_line(trimmed) {
+            block.has_error = true;
+        }
+        let insert_at = insert_index
+            .map(|index| index + 1)
+            .unwrap_or(block.output_lines.len());
+        block.output_lines.insert(insert_at, trimmed.to_string());
+        *total_output_lines += 1;
+        insert_index = Some(insert_at);
+        block.agent_stream_line_index = insert_index;
+    }
+}
+
+fn replace_agent_stream_snapshot(
+    block: &mut Block,
+    snapshot: &str,
+    total_output_lines: &mut usize,
+) {
+    let previous_count = agent_stream_rendered_lines(&block.agent_stream_text).len();
+    let mut insert_at = block.output_lines.len();
+
+    if let Some(end_index) = block.agent_stream_line_index
+        && previous_count > 0
+    {
+        let start_index = end_index
+            .saturating_add(1)
+            .saturating_sub(previous_count)
+            .min(block.output_lines.len());
+        let drain_end = end_index.min(block.output_lines.len().saturating_sub(1));
+        if start_index <= drain_end && start_index < block.output_lines.len() {
+            let removed = drain_end - start_index + 1;
+            block.output_lines.drain(start_index..=drain_end);
+            *total_output_lines = total_output_lines.saturating_sub(removed);
+            insert_at = start_index;
+        }
+    }
+
+    let rendered_lines = agent_stream_rendered_lines(snapshot);
+    let mut last_line_index = None;
+
+    for (offset, line) in rendered_lines.iter().enumerate() {
+        if is_error_line(line) {
+            block.has_error = true;
+        }
+        let target_index = insert_at + offset;
+        block.output_lines.insert(target_index, line.clone());
+        *total_output_lines += 1;
+        last_line_index = Some(target_index);
+    }
+
+    block.agent_stream_text = snapshot.to_string();
+    block.agent_stream_line_index = last_line_index;
+}
+
+fn append_output_batch_to_block(
+    block: &mut Block,
+    lines: &[String],
+    append_first_to_last: bool,
+) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+
+    let mut added_lines = 0;
+
+    for (index, line) in lines.iter().enumerate() {
+        if is_error_line(line) {
+            block.has_error = true;
+        }
+
+        if index == 0 && append_first_to_last {
+            if let Some(last) = block.output_lines.last_mut() {
+                last.push_str(line);
+                continue;
+            }
+        }
+
+        block.output_lines.push(line.clone());
+        added_lines += 1;
+    }
+
+    added_lines
 }
 
 impl TabView {
+    fn request_scroll_to_bottom(&mut self, _cx: &mut Context<Self>) {
+        if !self.follow_output {
+            return;
+        }
+
+        let now = Instant::now();
+        if now.duration_since(self.last_scroll_to_bottom_at) < Duration::from_millis(16) {
+            return;
+        }
+
+        self.last_scroll_to_bottom_at = now;
+        self.scroll_handle.scroll_to_bottom();
+    }
+
     fn update_follow_output_from_scroll(&mut self) {
         let max_y: f32 = self.scroll_handle.max_offset().height.into();
         if max_y <= 0.0 {
@@ -473,6 +1052,14 @@ impl TabView {
         let last_path_var = std::env::var("PATH").unwrap_or_default();
         let agent_rows = load_effective_agent_rows(ConflictPolicy::LocalWins).unwrap_or_default();
         let agent_selected_key = agent_rows.first().map(|row| row.agent_key.clone());
+        let model_options_loading = agent_selected_key.is_some();
+        let runtime_preferences =
+            Arc::new(Mutex::new(RuntimePreferences::load().unwrap_or_default()));
+        let registry_manifests = storage::app_root()
+            .ok()
+            .and_then(|app_root| load_cached_registry(&app_root).ok().flatten())
+            .map(|cached| cached.manifests)
+            .unwrap_or_default();
         Self {
             blocks: Vec::new(),
             pty: None,
@@ -503,6 +1090,7 @@ impl TabView {
             last_line_incomplete: false,
             total_output_lines: 0,
             follow_output: true,
+            last_scroll_to_bottom_at: Instant::now(),
             input_mode: InputMode::Terminal,
             agent_rows,
             agent_selected_key,
@@ -510,6 +1098,11 @@ impl TabView {
             agent_client_key: None,
             agent_busy: false,
             agent_needs_auth: false,
+            runtime_preferences,
+            registry_manifests,
+            discovered_models: Vec::new(),
+            model_options_loading,
+            selected_model_override: None,
             selected_block: None,
             output_selection_anchor: None,
             output_selection_head: None,
@@ -627,7 +1220,7 @@ impl TabView {
             && self.input_mode == InputMode::Agent
             && self.agent_busy
         {
-            self.cancel_agent_prompt();
+            self.cancel_agent_prompt(cx);
             cx.notify();
             cx.stop_propagation();
             return;
@@ -840,7 +1433,7 @@ impl TabView {
         let cwd = expand_tilde(&self.current_path);
         let mut picker = PathPickerState {
             cwd,
-            query: String::new(),
+            query: PickerQueryState::default(),
             entries: Vec::new(),
             selected: 0,
         };
@@ -864,7 +1457,7 @@ impl TabView {
             return;
         }
         let mut picker = BranchPickerState {
-            query: String::new(),
+            query: PickerQueryState::default(),
             all_branches: all.clone(),
             branches: all,
             selected: 0,
@@ -872,6 +1465,43 @@ impl TabView {
         Self::filter_branch_picker(&mut picker);
         self.overlay = Some(Overlay::Branch(picker));
         cx.notify();
+    }
+
+    fn on_open_agent_picker(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.input_visible || self.agent_rows.is_empty() {
+            return;
+        }
+        if let Some(picker) =
+            build_agent_picker_state(&self.agent_rows, self.agent_selected_key.as_ref())
+        {
+            self.overlay = Some(Overlay::Agent(picker));
+            cx.notify();
+        }
+    }
+
+    fn on_open_model_picker(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.input_visible {
+            return;
+        }
+        if self.model_options_loading || self.discovered_models.is_empty() {
+            return;
+        }
+        let catalog = self.current_model_catalog();
+        let selected_model_id = self.current_selected_model_id();
+        if let Some(picker) = build_model_picker_state(&catalog, selected_model_id.as_deref()) {
+            self.overlay = Some(Overlay::Model(picker));
+            cx.notify();
+        }
     }
 
     fn on_set_terminal_mode(
@@ -894,40 +1524,7 @@ impl TabView {
         if self.input_mode != InputMode::Agent {
             self.toggle_input_mode(cx);
         }
-    }
-
-    fn on_prev_agent(
-        &mut self,
-        _event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.agent_rows.is_empty() {
-            return;
-        }
-        let next_index = match self.active_agent_index() {
-            Some(0) | None => self.agent_rows.len().saturating_sub(1),
-            Some(index) => index.saturating_sub(1),
-        };
-        self.select_agent_index(next_index);
-        cx.notify();
-    }
-
-    fn on_next_agent(
-        &mut self,
-        _event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.agent_rows.is_empty() {
-            return;
-        }
-        let next_index = match self.active_agent_index() {
-            Some(index) => (index + 1) % self.agent_rows.len(),
-            None => 0,
-        };
-        self.select_agent_index(next_index);
-        cx.notify();
+        self.refresh_model_options(cx);
     }
 
     fn handle_overlay_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -941,19 +1538,23 @@ impl TabView {
                 cx.notify();
                 return true;
             }
-            "backspace" => {
+            "a" if event.keystroke.modifiers.control && Self::overlay_has_search_input(overlay) => {
                 match overlay {
-                    Overlay::Path(picker) => {
-                        picker.query.pop();
-                        picker.selected = 0;
-                        Self::populate_path_picker(picker);
-                    }
-                    Overlay::Branch(picker) => {
-                        picker.query.pop();
-                        picker.selected = 0;
-                        Self::filter_branch_picker(picker);
-                    }
+                    Overlay::Path(picker) => picker.query.select_all(),
+                    Overlay::Branch(picker) => picker.query.select_all(),
+                    Overlay::Agent(picker) => picker.query.select_all(),
+                    Overlay::Model(picker) => picker.query.select_all(),
                 }
+                cx.notify();
+                return true;
+            }
+            "backspace" => {
+                Self::overlay_query_pop(overlay);
+                cx.notify();
+                return true;
+            }
+            "delete" if Self::overlay_has_search_input(overlay) => {
+                Self::overlay_query_delete_forward(overlay);
                 cx.notify();
                 return true;
             }
@@ -962,32 +1563,90 @@ impl TabView {
                 return true;
             }
             "up" | "arrowup" => {
-                match overlay {
-                    Overlay::Path(picker) => {
-                        if picker.selected > 0 {
-                            picker.selected -= 1;
+                Self::overlay_move_selection_up(overlay);
+                cx.notify();
+                return true;
+            }
+            "down" | "arrowdown" => {
+                Self::overlay_move_selection_down(overlay);
+                cx.notify();
+                return true;
+            }
+            "home" => {
+                if Self::overlay_has_search_input(overlay) {
+                    match overlay {
+                        Overlay::Path(picker) => {
+                            picker.query.move_home(event.keystroke.modifiers.shift)
+                        }
+                        Overlay::Branch(picker) => {
+                            picker.query.move_home(event.keystroke.modifiers.shift)
+                        }
+                        Overlay::Agent(picker) => {
+                            picker.query.move_home(event.keystroke.modifiers.shift)
+                        }
+                        Overlay::Model(picker) => {
+                            picker.query.move_home(event.keystroke.modifiers.shift)
                         }
                     }
-                    Overlay::Branch(picker) => {
-                        if picker.selected > 0 {
-                            picker.selected -= 1;
+                } else {
+                    Self::overlay_select_first(overlay);
+                }
+                cx.notify();
+                return true;
+            }
+            "end" => {
+                if Self::overlay_has_search_input(overlay) {
+                    match overlay {
+                        Overlay::Path(picker) => {
+                            picker.query.move_end(event.keystroke.modifiers.shift)
                         }
+                        Overlay::Branch(picker) => {
+                            picker.query.move_end(event.keystroke.modifiers.shift)
+                        }
+                        Overlay::Agent(picker) => {
+                            picker.query.move_end(event.keystroke.modifiers.shift)
+                        }
+                        Overlay::Model(picker) => {
+                            picker.query.move_end(event.keystroke.modifiers.shift)
+                        }
+                    }
+                } else {
+                    Self::overlay_select_last(overlay);
+                }
+                cx.notify();
+                return true;
+            }
+            "left" | "arrowleft" if Self::overlay_has_search_input(overlay) => {
+                match overlay {
+                    Overlay::Path(picker) => {
+                        picker.query.move_left(event.keystroke.modifiers.shift)
+                    }
+                    Overlay::Branch(picker) => {
+                        picker.query.move_left(event.keystroke.modifiers.shift)
+                    }
+                    Overlay::Agent(picker) => {
+                        picker.query.move_left(event.keystroke.modifiers.shift)
+                    }
+                    Overlay::Model(picker) => {
+                        picker.query.move_left(event.keystroke.modifiers.shift)
                     }
                 }
                 cx.notify();
                 return true;
             }
-            "down" | "arrowdown" => {
+            "right" | "arrowright" if Self::overlay_has_search_input(overlay) => {
                 match overlay {
                     Overlay::Path(picker) => {
-                        if picker.selected + 1 < picker.entries.len() {
-                            picker.selected += 1;
-                        }
+                        picker.query.move_right(event.keystroke.modifiers.shift)
                     }
                     Overlay::Branch(picker) => {
-                        if picker.selected + 1 < picker.branches.len() {
-                            picker.selected += 1;
-                        }
+                        picker.query.move_right(event.keystroke.modifiers.shift)
+                    }
+                    Overlay::Agent(picker) => {
+                        picker.query.move_right(event.keystroke.modifiers.shift)
+                    }
+                    Overlay::Model(picker) => {
+                        picker.query.move_right(event.keystroke.modifiers.shift)
                     }
                 }
                 cx.notify();
@@ -996,30 +1655,298 @@ impl TabView {
             _ => {}
         }
 
-        if let Some(text) = event.keystroke.key_char.as_deref() {
-            if !text.is_empty() && !event.keystroke.modifiers.control {
-                match overlay {
-                    Overlay::Path(picker) => {
-                        picker.query.push_str(text);
-                        picker.selected = 0;
-                        Self::populate_path_picker(picker);
-                    }
-                    Overlay::Branch(picker) => {
-                        picker.query.push_str(text);
-                        picker.selected = 0;
-                        Self::filter_branch_picker(picker);
-                    }
+        if Self::overlay_has_search_input(overlay)
+            && ((event.keystroke.modifiers.control
+                && event.keystroke.key.eq_ignore_ascii_case("v"))
+                || (event.keystroke.modifiers.shift
+                    && event.keystroke.key.eq_ignore_ascii_case("insert")))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let paste = text.replace("\r\n", "\n").replace('\r', "\n");
+                if !paste.is_empty() {
+                    Self::overlay_insert_text(overlay, &paste);
+                    cx.notify();
+                    return true;
                 }
-                cx.notify();
-                return true;
+            }
+        }
+
+        if !event.keystroke.modifiers.control {
+            if let Some(text) = event.keystroke.key_char.as_deref() {
+                if !text.is_empty() && Self::overlay_consume_text_input(overlay, text) {
+                    cx.notify();
+                    return true;
+                }
+            }
+
+            if event.keystroke.key.len() == 1 {
+                if Self::overlay_consume_text_input(overlay, &event.keystroke.key) {
+                    cx.notify();
+                    return true;
+                }
             }
         }
 
         true
     }
 
+    fn overlay_kind(overlay: &Overlay) -> PickerKind {
+        match overlay {
+            Overlay::Path(_) => PickerKind::Path,
+            Overlay::Branch(_) => PickerKind::Branch,
+            Overlay::Agent(_) => PickerKind::Agent,
+            Overlay::Model(_) => PickerKind::Model,
+        }
+    }
+
+    fn overlay_has_search_input(overlay: &Overlay) -> bool {
+        match overlay {
+            Overlay::Path(_) => true,
+            Overlay::Branch(_) => true,
+            Overlay::Agent(picker) => {
+                picker_has_search_input(PickerKind::Agent, picker.all_options.len())
+            }
+            Overlay::Model(picker) => {
+                picker_has_search_input(PickerKind::Model, picker.all_options.len())
+            }
+        }
+    }
+
+    fn overlay_move_selection_up(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+            }
+            Overlay::Branch(picker) => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+            }
+            Overlay::Agent(picker) => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+            }
+            Overlay::Model(picker) => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+            }
+        }
+    }
+
+    fn overlay_move_selection_down(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => {
+                if picker.selected + 1 < picker.entries.len() {
+                    picker.selected += 1;
+                }
+            }
+            Overlay::Branch(picker) => {
+                if picker.selected + 1 < picker.branches.len() {
+                    picker.selected += 1;
+                }
+            }
+            Overlay::Agent(picker) => {
+                if picker.selected + 1 < picker.options.len() {
+                    picker.selected += 1;
+                }
+            }
+            Overlay::Model(picker) => {
+                if picker.selected + 1 < picker.options.len() {
+                    picker.selected += 1;
+                }
+            }
+        }
+    }
+
+    fn overlay_select_first(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => picker.selected = 0,
+            Overlay::Branch(picker) => picker.selected = 0,
+            Overlay::Agent(picker) => picker.selected = 0,
+            Overlay::Model(picker) => picker.selected = 0,
+        }
+    }
+
+    fn overlay_select_last(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => {
+                picker.selected = picker.entries.len().saturating_sub(1);
+            }
+            Overlay::Branch(picker) => {
+                picker.selected = picker.branches.len().saturating_sub(1);
+            }
+            Overlay::Agent(picker) => {
+                picker.selected = picker.options.len().saturating_sub(1);
+            }
+            Overlay::Model(picker) => {
+                picker.selected = picker.options.len().saturating_sub(1);
+            }
+        }
+    }
+
+    fn overlay_query_push(overlay: &mut Overlay, ch: char) {
+        match overlay {
+            Overlay::Path(picker) => {
+                picker.query.insert_text(&ch.to_string());
+                picker.selected = 0;
+                Self::populate_path_picker(picker);
+            }
+            Overlay::Branch(picker) => {
+                picker.query.insert_text(&ch.to_string());
+                picker.selected = 0;
+                Self::filter_branch_picker(picker);
+            }
+            Overlay::Agent(picker) => {
+                picker.query.insert_text(&ch.to_string());
+                picker.selected = 0;
+                Self::filter_agent_picker(picker);
+            }
+            Overlay::Model(picker) => {
+                picker.query.insert_text(&ch.to_string());
+                picker.selected = 0;
+                Self::filter_model_picker(picker);
+            }
+        }
+    }
+
+    fn overlay_query_pop(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => {
+                picker.query.pop_char_before_cursor();
+                picker.selected = 0;
+                Self::populate_path_picker(picker);
+            }
+            Overlay::Branch(picker) => {
+                picker.query.pop_char_before_cursor();
+                picker.selected = 0;
+                Self::filter_branch_picker(picker);
+            }
+            Overlay::Agent(picker) => {
+                picker.query.pop_char_before_cursor();
+                picker.selected = 0;
+                Self::filter_agent_picker(picker);
+            }
+            Overlay::Model(picker) => {
+                picker.query.pop_char_before_cursor();
+                picker.selected = 0;
+                Self::filter_model_picker(picker);
+            }
+        }
+    }
+
+    fn overlay_insert_text(overlay: &mut Overlay, text: &str) {
+        match overlay {
+            Overlay::Path(picker) => {
+                picker.query.insert_text(text);
+                picker.selected = 0;
+                Self::populate_path_picker(picker);
+            }
+            Overlay::Branch(picker) => {
+                picker.query.insert_text(text);
+                picker.selected = 0;
+                Self::filter_branch_picker(picker);
+            }
+            Overlay::Agent(picker) => {
+                picker.query.insert_text(text);
+                picker.selected = 0;
+                Self::filter_agent_picker(picker);
+            }
+            Overlay::Model(picker) => {
+                picker.query.insert_text(text);
+                picker.selected = 0;
+                Self::filter_model_picker(picker);
+            }
+        }
+    }
+
+    fn overlay_query_delete_forward(overlay: &mut Overlay) {
+        match overlay {
+            Overlay::Path(picker) => {
+                picker.query.delete_char_after_cursor();
+                picker.selected = 0;
+                Self::populate_path_picker(picker);
+            }
+            Overlay::Branch(picker) => {
+                picker.query.delete_char_after_cursor();
+                picker.selected = 0;
+                Self::filter_branch_picker(picker);
+            }
+            Overlay::Agent(picker) => {
+                picker.query.delete_char_after_cursor();
+                picker.selected = 0;
+                Self::filter_agent_picker(picker);
+            }
+            Overlay::Model(picker) => {
+                picker.query.delete_char_after_cursor();
+                picker.selected = 0;
+                Self::filter_model_picker(picker);
+            }
+        }
+    }
+
+    fn overlay_apply_typeahead(overlay: &mut Overlay, ch: char) -> bool {
+        let lower = ch.to_ascii_lowercase();
+        match overlay {
+            Overlay::Agent(picker) => {
+                if let Some(idx) = picker.options.iter().position(|row| {
+                    row.name
+                        .chars()
+                        .next()
+                        .map(|c| c.to_ascii_lowercase() == lower)
+                        .unwrap_or(false)
+                }) {
+                    picker.selected = idx;
+                    return true;
+                }
+            }
+            Overlay::Model(picker) => {
+                if let Some(idx) = picker.options.iter().position(|model| {
+                    model
+                        .label
+                        .chars()
+                        .next()
+                        .map(|c| c.to_ascii_lowercase() == lower)
+                        .unwrap_or(false)
+                }) {
+                    picker.selected = idx;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn overlay_consume_text_input(overlay: &mut Overlay, text: &str) -> bool {
+        let mut handled = false;
+        for ch in text.chars() {
+            match Self::overlay_kind(overlay) {
+                PickerKind::Path | PickerKind::Branch => {
+                    Self::overlay_query_push(overlay, ch);
+                    handled = true;
+                }
+                PickerKind::Agent | PickerKind::Model
+                    if Self::overlay_has_search_input(overlay) =>
+                {
+                    Self::overlay_query_push(overlay, ch);
+                    handled = true;
+                }
+                PickerKind::Agent | PickerKind::Model => {
+                    if Self::overlay_apply_typeahead(overlay, ch) {
+                        handled = true;
+                    }
+                }
+            }
+        }
+        handled
+    }
+
     fn populate_path_picker(picker: &mut PathPickerState) {
-        let query = picker.query.to_lowercase();
+        let query = picker.query.text.to_lowercase();
         let mut entries = Vec::new();
         if let Some(parent) = picker.cwd.parent() {
             entries.push(PathEntry {
@@ -1062,7 +1989,7 @@ impl TabView {
     }
 
     fn filter_branch_picker(picker: &mut BranchPickerState) {
-        let query = picker.query.to_lowercase();
+        let query = picker.query.text.to_lowercase();
         if query.is_empty() {
             picker.branches = picker.all_branches.clone();
         } else {
@@ -1075,6 +2002,51 @@ impl TabView {
         }
         if picker.selected >= picker.branches.len() {
             picker.selected = picker.branches.len().saturating_sub(1);
+        }
+    }
+
+    fn filter_agent_picker(picker: &mut AgentPickerState) {
+        let query = picker.query.text.to_lowercase();
+        if query.is_empty() {
+            picker.options = picker.all_options.clone();
+        } else {
+            picker.options = picker
+                .all_options
+                .iter()
+                .filter(|row| {
+                    row.name.to_lowercase().contains(&query)
+                        || row.acp_id.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+        }
+        if picker.selected >= picker.options.len() {
+            picker.selected = picker.options.len().saturating_sub(1);
+        }
+    }
+
+    fn filter_model_picker(picker: &mut ModelPickerState) {
+        let query = picker.query.text.to_lowercase();
+        if query.is_empty() {
+            picker.options = picker.all_options.clone();
+        } else {
+            picker.options = picker
+                .all_options
+                .iter()
+                .filter(|model| {
+                    model.label.to_lowercase().contains(&query)
+                        || model.id.to_lowercase().contains(&query)
+                        || model
+                            .description
+                            .as_ref()
+                            .map(|d| d.to_lowercase().contains(&query))
+                            .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+        }
+        if picker.selected >= picker.options.len() {
+            picker.selected = picker.options.len().saturating_sub(1);
         }
     }
 
@@ -1100,6 +2072,46 @@ impl TabView {
                     self.run_command(cmd, cx);
                 }
             }
+            Overlay::Agent(picker) => {
+                if let Some(selected) = picker.options.get(picker.selected) {
+                    if let Some(index) = self
+                        .agent_rows
+                        .iter()
+                        .position(|row| row.agent_key == selected.agent_key)
+                    {
+                        self.select_agent_index(index);
+                        self.refresh_model_options(cx);
+                    }
+                }
+                self.overlay = None;
+                cx.notify();
+            }
+            Overlay::Model(picker) => {
+                if let Some(selected) = picker.options.get(picker.selected) {
+                    self.selected_model_override = Some(selected.id.clone());
+                    if let Some(agent_key) = self.agent_selected_key.clone()
+                        && let Ok(mut preferences) = self.runtime_preferences.lock()
+                    {
+                        let _ = preferences.set_default_model(agent_key, Some(selected.id.clone()));
+                    }
+                    if let Some(client) = self.agent_client.as_ref().cloned() {
+                        let selected_model = selected.id.clone();
+                        thread::spawn(move || {
+                            if let Ok(client) = client.lock()
+                                && let Some(session_id) = client.session_id.as_deref()
+                            {
+                                let _ = client.set_session_config_option(
+                                    session_id,
+                                    "model",
+                                    &selected_model,
+                                );
+                            }
+                        });
+                    }
+                }
+                self.overlay = None;
+                cx.notify();
+            }
         }
     }
 
@@ -1115,13 +2127,19 @@ impl TabView {
                 .rounded(px(6.0))
                 .bg(rgb(0x141414))
                 .border_1()
-                .border_color(rgb(0x2a2a2a))
+                .border_color(rgb(0x262626))
+                .cursor(clickable_cursor())
                 .child(lucide_icon(icon, 12.0, 0x8a8a8a).cursor(CursorStyle::PointingHand))
         };
         let agent_name = self
             .active_agent_name()
             .unwrap_or_else(|| "No agent".to_string());
         let agent_mode = self.input_mode == InputMode::Agent;
+        let agent_icon_present = self
+            .active_registry_manifest()
+            .and_then(|manifest| manifest.icon.as_ref())
+            .is_some();
+        let model_button_state = self.current_model_button_state();
 
         div()
             .flex()
@@ -1203,13 +2221,14 @@ impl TabView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
+                                    .cursor(clickable_cursor())
                                     .child(
                                         lucide_icon(
-                                            Icon::Bot,
+                                            Icon::Sparkles,
                                             13.0,
                                             if agent_mode { 0x8eb8ff } else { 0x7f7f7f },
                                         )
-                                        .cursor(CursorStyle::PointingHand),
+                                        .cursor(clickable_cursor()),
                                     )
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
@@ -1228,25 +2247,11 @@ impl TabView {
                             .bg(rgb(0x141414))
                             .border_1()
                             .border_color(rgb(0x2a2a2a))
-                            .child(
-                                div()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(0x191919))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0xbdbdbd))
-                                    .child("<")
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(Self::on_prev_agent),
-                                    ),
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(Self::on_open_agent_picker),
                             )
+                            .child(registry_avatar(&agent_name, agent_icon_present))
                             .child(
                                 div()
                                     .text_size(px(11.0))
@@ -1272,24 +2277,65 @@ impl TabView {
                                 div()
                             })
                             .child(
-                                div()
-                                    .w(px(18.0))
-                                    .h(px(18.0))
-                                    .rounded(px(4.0))
-                                    .bg(rgb(0x191919))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0xbdbdbd))
-                                    .child(">")
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(Self::on_next_agent),
-                                    ),
+                                div().flex().items_center().justify_center().child(
+                                    lucide_icon(Icon::ChevronDown, 12.0, 0x9a9a9a)
+                                        .cursor(clickable_cursor()),
+                                ),
                             )
+                    } else {
+                        div()
+                    })
+                    .child(if agent_mode {
+                        {
+                            let (label, label_disabled) = model_trigger_label(&model_button_state);
+                            let (icon_color, text_color, border_color, bg_color, disabled_default) =
+                                match &model_button_state {
+                                    ModelButtonState::Loading => {
+                                        (0x7a7a7a, 0x8f8f8f, 0x2a2a2a, 0x111111, true)
+                                    }
+                                    ModelButtonState::Ready(_) => {
+                                        (0x8eb8ff, 0xcfcfcf, 0x2a2a2a, 0x141414, false)
+                                    }
+                                    ModelButtonState::Unavailable => {
+                                        (0x666666, 0x7f7f7f, 0x252525, 0x111111, true)
+                                    }
+                                };
+                            let disabled = disabled_default || label_disabled;
+
+                            let chip = div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .px(px(8.0))
+                                .py(px(5.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(bg_color))
+                                .border_1()
+                                .border_color(rgb(border_color))
+                                .child(
+                                    lucide_icon(Icon::Sparkles, 12.0, icon_color)
+                                        .cursor(CursorStyle::PointingHand),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(text_color))
+                                        .child(label),
+                                )
+                                .child(
+                                    lucide_icon(Icon::ChevronDown, 12.0, 0x9a9a9a)
+                                        .cursor(CursorStyle::PointingHand),
+                                );
+
+                            if disabled {
+                                chip
+                            } else {
+                                chip.on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(Self::on_open_model_picker),
+                                )
+                            }
+                        }
                     } else {
                         div()
                     })
@@ -1304,13 +2350,14 @@ impl TabView {
                             .bg(rgb(0x141414))
                             .border_1()
                             .border_color(rgb(0x2a2a2a))
+                            .cursor(clickable_cursor())
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(Self::on_open_path_picker),
                             )
                             .child(
                                 lucide_icon(Icon::Folder, 12.0, 0x6b9eff)
-                                    .cursor(CursorStyle::PointingHand),
+                                    .cursor(clickable_cursor()),
                             )
                             .child(
                                 div()
@@ -1330,13 +2377,14 @@ impl TabView {
                             .bg(rgb(0x141414))
                             .border_1()
                             .border_color(rgb(0x2a2a2a))
+                            .cursor(clickable_cursor())
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(Self::on_open_branch_picker),
                             )
                             .child(
                                 lucide_icon(Icon::GitBranch, 12.0, 0x6b9eff)
-                                    .cursor(CursorStyle::PointingHand),
+                                    .cursor(clickable_cursor()),
                             )
                             .child(
                                 div()
@@ -1397,7 +2445,7 @@ impl TabView {
                             .flex_1()
                             .child(
                                 lucide_icon(Icon::ChevronRight, 16.0, 0x6b9eff)
-                                    .cursor(CursorStyle::PointingHand),
+                                    .cursor(clickable_cursor()),
                             )
                             .child(self.render_input_text(is_focused)),
                     )
@@ -1464,12 +2512,12 @@ impl TabView {
         };
         let placeholder = div()
             .text_size(px(15.0))
-            .text_color(rgb(0x666666))
+            .text_color(rgb(0x7c7c7c))
             .child(placeholder_text);
 
         let ghost_div = div()
             .text_size(px(15.0))
-            .text_color(rgb(0x555555))
+            .text_color(rgb(0x626262))
             .font_family("Cascadia Code")
             .child(ghost);
 
@@ -1551,16 +2599,120 @@ impl TabView {
             .or_else(|| self.agent_rows.first())
     }
 
-    fn active_agent_index(&self) -> Option<usize> {
-        let selected_key = self.agent_selected_key.as_ref()?;
-        self.agent_rows
+    fn active_registry_manifest(&self) -> Option<&RegistryManifest> {
+        let row = self.active_agent_row()?;
+        self.registry_manifests.get(&row.acp_id)
+    }
+
+    fn current_model_catalog(&self) -> Vec<AcpModelOption> {
+        self.discovered_models.clone()
+    }
+
+    fn current_selected_model_id(&self) -> Option<String> {
+        let catalog = self.current_model_catalog();
+        if catalog.is_empty() {
+            return None;
+        }
+
+        let persisted_default = self
+            .agent_selected_key
+            .as_ref()
+            .and_then(|key| self.runtime_preferences.lock().ok()?.default_model_for(key));
+
+        model_discovery::resolve_selected_model(
+            self.selected_model_override.as_deref(),
+            persisted_default.as_deref(),
+            &catalog,
+        )
+    }
+
+    fn current_selected_model_label(&self) -> Option<String> {
+        let catalog = self.current_model_catalog();
+        let selected = self.current_selected_model_id()?;
+        catalog
             .iter()
-            .position(|row| row.agent_key == *selected_key)
-            .or(if self.agent_rows.is_empty() {
-                None
-            } else {
-                Some(0)
-            })
+            .find(|model| model.id == selected)
+            .map(|model| model.label.clone())
+    }
+
+    fn current_model_button_state(&self) -> ModelButtonState {
+        if self.model_options_loading {
+            return ModelButtonState::Loading;
+        }
+
+        if let Some(label) = self.current_selected_model_label() {
+            return ModelButtonState::Ready(label);
+        }
+
+        ModelButtonState::Unavailable
+    }
+
+    fn refresh_model_options(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.ensure_agent_client().ok() else {
+            self.model_options_loading = false;
+            self.discovered_models.clear();
+            cx.notify();
+            return;
+        };
+
+        self.model_options_loading = true;
+        self.discovered_models.clear();
+        let selected_key = self.agent_selected_key.clone();
+        let runtime_preferences = self.runtime_preferences.clone();
+
+        let (tx, mut rx) = mpsc::unbounded::<Result<Vec<AcpModelOption>, String>>();
+        thread::spawn(move || {
+            let result = (|| -> Result<Vec<AcpModelOption>, String> {
+                let mut guard = client
+                    .lock()
+                    .map_err(|_| "agent lock poisoned".to_string())?;
+                if guard.protocol_version.is_none() {
+                    guard.initialize().map_err(|err| err.to_string())?;
+                }
+                let cwd = std::env::current_dir()
+                    .map_err(|err| err.to_string())?
+                    .to_string_lossy()
+                    .to_string();
+                let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
+                let persisted_default = selected_key.as_ref().and_then(|key| {
+                    runtime_preferences
+                        .lock()
+                        .ok()
+                        .and_then(|prefs| prefs.default_model_for(key))
+                });
+                let bootstrap = guard
+                    .ensure_session(&cwd, &runtime_mcp, persisted_default.as_deref())
+                    .map_err(|err| err.to_string())?;
+                Ok(bootstrap.model_options)
+            })();
+
+            let _ = tx.unbounded_send(result);
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                while let Some(result) = rx.next().await {
+                    let _ = view.update(&mut cx, |view, cx| {
+                        view.model_options_loading = false;
+                        match result {
+                            Ok(models) => {
+                                view.discovered_models = models;
+                            }
+                            Err(err) => {
+                                view.discovered_models.clear();
+                                view.append_agent_update_line(
+                                    &format!("[agent] failed to load model selector: {err}"),
+                                    cx,
+                                );
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     fn select_agent_index(&mut self, index: usize) {
@@ -1568,6 +2720,9 @@ impl TabView {
         self.agent_client = None;
         self.agent_client_key = None;
         self.agent_needs_auth = false;
+        self.discovered_models.clear();
+        self.model_options_loading = self.agent_selected_key.is_some();
+        self.selected_model_override = None;
     }
 
     fn is_auth_related_error(message: &str) -> bool {
@@ -1604,12 +2759,12 @@ impl TabView {
 
     fn run_agent_auth_flow(&mut self, cx: &mut Context<Self>) {
         let Some(spec) = self.active_agent_spec() else {
-            self.append_agent_update_line("[agent] no selected agent.");
+            self.append_agent_update_line("[agent] no selected agent.", cx);
             cx.notify();
             return;
         };
         let Some(auth_cmd) = spec.auth else {
-            self.append_agent_update_line("[agent] this agent has no auth command configured.");
+            self.append_agent_update_line("[agent] this agent has no auth command configured.", cx);
             cx.notify();
             return;
         };
@@ -1667,37 +2822,121 @@ impl TabView {
             .ok_or_else(|| "failed to initialize agent client".to_string())
     }
 
-    fn append_agent_update_line(&mut self, text: &str) {
-        self.append_agent_update(text, false);
+    fn append_agent_update_line(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.append_agent_update(text, false, cx);
     }
 
-    fn append_agent_update(&mut self, text: &str, append_to_last: bool) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    fn clear_last_agent_placeholder(&mut self) {
+        let had_placeholder = self
+            .blocks
+            .last()
+            .map(|block| block.agent_placeholder_active)
+            .unwrap_or(false);
+        if !had_placeholder {
+            return;
+        }
+
+        if let Some(block) = self.blocks.last_mut() {
+            block.agent_placeholder_active = false;
+            block.agent_response = None;
+            block.agent_response_line_count = 0;
+            if block.output_lines.pop().is_some() {
+                self.total_output_lines = self.total_output_lines.saturating_sub(1);
+            }
+        }
+    }
+
+    fn replace_last_agent_placeholder(
+        &mut self,
+        response: AcpResponseText,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_last_agent_placeholder();
+        self.append_agent_response(response, cx);
+    }
+
+    fn update_last_agent_placeholder(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(block) = self.blocks.last_mut() {
+            if !update_agent_placeholder_block(block, text) && block.agent_placeholder_active {
+                block.output_lines.push(text.to_string());
+                self.total_output_lines += 1;
+            }
+        }
+        self.trim_output_lines();
+        self.request_scroll_to_bottom(cx);
+    }
+
+    fn last_block_has_agent_placeholder(&self) -> bool {
+        self.blocks
+            .last()
+            .map(|block| block.agent_placeholder_active)
+            .unwrap_or(false)
+    }
+
+    fn append_agent_response(&mut self, response: AcpResponseText, cx: &mut Context<Self>) {
+        let response_text = response.text().to_string();
+        let normalized = response_text.replace("\r\n", "\n").replace('\r', "\n");
+        let response_lines = markdown_response_line_count(&normalized);
+
+        if let Some(block) = self.blocks.last_mut() {
+            block.agent_response = Some(response);
+            block.agent_response_line_count = response_lines;
+            for line in normalized.lines() {
+                block.output_lines.push(line.to_string());
+            }
+            if normalized.is_empty() {
+                block.output_lines.push(String::new());
+            }
+            self.total_output_lines += response_lines.max(1);
+        }
+        self.trim_output_lines();
+        self.request_scroll_to_bottom(cx);
+    }
+
+    fn append_agent_update(&mut self, text: &str, append_to_last: bool, cx: &mut Context<Self>) {
+        let normalized = strip_ansi(text).replace("\r\n", "\n").replace('\r', "\n");
         if self.blocks.is_empty() {
             self.blocks.push(Block {
                 command: String::new(),
                 output_lines: Vec::new(),
                 has_error: false,
                 context: None,
+                agent_placeholder_active: false,
+                pending_permission: None,
+                agent_stream_text: String::new(),
+                agent_stream_line_index: None,
+                agent_response: None,
+                agent_response_line_count: 0,
             });
         }
+        if !normalized.trim().is_empty() {
+            self.clear_last_agent_placeholder();
+        }
         if let Some(block) = self.blocks.last_mut() {
-            if append_to_last && !normalized.contains('\n') {
-                if let Some(last) = block.output_lines.last_mut() {
-                    last.push_str(&normalized);
-                } else if !normalized.is_empty() {
-                    if is_error_line(normalized.trim()) {
-                        block.has_error = true;
-                    }
-                    block.output_lines.push(normalized.clone());
-                    self.total_output_lines += 1;
+            match classify_agent_stream_op(&block.agent_stream_text, &normalized, append_to_last) {
+                AgentStreamOp::Ignore => {
+                    block.agent_stream_text = normalized;
+                    return;
                 }
-                self.trim_output_lines();
-                if self.follow_output {
-                    self.scroll_handle.scroll_to_bottom();
+                AgentStreamOp::Append => {
+                    block.agent_stream_text.push_str(&normalized);
+                    append_agent_stream_delta(block, &normalized, &mut self.total_output_lines);
+                    self.trim_output_lines();
+                    self.request_scroll_to_bottom(cx);
+                    return;
                 }
-                return;
+                AgentStreamOp::Replace => {
+                    replace_agent_stream_snapshot(block, &normalized, &mut self.total_output_lines);
+                    self.trim_output_lines();
+                    self.request_scroll_to_bottom(cx);
+                    return;
+                }
+                AgentStreamOp::NewLines => {}
             }
+
+            block.agent_stream_text.clear();
+            block.agent_stream_line_index = None;
+            let mut last_agent_line_index = None;
 
             for line in normalized.lines() {
                 let trimmed = line.trim_end();
@@ -1709,51 +2948,54 @@ impl TabView {
                 }
                 block.output_lines.push(trimmed.to_string());
                 self.total_output_lines += 1;
+                last_agent_line_index = Some(block.output_lines.len() - 1);
             }
+            block.agent_stream_line_index = last_agent_line_index;
         }
         self.trim_output_lines();
-        if self.follow_output {
-            self.scroll_handle.scroll_to_bottom();
-        }
+        self.request_scroll_to_bottom(cx);
     }
 
     fn run_agent_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.agent_busy {
             return;
         }
-        let client = match self.ensure_agent_client() {
-            Ok(client) => client,
-            Err(err) => {
-                self.agent_needs_auth = Self::is_auth_related_error(&err);
-                self.blocks.push(Block {
-                    command: format!("agent> {prompt}"),
-                    output_lines: vec![format!("[agent] {err}")],
-                    has_error: true,
-                    context: Some(BlockContext {
-                        cwd: self.current_path.clone(),
-                        git_branch: self.git_status.as_ref().map(|g| g.branch.clone()),
-                        git_files: self.git_status.as_ref().map(|g| g.files_changed),
-                        git_added: self.git_status.as_ref().map(|g| g.added),
-                        git_deleted: self.git_status.as_ref().map(|g| g.deleted),
-                        git_modified: self.git_status.as_ref().map(|g| g.modified),
-                    }),
-                });
-                self.selected_block = self.blocks.len().checked_sub(1);
-                self.clear_output_selection();
-                self.total_output_lines += 1;
-                self.trim_output_lines();
-                cx.notify();
-                return;
-            }
+        let Some(row) = self.active_agent_row().cloned() else {
+            self.blocks.push(Block {
+                command: format!("agent> {prompt}"),
+                output_lines: vec!["[agent] no selected agent.".to_string()],
+                has_error: true,
+                context: Some(BlockContext {
+                    cwd: self.current_path.clone(),
+                    git_branch: self.git_status.as_ref().map(|g| g.branch.clone()),
+                    git_files: self.git_status.as_ref().map(|g| g.files_changed),
+                    git_added: self.git_status.as_ref().map(|g| g.added),
+                    git_deleted: self.git_status.as_ref().map(|g| g.deleted),
+                    git_modified: self.git_status.as_ref().map(|g| g.modified),
+                }),
+                agent_placeholder_active: false,
+                pending_permission: None,
+                agent_stream_text: String::new(),
+                agent_stream_line_index: None,
+                agent_response: None,
+                agent_response_line_count: 0,
+            });
+            self.selected_block = self.blocks.len().checked_sub(1);
+            self.clear_output_selection();
+            self.total_output_lines += 1;
+            self.trim_output_lines();
+            cx.notify();
+            return;
         };
-
+        let spec = row.spec.clone();
+        let agent_key = row.agent_key.clone();
         let agent_label = self
             .active_agent_name()
             .unwrap_or_else(|| "Agent".to_string());
         self.push_history(&prompt);
         self.blocks.push(Block {
             command: format!("{agent_label}> {prompt}"),
-            output_lines: vec![],
+            output_lines: vec![AGENT_CONNECTING_PLACEHOLDER.to_string()],
             has_error: false,
             context: Some(BlockContext {
                 cwd: self.current_path.clone(),
@@ -1763,9 +3005,16 @@ impl TabView {
                 git_deleted: self.git_status.as_ref().map(|g| g.deleted),
                 git_modified: self.git_status.as_ref().map(|g| g.modified),
             }),
+            agent_placeholder_active: true,
+            pending_permission: None,
+            agent_stream_text: String::new(),
+            agent_stream_line_index: None,
+            agent_response: None,
+            agent_response_line_count: 0,
         });
         self.selected_block = self.blocks.len().checked_sub(1);
         self.clear_output_selection();
+        self.total_output_lines += 1;
         self.follow_output = true;
         self.agent_busy = true;
         self.agent_needs_auth = false;
@@ -1777,30 +3026,135 @@ impl TabView {
         self.suggest_index = 0;
         self.clear_selection();
         self.overlay = None;
-        self.scroll_handle.scroll_to_bottom();
+        cx.notify();
+
+        let cached_client = self.agent_client.as_ref().and_then(|client| {
+            if self
+                .agent_client_key
+                .as_ref()
+                .map(|key| key == &agent_key)
+                .unwrap_or(false)
+            {
+                Some(client.clone())
+            } else {
+                None
+            }
+        });
+
+        let selected_key = self.agent_selected_key.clone();
+        let runtime_preferences = self.runtime_preferences.clone();
+        let session_override = self.selected_model_override.clone();
 
         let (tx, mut rx) = mpsc::unbounded::<AgentPromptEvent>();
         thread::spawn(move || {
-            let result = (|| -> Result<Option<String>, String> {
+            let result = (|| -> Result<Option<AcpResponseText>, String> {
+                let _ = tx.unbounded_send(AgentPromptEvent::Status(
+                    AGENT_CONNECTING_PLACEHOLDER.to_string(),
+                ));
+                let client = if let Some(client) = cached_client {
+                    client
+                } else {
+                    let client = Arc::new(Mutex::new(AcpClient::connect(&spec).map_err(
+                        |err| {
+                            format!(
+                                "failed to spawn agent command '{}'. Check agents.json (Windows often needs `.cmd` shim like `codex.cmd`). Details: {err}",
+                                spec.command
+                            )
+                        },
+                    )?));
+                    let _ = tx.unbounded_send(AgentPromptEvent::ClientReady {
+                        client: client.clone(),
+                        agent_key: agent_key.clone(),
+                    });
+                    client
+                };
                 let mut guard = client
                     .lock()
                     .map_err(|_| "agent lock poisoned".to_string())?;
                 if guard.protocol_version.is_none() {
                     guard.initialize().map_err(|err| err.to_string())?;
                 }
+                let mut on_permission_request =
+                    |request: PermissionRequest| -> Result<PermissionDecision> {
+                        let (response_tx, response_rx) = std::sync::mpsc::channel();
+                        let _ = tx.unbounded_send(AgentPromptEvent::PermissionRequest(
+                            AgentPermissionEvent {
+                                request: request.clone(),
+                                response_tx,
+                            },
+                        ));
+                        response_rx
+                            .recv()
+                            .map_err(|_| anyhow!("permission request was dropped"))
+                    };
+                let _ = tx.unbounded_send(AgentPromptEvent::Status(
+                    AGENT_STARTING_SESSION_PLACEHOLDER.to_string(),
+                ));
                 let cwd = std::env::current_dir()
                     .map_err(|err| err.to_string())?
                     .to_string_lossy()
                     .to_string();
                 let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
-                let session_id = guard
-                    .ensure_session(&cwd, &runtime_mcp)
+                if let Some(ref key) = selected_key {
+                    let mut prefs = runtime_preferences
+                        .lock()
+                        .map_err(|_| "runtime preferences lock poisoned".to_string())?;
+                    let bootstrap = guard
+                        .ensure_session(&cwd, &runtime_mcp, session_override.as_deref())
+                        .map_err(|err| err.to_string())?;
+                    let catalog = bootstrap.model_options;
+                    let ids = catalog
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>();
+                    let _ = prefs.ensure_default_model_valid(key, &ids);
+                    let persisted_default = prefs.default_model_for(key);
+                    let _ = tx.unbounded_send(AgentPromptEvent::Models(catalog.clone()));
+                    let effective_model = model_discovery::resolve_selected_model(
+                        session_override.as_deref(),
+                        persisted_default.as_deref(),
+                        &catalog,
+                    );
+                    if let Some(model_id) = effective_model.as_deref() {
+                        let _ = guard.set_session_config_option(
+                            &bootstrap.session_id,
+                            "model",
+                            model_id,
+                        );
+                    }
+                    let _ = tx.unbounded_send(AgentPromptEvent::Status(
+                        AGENT_SENDING_PROMPT_PLACEHOLDER.to_string(),
+                    ));
+                    let mut on_update = |text: String, append: bool| {
+                        let _ = tx.unbounded_send(AgentPromptEvent::Update { text, append });
+                    };
+                    return guard
+                        .prompt(
+                            &bootstrap.session_id,
+                            &prompt,
+                            &mut on_update,
+                            &mut on_permission_request,
+                        )
+                        .map_err(|err| err.to_string());
+                }
+                let bootstrap = guard
+                    .ensure_session(&cwd, &runtime_mcp, session_override.as_deref())
                     .map_err(|err| err.to_string())?;
+                let _ =
+                    tx.unbounded_send(AgentPromptEvent::Models(bootstrap.model_options.clone()));
+                let _ = tx.unbounded_send(AgentPromptEvent::Status(
+                    AGENT_SENDING_PROMPT_PLACEHOLDER.to_string(),
+                ));
                 let mut on_update = |text: String, append: bool| {
                     let _ = tx.unbounded_send(AgentPromptEvent::Update { text, append });
                 };
                 guard
-                    .prompt(&session_id, &prompt, &mut on_update)
+                    .prompt(
+                        &bootstrap.session_id,
+                        &prompt,
+                        &mut on_update,
+                        &mut on_permission_request,
+                    )
                     .map_err(|err| err.to_string())
             })();
             let _ = tx.unbounded_send(AgentPromptEvent::Done(result));
@@ -1813,24 +3167,64 @@ impl TabView {
                     if view
                         .update(&mut cx, |view, cx| {
                             match event {
+                                AgentPromptEvent::ClientReady { client, agent_key } => {
+                                    view.agent_client = Some(client);
+                                    view.agent_client_key = Some(agent_key);
+                                }
+                                AgentPromptEvent::PermissionRequest(request) => {
+                                    view.update_last_agent_placeholder(
+                                        "[agent] awaiting permission...",
+                                        cx,
+                                    );
+                                    if let Some(block) = view.blocks.last_mut() {
+                                        block.pending_permission = Some(AgentPermissionPrompt {
+                                            request: request.request,
+                                            response_tx: request.response_tx,
+                                        });
+                                    }
+                                }
+                                AgentPromptEvent::Status(status) => {
+                                    view.update_last_agent_placeholder(&status, cx);
+                                }
                                 AgentPromptEvent::Update { text, append } => {
-                                    view.append_agent_update(&text, append)
+                                    view.append_agent_update(&text, append, cx)
+                                }
+                                AgentPromptEvent::Models(models) => {
+                                    view.model_options_loading = false;
+                                    view.discovered_models = models;
                                 }
                                 AgentPromptEvent::Done(result) => {
                                     view.agent_busy = false;
                                     match result {
                                         Ok(Some(final_text)) => {
                                             view.agent_needs_auth =
-                                                Self::is_auth_related_error(&final_text);
-                                            view.append_agent_update_line(&final_text);
+                                                Self::is_auth_related_error(final_text.text());
+                                            if view.last_block_has_agent_placeholder() {
+                                                view.replace_last_agent_placeholder(final_text, cx);
+                                            }
                                         }
-                                        Ok(None) => {}
+                                        Ok(None) => {
+                                            if view.last_block_has_agent_placeholder() {
+                                                view.replace_last_agent_placeholder(
+                                                    AcpResponseText::Plain(
+                                                        "[agent] no response received.".to_string(),
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                        }
                                         Err(err) => {
                                             view.agent_needs_auth =
                                                 Self::is_auth_related_error(&err);
-                                            view.append_agent_update_line(&format!(
-                                                "[agent] {err}"
-                                            ));
+                                            let message = format!("[agent] {err}");
+                                            if view.last_block_has_agent_placeholder() {
+                                                view.replace_last_agent_placeholder(
+                                                    AcpResponseText::Plain(message),
+                                                    cx,
+                                                );
+                                            } else {
+                                                view.append_agent_update_line(&message, cx);
+                                            }
                                         }
                                     }
                                 }
@@ -1847,12 +3241,12 @@ impl TabView {
         .detach();
     }
 
-    fn cancel_agent_prompt(&mut self) {
+    fn cancel_agent_prompt(&mut self, cx: &mut Context<Self>) {
         if !self.agent_busy {
             return;
         }
         self.agent_busy = false;
-        self.append_agent_update_line("[agent] cancel requested");
+        self.append_agent_update_line("[agent] cancel requested", cx);
         let Some(client) = self.agent_client.as_ref().cloned() else {
             return;
         };
@@ -1913,6 +3307,12 @@ impl TabView {
                 git_deleted: self.git_status.as_ref().map(|g| g.deleted),
                 git_modified: self.git_status.as_ref().map(|g| g.modified),
             }),
+            agent_placeholder_active: false,
+            pending_permission: None,
+            agent_stream_text: String::new(),
+            agent_stream_line_index: None,
+            agent_response: None,
+            agent_response_line_count: 0,
         });
         self.selected_block = self.blocks.len().checked_sub(1);
         self.clear_output_selection();
@@ -1931,7 +3331,6 @@ impl TabView {
         self.clear_selection();
         self.input_visible = false;
         self.overlay = None;
-        self.scroll_handle.scroll_to_bottom();
         cx.notify();
     }
 
@@ -2006,6 +3405,8 @@ impl TabView {
         let panel = match overlay {
             Overlay::Path(picker) => self.render_path_picker(picker, cx),
             Overlay::Branch(picker) => self.render_branch_picker(picker, cx),
+            Overlay::Agent(picker) => self.render_agent_picker(picker, cx),
+            Overlay::Model(picker) => self.render_model_picker(picker, cx),
         };
 
         div()
@@ -2017,16 +3418,115 @@ impl TabView {
                 gpui::MouseButton::Left,
                 cx.listener(Self::on_overlay_dismiss),
             ))
-            .child(panel)
+            .child(
+                panel.on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    fn render_picker_query_input(&self, query: &PickerQueryState, placeholder: &str) -> Div {
+        let caret = div()
+            .w(px(2.0))
+            .h(px(14.0))
+            .rounded(px(1.0))
+            .bg(rgb(0x6b9eff));
+
+        let text_normal = |text: String| {
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0xcccccc))
+                .font_family("Cascadia Code")
+                .child(text)
+        };
+
+        let text_selected = |text: String| {
+            div()
+                .px(px(2.0))
+                .py(px(1.0))
+                .rounded(px(3.0))
+                .bg(rgb(0x2d4a7a))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xf0f0f0))
+                        .font_family("Cascadia Code")
+                        .child(text),
+                )
+        };
+
+        let content = if query.text.is_empty() {
+            div().flex().items_center().gap(px(6.0)).child(caret).child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x666666))
+                    .child(placeholder.to_string()),
+            )
+        } else if let Some((a, b)) = query.normalized_selection().filter(|(a, b)| a != b) {
+            let (pre, rest) = TextEditState::split_at_cursor(&query.text, a);
+            let (sel, post) = TextEditState::split_at_cursor(&rest, b.saturating_sub(a));
+            if query.cursor <= a {
+                let (left, right) = TextEditState::split_at_cursor(&pre, query.cursor.min(a));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(0.0))
+                    .child(text_normal(left))
+                    .child(caret)
+                    .child(text_normal(right))
+                    .child(text_selected(sel))
+                    .child(text_normal(post))
+            } else if query.cursor >= b {
+                let offset = query.cursor.saturating_sub(b);
+                let (left, right) =
+                    TextEditState::split_at_cursor(&post, offset.min(post.chars().count()));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(0.0))
+                    .child(text_normal(pre))
+                    .child(text_selected(sel))
+                    .child(text_normal(left))
+                    .child(caret)
+                    .child(text_normal(right))
+            } else {
+                let offset = query.cursor.saturating_sub(a);
+                let (left, right) =
+                    TextEditState::split_at_cursor(&sel, offset.min(sel.chars().count()));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(0.0))
+                    .child(text_normal(pre))
+                    .child(text_selected(left))
+                    .child(caret)
+                    .child(text_selected(right))
+                    .child(text_normal(post))
+            }
+        } else {
+            let (left, right) = TextEditState::split_at_cursor(&query.text, query.cursor);
+            div()
+                .flex()
+                .items_center()
+                .gap(px(0.0))
+                .child(text_normal(left))
+                .child(caret)
+                .child(text_normal(right))
+        };
+
+        div()
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(rgb(0x111111))
+            .border_1()
+            .border_color(rgb(0x252525))
+            .cursor(text_input_cursor())
+            .child(content)
     }
 
     fn render_path_picker(&self, picker: &PathPickerState, cx: &Context<Self>) -> Div {
         let handle = cx.entity().downgrade();
-        let query_text = if picker.query.is_empty() {
-            "Search directories...".to_string()
-        } else {
-            picker.query.clone()
-        };
 
         let items = picker.entries.iter().enumerate().map(|(i, entry)| {
             let is_active = i == picker.selected;
@@ -2079,22 +3579,7 @@ impl TabView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(
-                div()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded(px(6.0))
-                    .bg(rgb(0x111111))
-                    .border_1()
-                    .border_color(rgb(0x252525))
-                    .text_size(px(12.0))
-                    .text_color(if picker.query.is_empty() {
-                        rgb(0x666666)
-                    } else {
-                        rgb(0xcccccc)
-                    })
-                    .child(query_text),
-            )
+            .child(self.render_picker_query_input(&picker.query, "Search directories..."))
             .child(
                 div()
                     .id("path_picker_list")
@@ -2108,12 +3593,15 @@ impl TabView {
 
     fn render_branch_picker(&self, picker: &BranchPickerState, cx: &Context<Self>) -> Div {
         let handle = cx.entity().downgrade();
-        let query_text = if picker.query.is_empty() {
-            "Search branches...".to_string()
-        } else {
-            picker.query.clone()
-        };
         let current = self.git_status.as_ref().map(|g| g.branch.clone());
+
+        let truncate_branch = |label: &str| {
+            if label.len() > 32 {
+                format!("...{}", &label[label.len() - 29..])
+            } else {
+                label.to_string()
+            }
+        };
 
         let items = picker.branches.iter().enumerate().map(|(i, branch)| {
             let is_active = i == picker.selected;
@@ -2147,7 +3635,7 @@ impl TabView {
                         } else {
                             rgb(0xeeeeee)
                         })
-                        .child(branch.clone()),
+                        .child(truncate_branch(branch)),
                 )
                 .on_mouse_down(gpui::MouseButton::Left, {
                     let handle = handle.clone();
@@ -2172,25 +3660,218 @@ impl TabView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(
-                div()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .rounded(px(6.0))
-                    .bg(rgb(0x111111))
-                    .border_1()
-                    .border_color(rgb(0x252525))
-                    .text_size(px(12.0))
-                    .text_color(if picker.query.is_empty() {
-                        rgb(0x666666)
-                    } else {
-                        rgb(0xcccccc)
-                    })
-                    .child(query_text),
-            )
+            .child(self.render_picker_query_input(&picker.query, "Search branches..."))
             .child(
                 div()
                     .id("branch_picker_list")
+                    .flex_col()
+                    .gap(px(6.0))
+                    .max_h(px(260.0))
+                    .overflow_y_scroll()
+                    .children(items),
+            )
+    }
+
+    fn render_agent_picker(&self, picker: &AgentPickerState, cx: &Context<Self>) -> Div {
+        let handle = cx.entity().downgrade();
+        let search_visible = picker_has_search_input(PickerKind::Agent, picker.all_options.len());
+
+        let header = if search_visible {
+            self.render_picker_query_input(&picker.query, "Search ACPs...")
+        } else {
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .bg(rgb(0x111111))
+                .border_1()
+                .border_color(rgb(0x252525))
+                .text_size(px(12.0))
+                .text_color(rgb(0xaaaaaa))
+                .child("Select ACP")
+        };
+
+        let items = picker.options.iter().enumerate().map(|(i, row)| {
+            let is_active = i == picker.selected;
+            let icon_present = self
+                .registry_manifests
+                .get(&row.acp_id)
+                .and_then(|manifest| manifest.icon.as_ref())
+                .is_some();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(if is_active {
+                    rgb(0x1f2a2f)
+                } else {
+                    rgb(0x1a1a1a)
+                })
+                .border_1()
+                .border_color(if is_active {
+                    rgb(0x27404a)
+                } else {
+                    rgb(0x1f1f1f)
+                })
+                .cursor(clickable_cursor())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(registry_avatar(&row.name, icon_present))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(0xeeeeee))
+                                .child(row.name.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8d8d8d))
+                        .child(row.acp_id.clone()),
+                )
+                .on_mouse_down(gpui::MouseButton::Left, {
+                    let handle = handle.clone();
+                    move |_event, _window, cx| {
+                        let _ = handle.update(cx, |view, cx| {
+                            view.on_agent_picker_select(i, cx);
+                        });
+                    }
+                })
+        });
+
+        div()
+            .absolute()
+            .left(px(116.0))
+            .bottom(px(120.0))
+            .w(px(360.0))
+            .rounded(px(10.0))
+            .bg(rgb(0x171717))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(header)
+            .child(
+                div()
+                    .id("agent_picker_list")
+                    .flex_col()
+                    .gap(px(6.0))
+                    .max_h(px(260.0))
+                    .overflow_y_scroll()
+                    .children(items),
+            )
+    }
+
+    fn render_model_picker(&self, picker: &ModelPickerState, cx: &Context<Self>) -> Div {
+        let handle = cx.entity().downgrade();
+        let search_visible = picker_has_search_input(PickerKind::Model, picker.all_options.len());
+
+        let header = if search_visible {
+            self.render_picker_query_input(&picker.query, "Search models...")
+        } else {
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .bg(rgb(0x111111))
+                .border_1()
+                .border_color(rgb(0x252525))
+                .text_size(px(12.0))
+                .text_color(rgb(0xaaaaaa))
+                .child("Select model")
+        };
+
+        let items = picker.options.iter().enumerate().map(|(i, model)| {
+            let is_active = i == picker.selected;
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(if is_active {
+                    rgb(0x1f2a2f)
+                } else {
+                    rgb(0x1a1a1a)
+                })
+                .border_1()
+                .border_color(if is_active {
+                    rgb(0x27404a)
+                } else {
+                    rgb(0x1f1f1f)
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(0xeeeeee))
+                                .child(model.label.clone()),
+                        )
+                        .child(if model.is_default {
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .bg(rgb(0x1c2b1a))
+                                .border_1()
+                                .border_color(rgb(0x335f2d))
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xb7e3a1))
+                                .child("Default")
+                        } else {
+                            div()
+                        }),
+                )
+                .child(if let Some(description) = model.description.clone() {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8d8d8d))
+                        .child(description)
+                } else {
+                    div()
+                })
+                .on_mouse_down(gpui::MouseButton::Left, {
+                    let handle = handle.clone();
+                    move |_event, _window, cx| {
+                        let _ = handle.update(cx, |view, cx| {
+                            view.on_model_picker_select(i, cx);
+                        });
+                    }
+                })
+        });
+
+        div()
+            .absolute()
+            .left(px(320.0))
+            .bottom(px(120.0))
+            .w(px(360.0))
+            .rounded(px(10.0))
+            .bg(rgb(0x171717))
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(header)
+            .child(
+                div()
+                    .id("model_picker_list")
                     .flex_col()
                     .gap(px(6.0))
                     .max_h(px(260.0))
@@ -2223,6 +3904,20 @@ impl TabView {
         self.accept_overlay_selection(cx);
     }
 
+    fn on_agent_picker_select(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(Overlay::Agent(ref mut picker)) = self.overlay {
+            picker.selected = index;
+        }
+        self.accept_overlay_selection(cx);
+    }
+
+    fn on_model_picker_select(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(Overlay::Model(ref mut picker)) = self.overlay {
+            picker.selected = index;
+        }
+        self.accept_overlay_selection(cx);
+    }
+
     fn push_history(&mut self, command: &str) {
         if self.history.front().map(|c| c == command).unwrap_or(false) {
             return;
@@ -2232,7 +3927,10 @@ impl TabView {
             self.history.pop_back();
         }
         if let Some(path) = self.history_file.clone() {
-            let _ = Self::append_history_line(&path, command);
+            let command = command.to_string();
+            thread::spawn(move || {
+                let _ = Self::append_history_line(&path, &command);
+            });
         }
     }
 
@@ -2861,6 +4559,12 @@ impl TabView {
                 output_lines: Vec::new(),
                 has_error: false,
                 context: None,
+                agent_placeholder_active: false,
+                pending_permission: None,
+                agent_stream_text: String::new(),
+                agent_stream_line_index: None,
+                agent_response: None,
+                agent_response_line_count: 0,
             });
             self.selected_block = Some(0);
         }
@@ -2892,25 +4596,31 @@ impl TabView {
             }
         }
 
-        let mut appended_any = false;
-        let mut last_line_appended = false;
+        let mut batch = Vec::new();
+        let mut append_first_to_last = false;
         for (index, line) in lines.iter().enumerate() {
             let append_to_last = index == 0 && self.last_line_incomplete;
-            let appended = self.append_output_line(line, append_to_last);
-            if appended {
-                appended_any = true;
-                last_line_appended = true;
+            if self.should_skip_output_line(line) {
+                if append_to_last {
+                    self.rollback_last_incomplete_output_line();
+                }
+                continue;
             }
+
+            if batch.is_empty() {
+                append_first_to_last = append_to_last;
+            }
+            batch.push((*line).to_string());
         }
 
-        self.last_line_incomplete = !ends_with_newline && last_line_appended;
+        let appended_any =
+            self.append_output_batch(&batch, append_first_to_last) && !batch.is_empty();
+        self.last_line_incomplete = !ends_with_newline && appended_any;
 
         if appended_any {
             self.trim_output_lines();
             self.update_follow_output_from_scroll();
-            if self.follow_output {
-                self.scroll_handle.scroll_to_bottom();
-            }
+            self.request_scroll_to_bottom(cx);
         }
     }
 
@@ -2972,31 +4682,24 @@ impl TabView {
         self.git_status = get_git_status(&cwd);
     }
 
-    fn append_output_line(&mut self, line: &str, append_to_last: bool) -> bool {
-        if self.should_skip_output_line(line) {
-            if append_to_last {
-                if let Some(block) = self.blocks.last_mut() {
-                    if !block.output_lines.is_empty() {
-                        block.output_lines.pop();
-                        self.total_output_lines = self.total_output_lines.saturating_sub(1);
-                    }
-                }
-            }
+    fn rollback_last_incomplete_output_line(&mut self) {
+        if let Some(block) = self.blocks.last_mut()
+            && !block.output_lines.is_empty()
+        {
+            block.output_lines.pop();
+            self.total_output_lines = self.total_output_lines.saturating_sub(1);
+        }
+    }
+
+    fn append_output_batch(&mut self, lines: &[String], append_first_to_last: bool) -> bool {
+        if lines.is_empty() {
             return false;
         }
+
         let block = self.ensure_output_block();
-        if is_error_line(line) {
-            block.has_error = true;
-        }
-        if append_to_last {
-            if let Some(last) = block.output_lines.last_mut() {
-                last.push_str(line);
-                return true;
-            }
-        }
-        block.output_lines.push(line.to_string());
-        self.total_output_lines += 1;
-        true
+        let added_lines = append_output_batch_to_block(block, lines, append_first_to_last);
+        self.total_output_lines += added_lines;
+        added_lines > 0 || append_first_to_last
     }
 
     fn trim_output_lines(&mut self) {
@@ -3052,10 +4755,15 @@ impl TabView {
         let mut row = div()
             .min_w(px(0.0))
             .text_color(color)
-            .truncate()
             .cursor(CursorStyle::IBeam)
             .px(px(2.0))
-            .child(line.to_string())
+            .child(
+                div().flex_col().gap(px(0.0)).children(
+                    wrap_terminal_text_lines(line, 96)
+                        .into_iter()
+                        .map(|wrapped| div().min_w(px(0.0)).child(wrapped)),
+                ),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, event: &MouseDownEvent, _window, cx| {
@@ -3073,6 +4781,182 @@ impl TabView {
         }
 
         row
+    }
+
+    fn permission_prompt_options(request: &PermissionRequest) -> Vec<PermissionOption> {
+        if !request.options.is_empty() {
+            return request.options.clone();
+        }
+
+        vec![
+            PermissionOption {
+                id: "allow_once".into(),
+                name: "Permitir uma vez".into(),
+                description: Some("Allow this action only for this turn.".into()),
+            },
+            PermissionOption {
+                id: "allow_always".into(),
+                name: "Sempre permitir".into(),
+                description: Some("Allow this action for future turns.".into()),
+            },
+            PermissionOption {
+                id: "reject".into(),
+                name: "Negar".into(),
+                description: Some("Reject this request.".into()),
+            },
+        ]
+    }
+
+    fn permission_status_text(decision: &PermissionDecision) -> &'static str {
+        match decision {
+            PermissionDecision::Selected { .. } => "[agent] permission granted",
+            PermissionDecision::Cancelled => "[agent] permission denied",
+        }
+    }
+
+    fn resolve_permission_prompt(
+        &mut self,
+        block_index: usize,
+        decision: PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let is_last_block = block_index == self.blocks.len().saturating_sub(1);
+        let Some(block) = self.blocks.get_mut(block_index) else {
+            return;
+        };
+        let Some(pending) = block.pending_permission.take() else {
+            return;
+        };
+
+        let _ = pending.response_tx.send(decision.clone());
+        let status = Self::permission_status_text(&decision);
+
+        if is_last_block {
+            if !update_agent_placeholder_block(block, status) {
+                block.output_lines.push(status.to_string());
+                self.total_output_lines += 1;
+            }
+        } else {
+            block.output_lines.push(status.to_string());
+            self.total_output_lines += 1;
+        }
+        self.trim_output_lines();
+        self.request_scroll_to_bottom(cx);
+        cx.notify();
+    }
+
+    fn render_permission_prompt(
+        &self,
+        block_index: usize,
+        block: &Block,
+        cx: &Context<Self>,
+    ) -> Div {
+        let Some(pending) = block.pending_permission.as_ref() else {
+            return div();
+        };
+
+        let request = &pending.request;
+        let title = request
+            .title
+            .clone()
+            .unwrap_or_else(|| "Permission request".to_string());
+        let description = request.description.clone();
+        let tool_name = request.tool_name.clone();
+        let options = Self::permission_prompt_options(request);
+        let handle = cx.entity().downgrade();
+
+        let mut card = div()
+            .mt(px(4.0))
+            .px(px(10.0))
+            .py(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(0x27485f))
+            .bg(rgb(0x0d1620))
+            .flex()
+            .flex_col()
+            .gap(px(8.0));
+
+        card = card.child(
+            div()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(0xe4f1ff))
+                .child(title),
+        );
+
+        if let Some(tool_name) = tool_name {
+            card = card.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x9bb4c9))
+                    .child(format!("Tool: {tool_name}")),
+            );
+        }
+
+        if let Some(description) = description {
+            card = card.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xc0cfdd))
+                    .whitespace_normal()
+                    .child(description),
+            );
+        }
+
+        let buttons = options.into_iter().map(move |option| {
+            let option_id = option.id.clone();
+            let option_label = option.name.clone();
+            let option_description = option.description.clone();
+            let handle = handle.clone();
+            let mut button = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(rgb(0x2b3e50))
+                .bg(rgb(0x111a24))
+                .hover(|this| this.bg(rgb(0x162432)).border_color(rgb(0x3d5a75)))
+                .cursor(CursorStyle::PointingHand)
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xeaf2ff))
+                        .child(option_label),
+                );
+
+            if let Some(description) = option_description {
+                button = button.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0xa6bbcf))
+                        .whitespace_normal()
+                        .child(description),
+                );
+            }
+
+            button.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                let _ = handle.update(cx, |view, cx| {
+                    view.resolve_permission_prompt(
+                        block_index,
+                        PermissionDecision::Selected {
+                            option_id: option_id.clone(),
+                        },
+                        cx,
+                    );
+                });
+                cx.stop_propagation();
+            })
+        });
+
+        card.child(div().flex().gap(px(6.0)).children(buttons))
     }
 
     fn render_block(
@@ -3151,19 +5035,54 @@ impl TabView {
                 }),
             );
 
-        let output = if block.output_lines.is_empty() {
+        let response_line_count = block
+            .agent_response_line_count
+            .min(block.output_lines.len());
+        let output_lines = if response_line_count == 0 {
+            block.output_lines.as_slice()
+        } else {
+            &block.output_lines[..block.output_lines.len() - response_line_count]
+        };
+        let output = if output_lines.is_empty() {
             div()
         } else {
+            let (render_start, visible_lines) =
+                renderable_output_window(output_lines, MAX_RENDERED_OUTPUT_LINES_PER_BLOCK);
             div().flex_col().gap(px(2.0)).text_size(px(12.0)).children(
-                block
-                    .output_lines
-                    .iter()
-                    .enumerate()
-                    .map(|(line_index, line)| {
-                        self.render_output_line(line, block.has_error, index, line_index, cx)
-                    }),
+                (render_start > 0)
+                    .then(|| {
+                        self.render_output_line(
+                            &format!(
+                                "[... {} earlier lines hidden for performance ...]",
+                                render_start
+                            ),
+                            false,
+                            index,
+                            render_start.saturating_sub(1),
+                            cx,
+                        )
+                    })
+                    .into_iter()
+                    .chain(
+                        visible_lines
+                            .iter()
+                            .enumerate()
+                            .map(|(visible_index, line)| {
+                                let line_index = render_start + visible_index;
+                                self.render_output_line(
+                                    line,
+                                    block.has_error,
+                                    index,
+                                    line_index,
+                                    cx,
+                                )
+                            }),
+                    ),
             )
         };
+        let agent_response =
+            render_agent_response_content(block.agent_response.as_ref(), block.has_error);
+        let permission_prompt = self.render_permission_prompt(index, block, cx);
 
         div()
             .flex()
@@ -3196,7 +5115,9 @@ impl TabView {
                             .child(div().flex_1().min_w(px(0.0)).child(header))
                             .child(copy_button),
                     )
-                    .child(output),
+                    .child(output)
+                    .child(agent_response)
+                    .child(permission_prompt),
             )
     }
 }
@@ -3447,6 +5368,621 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
+fn wrap_terminal_line(line: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_len = 0usize;
+
+    for ch in line.chars() {
+        chunk.push(ch);
+        chunk_len += 1;
+
+        if chunk_len >= max_chars {
+            wrapped.push(std::mem::take(&mut chunk));
+            chunk_len = 0;
+        }
+    }
+
+    if !chunk.is_empty() {
+        wrapped.push(chunk);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn wrap_terminal_text_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut wrapped = Vec::new();
+
+    for line in normalized.split('\n') {
+        wrapped.extend(wrap_terminal_line(line, max_chars));
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn renderable_output_window(lines: &[String], max_lines: usize) -> (usize, &[String]) {
+    if lines.len() <= max_lines {
+        return (0, lines);
+    }
+
+    let start = lines.len() - max_lines;
+    (start, &lines[start..])
+}
+
+fn markdown_response_line_count(text: &str) -> usize {
+    let count = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .count();
+    count.max(1)
+}
+
+fn render_agent_response_content(response: Option<&AcpResponseText>, has_error: bool) -> Div {
+    let Some(response) = response else {
+        return div();
+    };
+
+    let container = div()
+        .mt(px(4.0))
+        .px(px(10.0))
+        .py(px(10.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgb(0x355c7d))
+        .bg(rgb(0x0d1620))
+        .flex()
+        .flex_col()
+        .gap(px(6.0));
+
+    let body = render_markdown_response_content(response.text(), has_error);
+
+    container.child(body)
+}
+
+fn render_markdown_response_content(text: &str, has_error: bool) -> Div {
+    let blocks = parse_markdown_blocks(text);
+    if markdown_should_fallback_to_raw(text, &blocks) {
+        return render_markdown_raw_content(text, has_error);
+    }
+    let base_color = if has_error {
+        rgb(0xffd0d0)
+    } else {
+        rgb(0xd8e6f2)
+    };
+
+    div().flex_col().gap(px(8.0)).children(
+        blocks
+            .into_iter()
+            .map(|block| render_markdown_block(block, base_color.into())),
+    )
+}
+
+fn render_markdown_raw_content(text: &str, has_error: bool) -> Div {
+    let color = if has_error {
+        rgb(0xffd0d0)
+    } else {
+        rgb(0xd8e6f2)
+    };
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(items) = extract_compact_list_items(&normalized) {
+        return render_markdown_compact_list(items, color);
+    }
+
+    div()
+        .flex_col()
+        .gap(px(2.0))
+        .px(px(10.0))
+        .py(px(8.0))
+        .rounded(px(6.0))
+        .bg(rgb(0x111820))
+        .border_1()
+        .border_color(rgb(0x253545))
+        .font_family("Cascadia Code")
+        .text_color(color)
+        .children(normalized.lines().map(|line| {
+            if line.is_empty() {
+                div().h(px(12.0))
+            } else {
+                div().min_w(px(0.0)).child(line.to_string())
+            }
+        }))
+}
+
+fn render_markdown_compact_list(items: Vec<String>, color: Rgba) -> Div {
+    div()
+        .flex_col()
+        .gap(px(4.0))
+        .px(px(10.0))
+        .py(px(8.0))
+        .rounded(px(6.0))
+        .bg(rgb(0x111820))
+        .border_1()
+        .border_color(rgb(0x253545))
+        .font_family("Cascadia Code")
+        .text_color(color)
+        .children(items.into_iter().map(|item| {
+            div()
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .child(div().flex_none().font_weight(FontWeight::BOLD).child("•"))
+                .child(div().min_w(px(0.0)).child(item))
+        }))
+}
+
+fn extract_compact_list_items(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    if trimmed.contains("```") || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let mut items = Vec::new();
+    let mut rest = trimmed;
+
+    loop {
+        let rest_trimmed = rest.trim_start_matches(|ch: char| ch == ',' || ch.is_whitespace());
+        if rest_trimmed.is_empty() {
+            break;
+        }
+        rest = rest_trimmed;
+
+        let Some(open) = rest.find('`') else {
+            return None;
+        };
+        if open > 0 {
+            let prefix = rest[..open].trim();
+            if !prefix.is_empty() && items.is_empty() {
+                return None;
+            }
+        }
+
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            return None;
+        };
+        let item = after_open[..close].trim().to_string();
+        if item.is_empty() {
+            return None;
+        }
+        items.push(item);
+        rest = &after_open[close + 1..];
+
+        let rest_check = rest.trim_start();
+        if rest_check.is_empty() {
+            break;
+        }
+        if !rest_check.starts_with(',') {
+            return None;
+        }
+    }
+
+    if items.len() >= 2 { Some(items) } else { None }
+}
+
+fn markdown_should_fallback_to_raw(text: &str, blocks: &[MarkdownBlock]) -> bool {
+    // Structural markdown elements → always keep markdown rendering.
+    if blocks.iter().any(|block| {
+        matches!(
+            block,
+            MarkdownBlock::Heading { .. }
+                | MarkdownBlock::ListItem { .. }
+                | MarkdownBlock::CodeBlock { .. }
+        )
+    }) {
+        return false;
+    }
+
+    // Check for paired inline markers (not just single chars).
+    let has_bold = text.contains("**");
+    let has_inline_code = {
+        if let Some(first) = text.find('`') {
+            text[first + 1..].contains('`')
+        } else {
+            false
+        }
+    };
+    let has_link = text.contains('[') && text.contains("](");
+
+    let has_inline_markers = has_bold || has_inline_code || has_link;
+    if !has_inline_markers {
+        return true;
+    }
+
+    // Odd backtick count suggests malformed inline code, but only fall back
+    // if there are no other strong inline markers to render.
+    let backtick_count = text.chars().filter(|ch| *ch == '`').count();
+    if backtick_count % 2 != 0 && !has_bold && !has_link {
+        return true;
+    }
+
+    false
+}
+
+fn render_markdown_block(block: MarkdownBlock, base_color: gpui::Hsla) -> Div {
+    match block {
+        MarkdownBlock::Heading { level, text } => {
+            let size = match level {
+                1 => 17.0,
+                2 => 15.5,
+                _ => 14.0,
+            };
+            div()
+                .flex_col()
+                .gap(px(2.0))
+                .text_color(base_color)
+                .text_size(px(size))
+                .font_weight(FontWeight::BOLD)
+                .children(vec![render_markdown_inline_line(&text, base_color)])
+        }
+        MarkdownBlock::Paragraph(text) => render_markdown_inline_line(&text, base_color),
+        MarkdownBlock::ListItem {
+            ordered,
+            index,
+            text,
+        } => {
+            let prefix = if ordered {
+                format!("{}.", index.unwrap_or(1))
+            } else {
+                "•".to_string()
+            };
+            div()
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .text_color(base_color)
+                .children(vec![
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::BOLD)
+                        .child(prefix),
+                    render_markdown_inline_line(&text, base_color),
+                ])
+        }
+        MarkdownBlock::CodeBlock { language, lines } => {
+            let mut code = div()
+                .flex_col()
+                .gap(px(2.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(rgb(0x111820))
+                .border_1()
+                .border_color(rgb(0x253545))
+                .font_family("Cascadia Code")
+                .text_color(rgb(0xcfd8e3));
+
+            if let Some(language) = language {
+                code = code.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0x8aa1b3))
+                        .child(language),
+                );
+            }
+
+            code.children(
+                lines
+                    .into_iter()
+                    .map(|line| div().font_family("Cascadia Code").child(line)),
+            )
+        }
+    }
+}
+
+fn render_markdown_inline_line(text: &str, base_color: gpui::Hsla) -> Div {
+    let segments = parse_markdown_inline(text);
+    div()
+        .flex()
+        .flex_wrap()
+        .gap(px(0.0))
+        .text_color(base_color)
+        .children(
+            segments
+                .into_iter()
+                .map(|segment| render_markdown_inline_segment(segment)),
+        )
+}
+
+fn render_markdown_inline_segment(segment: MarkdownInlineSegment) -> Div {
+    match segment {
+        MarkdownInlineSegment::Text(text) => div().min_w(px(0.0)).child(text),
+        MarkdownInlineSegment::Strong(text) => div()
+            .min_w(px(0.0))
+            .font_weight(FontWeight::BOLD)
+            .child(text),
+        MarkdownInlineSegment::Emphasis(text) => div().min_w(px(0.0)).child(text),
+        MarkdownInlineSegment::Code(text) => div()
+            .min_w(px(0.0))
+            .font_family("Cascadia Code")
+            .px(px(4.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .bg(rgb(0x1a2430))
+            .text_color(rgb(0xd6e1ec))
+            .child(text),
+        MarkdownInlineSegment::Link { label, url } => div()
+            .min_w(px(0.0))
+            .text_color(rgb(0x7fb3ff))
+            .child(format!("{label} ({url})")),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MarkdownBlock {
+    Heading {
+        level: usize,
+        text: String,
+    },
+    Paragraph(String),
+    ListItem {
+        ordered: bool,
+        index: Option<usize>,
+        text: String,
+    },
+    CodeBlock {
+        language: Option<String>,
+        lines: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MarkdownInlineSegment {
+    Text(String),
+    Strong(String),
+    Emphasis(String),
+    Code(String),
+    Link { label: String, url: String },
+}
+
+fn parse_markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut blocks = Vec::new();
+    let mut paragraph_lines = Vec::new();
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut index = 0;
+
+    let flush_paragraph = |blocks: &mut Vec<MarkdownBlock>, paragraph_lines: &mut Vec<String>| {
+        if paragraph_lines.is_empty() {
+            return;
+        }
+        blocks.push(MarkdownBlock::Paragraph(paragraph_lines.join(" ")));
+        paragraph_lines.clear();
+    };
+
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_end();
+        let stripped = trimmed.trim_start();
+
+        if stripped.is_empty() {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            index += 1;
+            continue;
+        }
+
+        if let Some((language, consumed)) = parse_markdown_fence_start(stripped) {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            let mut code_lines = Vec::new();
+            index += 1;
+            while index < lines.len() {
+                let current = lines[index].trim_end();
+                if current.trim_start().starts_with("```") {
+                    break;
+                }
+                code_lines.push(current.to_string());
+                index += 1;
+            }
+            blocks.push(MarkdownBlock::CodeBlock {
+                language,
+                lines: code_lines,
+            });
+            if consumed {
+                index += 1;
+            }
+            continue;
+        }
+
+        if let Some((level, heading_text)) = parse_markdown_heading(stripped) {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            blocks.push(MarkdownBlock::Heading {
+                level,
+                text: heading_text,
+            });
+            index += 1;
+            continue;
+        }
+
+        if let Some((ordered, list_index, list_text)) = parse_markdown_list_item(stripped) {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            blocks.push(MarkdownBlock::ListItem {
+                ordered,
+                index: list_index,
+                text: list_text,
+            });
+            index += 1;
+            continue;
+        }
+
+        paragraph_lines.push(stripped.to_string());
+        index += 1;
+    }
+
+    flush_paragraph(&mut blocks, &mut paragraph_lines);
+    blocks
+}
+
+fn parse_markdown_fence_start(line: &str) -> Option<(Option<String>, bool)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+
+    let language = trimmed
+        .trim_start_matches("```")
+        .trim()
+        .chars()
+        .next()
+        .map(|_| trimmed.trim_start_matches("```").trim().to_string())
+        .filter(|lang| !lang.is_empty());
+
+    Some((language, true))
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, String)> {
+    let count = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&count) {
+        return None;
+    }
+    let rest = line[count..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((count, rest.to_string()))
+}
+
+fn parse_markdown_list_item(line: &str) -> Option<(bool, Option<usize>, String)> {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return Some((false, None, rest.trim().to_string()));
+    }
+    if let Some(rest) = line.strip_prefix("* ") {
+        return Some((false, None, rest.trim().to_string()));
+    }
+    if let Some(rest) = line.strip_prefix("+ ") {
+        return Some((false, None, rest.trim().to_string()));
+    }
+
+    let mut digits = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            chars.next();
+            continue;
+        }
+        break;
+    }
+
+    if digits.is_empty() || !matches!(chars.next(), Some('.')) || !matches!(chars.next(), Some(' '))
+    {
+        return None;
+    }
+
+    let text = chars.collect::<String>().trim().to_string();
+    let index = digits.parse::<usize>().ok();
+    Some((true, index, text))
+}
+
+fn parse_markdown_inline(text: &str) -> Vec<MarkdownInlineSegment> {
+    let mut segments = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if let Some(rest) = remaining.strip_prefix("**") {
+            if let Some(end) = rest.find("**") {
+                segments.push(MarkdownInlineSegment::Strong(rest[..end].to_string()));
+                remaining = &rest[end + 2..];
+                continue;
+            }
+            segments.push(MarkdownInlineSegment::Text("*".to_string()));
+            remaining = rest;
+            continue;
+        }
+
+        if let Some(rest) = remaining.strip_prefix('*') {
+            if !rest.starts_with('*')
+                && let Some(end) = rest.find('*')
+            {
+                segments.push(MarkdownInlineSegment::Emphasis(rest[..end].to_string()));
+                remaining = &rest[end + 1..];
+                continue;
+            }
+            segments.push(MarkdownInlineSegment::Text("*".to_string()));
+            remaining = rest;
+            continue;
+        }
+
+        if let Some(rest) = remaining.strip_prefix('`')
+            && let Some(end) = rest.find('`')
+        {
+            segments.push(MarkdownInlineSegment::Code(rest[..end].to_string()));
+            remaining = &rest[end + 1..];
+            continue;
+        }
+        if remaining.starts_with('`') {
+            segments.push(MarkdownInlineSegment::Text("`".to_string()));
+            remaining = &remaining[1..];
+            continue;
+        }
+
+        if let Some(rest) = remaining.strip_prefix('[')
+            && let Some(label_end) = rest.find("](")
+        {
+            let label = &rest[..label_end];
+            let after = &rest[label_end + 2..];
+            if let Some(url_end) = after.find(')') {
+                segments.push(MarkdownInlineSegment::Link {
+                    label: label.to_string(),
+                    url: after[..url_end].to_string(),
+                });
+                remaining = &after[url_end + 1..];
+                continue;
+            }
+        }
+        if remaining.starts_with('[') {
+            segments.push(MarkdownInlineSegment::Text("[".to_string()));
+            remaining = &remaining[1..];
+            continue;
+        }
+
+        let next_marker = find_next_markdown_marker(remaining).unwrap_or(remaining.len());
+        if next_marker == 0 {
+            let mut chars = remaining.chars();
+            if let Some(first) = chars.next() {
+                segments.push(MarkdownInlineSegment::Text(first.to_string()));
+                remaining = chars.as_str();
+                continue;
+            }
+            break;
+        }
+        segments.push(MarkdownInlineSegment::Text(
+            remaining[..next_marker].to_string(),
+        ));
+        remaining = &remaining[next_marker..];
+    }
+
+    segments
+}
+
+fn find_next_markdown_marker(text: &str) -> Option<usize> {
+    let mut next: Option<usize> = None;
+    for marker in ["**", "*", "`", "["] {
+        if let Some(index) = text.find(marker) {
+            next = Some(match next {
+                Some(current) => current.min(index),
+                None => index,
+            });
+        }
+    }
+    next
+}
+
 impl Focusable for TabView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -3454,3 +5990,561 @@ impl Focusable for TabView {
 }
 
 impl EventEmitter<TabViewEvent> for TabView {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AGENT_CONNECTING_PLACEHOLDER, AGENT_SENDING_PROMPT_PLACEHOLDER, AgentStreamOp, Block,
+        InitialFocusTarget, MarkdownBlock, MarkdownInlineSegment, ModelButtonState,
+        PermissionDecision, PermissionRequest, PickerKind, PickerQueryState, TabView,
+        append_agent_stream_delta, append_output_batch_to_block, build_agent_picker_state,
+        build_model_picker_state, classify_agent_stream_op, clickable_cursor, compute_row_state,
+        compute_trigger_state, extract_compact_list_items, model_trigger_label,
+        parse_markdown_blocks, parse_markdown_inline, picker_has_search_input,
+        picker_header_is_static, picker_initial_focus_target, picker_typeahead_enabled,
+        renderable_output_window, replace_agent_stream_snapshot, streaming_snapshot_delta,
+        text_input_cursor, update_agent_placeholder_block, wrap_terminal_line,
+        wrap_terminal_text_lines,
+    };
+    use crate::acp::manager::AgentSpec;
+    use crate::acp::model_discovery::AcpModelOption;
+    use crate::acp::resolve::{AgentKey, AgentSourceKind, EffectiveAgentRow};
+    use gpui::CursorStyle;
+
+    fn row(id: &str, name: &str) -> EffectiveAgentRow {
+        EffectiveAgentRow {
+            agent_key: AgentKey {
+                source_type: AgentSourceKind::Registry,
+                source_id: "managed".into(),
+                acp_id: id.into(),
+            },
+            acp_id: id.into(),
+            name: name.into(),
+            source_type: AgentSourceKind::Registry,
+            source_id: "managed".into(),
+            spec: AgentSpec {
+                id: id.into(),
+                name: name.into(),
+                command: format!("{id}.cmd"),
+                args: Vec::new(),
+                fixed_env: Default::default(),
+                env_keys: Vec::new(),
+                install: None,
+                auth: None,
+            },
+            managed_state: None,
+            is_selected: true,
+            is_alternate: false,
+        }
+    }
+
+    #[test]
+    fn agent_picker_defaults_to_first_option_without_selected_key() {
+        let picker =
+            build_agent_picker_state(&[row("codex", "Codex"), row("claude", "Claude")], None)
+                .expect("picker should exist");
+
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.options.len(), 2);
+        assert_eq!(picker.options[0].acp_id, "codex");
+    }
+
+    #[test]
+    fn agent_picker_uses_selected_key_when_present() {
+        let rows = vec![row("codex", "Codex"), row("claude", "Claude")];
+        let selected_key = rows[1].agent_key.clone();
+
+        let picker =
+            build_agent_picker_state(&rows, Some(&selected_key)).expect("picker should exist");
+
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.options[picker.selected].acp_id, "claude");
+    }
+
+    #[test]
+    fn model_picker_uses_selected_model_when_present() {
+        let catalog = vec![
+            AcpModelOption {
+                id: "gpt-5.3".into(),
+                label: "GPT-5.3".into(),
+                description: None,
+                is_default: true,
+            },
+            AcpModelOption {
+                id: "gpt-5.4".into(),
+                label: "GPT-5.4".into(),
+                description: None,
+                is_default: false,
+            },
+        ];
+
+        let picker =
+            build_model_picker_state(&catalog, Some("gpt-5.4")).expect("picker should exist");
+
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.options[picker.selected].id, "gpt-5.4");
+    }
+
+    #[test]
+    fn conditional_search_picker_hides_search_for_five_or_fewer_items() {
+        assert!(!picker_has_search_input(PickerKind::Agent, 5));
+    }
+
+    #[test]
+    fn conditional_search_picker_shows_search_for_six_or_more_items() {
+        assert!(picker_has_search_input(PickerKind::Agent, 6));
+    }
+
+    #[test]
+    fn short_conditional_picker_uses_typeahead_without_search_input() {
+        assert!(picker_typeahead_enabled(PickerKind::Agent, 5));
+        assert!(picker_header_is_static(PickerKind::Agent, 5));
+    }
+
+    #[test]
+    fn clickable_rows_and_triggers_report_pointer_semantics() {
+        assert_eq!(clickable_cursor(), CursorStyle::PointingHand);
+    }
+
+    #[test]
+    fn editable_search_inputs_report_text_semantics() {
+        assert_eq!(text_input_cursor(), CursorStyle::IBeam);
+    }
+
+    #[test]
+    fn conditional_picker_initial_focus_is_list() {
+        assert_eq!(
+            picker_initial_focus_target(PickerKind::Agent),
+            InitialFocusTarget::List
+        );
+        assert_eq!(
+            picker_initial_focus_target(PickerKind::Path),
+            InitialFocusTarget::SearchInput
+        );
+    }
+
+    #[test]
+    fn selected_row_keeps_selected_state_when_also_highlighted() {
+        let row = compute_row_state(true, true, false);
+        assert!(row.is_selected);
+        assert!(row.is_highlighted);
+    }
+
+    #[test]
+    fn trigger_state_reports_loading_and_has_search_input() {
+        let state = compute_trigger_state(true, false, true, true);
+        assert!(state.loading);
+        assert!(state.has_search_input);
+    }
+
+    #[test]
+    fn model_trigger_label_returns_expected_texts() {
+        assert_eq!(
+            model_trigger_label(&ModelButtonState::Loading),
+            ("Loading models...".to_string(), true)
+        );
+        assert_eq!(
+            model_trigger_label(&ModelButtonState::Unavailable),
+            ("No models available".to_string(), true)
+        );
+        assert_eq!(
+            model_trigger_label(&ModelButtonState::Ready("GPT".to_string())),
+            ("GPT".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn model_picker_search_threshold() {
+        assert!(!picker_has_search_input(PickerKind::Model, 5));
+        assert!(picker_has_search_input(PickerKind::Model, 6));
+    }
+
+    #[test]
+    fn permission_prompt_options_fallback_to_default_choices() {
+        let request = PermissionRequest {
+            request_id: 1,
+            session_id: Some("sess_123".into()),
+            title: Some("Approve".into()),
+            description: None,
+            tool_name: None,
+            options: Vec::new(),
+            raw_params: serde_json::json!({}),
+        };
+
+        let options = TabView::permission_prompt_options(&request);
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].id, "allow_once");
+        assert_eq!(options[2].name, "Negar");
+    }
+
+    #[test]
+    fn permission_status_text_matches_decision() {
+        assert_eq!(
+            TabView::permission_status_text(&PermissionDecision::Selected {
+                option_id: "allow_once".into()
+            }),
+            "[agent] permission granted"
+        );
+        assert_eq!(
+            TabView::permission_status_text(&PermissionDecision::Cancelled),
+            "[agent] permission denied"
+        );
+    }
+
+    #[test]
+    fn streaming_snapshot_delta_returns_only_new_suffix() {
+        assert_eq!(
+            streaming_snapshot_delta("Directory:\nassets", "Directory:\nassets\ndocs"),
+            Some("\ndocs".to_string())
+        );
+        assert_eq!(streaming_snapshot_delta("same", "same"), None);
+    }
+
+    #[test]
+    fn classify_agent_stream_op_detects_snapshot_growth_even_without_append_flag() {
+        assert_eq!(
+            classify_agent_stream_op("Directory:\nassets", "Directory:\nassets\ndocs", false),
+            AgentStreamOp::Replace
+        );
+        assert_eq!(
+            classify_agent_stream_op("same", "same", false),
+            AgentStreamOp::Ignore
+        );
+        assert_eq!(
+            classify_agent_stream_op("assets", "docs", false),
+            AgentStreamOp::NewLines
+        );
+    }
+
+    #[test]
+    fn classify_agent_stream_op_treats_small_inline_chunks_as_append() {
+        assert_eq!(
+            classify_agent_stream_op("Vou listar", " o diretório", true),
+            AgentStreamOp::Append
+        );
+    }
+
+    #[test]
+    fn replace_agent_stream_snapshot_replaces_existing_stream_block_in_place() {
+        let mut block = Block {
+            command: "Codex> ls".into(),
+            output_lines: vec![
+                "Directory: C:\\repo".into(),
+                "assets".into(),
+                "[agent stderr] sandbox retry".into(),
+            ],
+            has_error: true,
+            context: None,
+            agent_placeholder_active: false,
+            pending_permission: None,
+            agent_stream_text: "Directory: C:\\repo\nassets".into(),
+            agent_stream_line_index: Some(1),
+            agent_response: None,
+            agent_response_line_count: 0,
+        };
+        let mut total_output_lines = block.output_lines.len();
+
+        replace_agent_stream_snapshot(
+            &mut block,
+            "```sh\nDirectory: C:\\repo\nassets\ndocs\n```",
+            &mut total_output_lines,
+        );
+
+        assert_eq!(
+            block.output_lines,
+            vec![
+                "```sh".to_string(),
+                "Directory: C:\\repo".to_string(),
+                "assets".to_string(),
+                "docs".to_string(),
+                "```".to_string(),
+                "[agent stderr] sandbox retry".to_string(),
+            ]
+        );
+        assert_eq!(total_output_lines, 6);
+        assert_eq!(block.agent_stream_line_index, Some(4));
+    }
+
+    #[test]
+    fn append_agent_stream_delta_extends_existing_lines_without_duplication() {
+        let mut block = Block {
+            command: "Codex> ls".into(),
+            output_lines: vec!["Directory: C:\\repo".into(), "assets".into()],
+            has_error: false,
+            context: None,
+            agent_placeholder_active: false,
+            pending_permission: None,
+            agent_stream_text: "Directory: C:\\repo\nassets".into(),
+            agent_stream_line_index: Some(1),
+            agent_response: None,
+            agent_response_line_count: 0,
+        };
+        let mut total_output_lines = block.output_lines.len();
+
+        let delta = streaming_snapshot_delta(
+            &block.agent_stream_text,
+            "Directory: C:\\repo\nassets\ndocs",
+        )
+        .expect("expected suffix delta");
+        block.agent_stream_text = "Directory: C:\\repo\nassets\ndocs".into();
+        append_agent_stream_delta(&mut block, &delta, &mut total_output_lines);
+
+        assert_eq!(
+            block.output_lines,
+            vec![
+                "Directory: C:\\repo".to_string(),
+                "assets".to_string(),
+                "docs".to_string()
+            ]
+        );
+        assert_eq!(total_output_lines, 3);
+    }
+
+    #[test]
+    fn append_agent_stream_delta_inserts_before_later_stderr_lines() {
+        let mut block = Block {
+            command: "Codex> ls".into(),
+            output_lines: vec![
+                "Directory: C:\\repo".into(),
+                "assets".into(),
+                "[agent stderr] sandbox retry".into(),
+            ],
+            has_error: true,
+            context: None,
+            agent_placeholder_active: false,
+            pending_permission: None,
+            agent_stream_text: "Directory: C:\\repo\nassets".into(),
+            agent_stream_line_index: Some(1),
+            agent_response: None,
+            agent_response_line_count: 0,
+        };
+        let mut total_output_lines = block.output_lines.len();
+
+        let delta = streaming_snapshot_delta(
+            &block.agent_stream_text,
+            "Directory: C:\\repo\nassets\ndocs",
+        )
+        .expect("expected suffix delta");
+        block.agent_stream_text = "Directory: C:\\repo\nassets\ndocs".into();
+        append_agent_stream_delta(&mut block, &delta, &mut total_output_lines);
+
+        assert_eq!(
+            block.output_lines,
+            vec![
+                "Directory: C:\\repo".to_string(),
+                "assets".to_string(),
+                "docs".to_string(),
+                "[agent stderr] sandbox retry".to_string(),
+            ]
+        );
+        assert_eq!(total_output_lines, 4);
+        assert_eq!(block.agent_stream_line_index, Some(2));
+    }
+
+    #[test]
+    fn picker_query_select_all_and_replace_text() {
+        let mut query = PickerQueryState::default();
+        query.insert_text("codex");
+        query.select_all();
+        assert_eq!(query.normalized_selection(), Some((0, 5)));
+
+        query.insert_text("gpt");
+        assert_eq!(query.text, "gpt");
+        assert_eq!(query.cursor, 3);
+        assert_eq!(query.normalized_selection(), None);
+    }
+
+    #[test]
+    fn picker_query_arrow_navigation_updates_cursor_and_selection() {
+        let mut query = PickerQueryState::default();
+        query.insert_text("model");
+        query.move_left(false);
+        query.move_left(false);
+        assert_eq!(query.cursor, 3);
+
+        query.move_left(true);
+        assert_eq!(query.cursor, 2);
+        assert_eq!(query.normalized_selection(), Some((2, 3)));
+
+        query.move_right(true);
+        assert_eq!(query.cursor, 3);
+        assert_eq!(query.normalized_selection(), Some((3, 3)));
+
+        query.move_home(false);
+        assert_eq!(query.cursor, 0);
+        assert_eq!(query.normalized_selection(), None);
+
+        query.move_end(false);
+        assert_eq!(query.cursor, 5);
+    }
+
+    #[test]
+    fn picker_query_delete_forward_removes_character_at_cursor() {
+        let mut query = PickerQueryState::default();
+        query.insert_text("branch");
+        query.move_left(false);
+        query.move_left(false);
+        query.delete_char_after_cursor();
+
+        assert_eq!(query.text, "branh");
+        assert_eq!(query.cursor, 4);
+    }
+
+    #[test]
+    fn wrap_terminal_line_preserves_multiple_rows() {
+        assert_eq!(
+            wrap_terminal_line("abcdefgh", 3),
+            vec!["abc".to_string(), "def".to_string(), "gh".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_terminal_text_lines_splits_embedded_newlines_before_wrapping() {
+        assert_eq!(
+            wrap_terminal_text_lines("abc\ndefghi", 3),
+            vec!["abc".to_string(), "def".to_string(), "ghi".to_string(),]
+        );
+    }
+
+    #[test]
+    fn renderable_output_window_keeps_recent_tail_for_large_blocks() {
+        let lines = (0..6).map(|i| format!("line-{i}")).collect::<Vec<_>>();
+        let (start, visible) = renderable_output_window(&lines, 3);
+
+        assert_eq!(start, 3);
+        assert_eq!(
+            visible,
+            &[
+                "line-3".to_string(),
+                "line-4".to_string(),
+                "line-5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_output_batch_to_block_appends_first_fragment_and_batches_remaining_lines() {
+        let mut block = Block {
+            command: "ls".into(),
+            output_lines: vec!["Dire".into()],
+            has_error: false,
+            context: None,
+            agent_placeholder_active: false,
+            pending_permission: None,
+            agent_stream_text: String::new(),
+            agent_stream_line_index: None,
+            agent_response: None,
+            agent_response_line_count: 0,
+        };
+
+        let added = append_output_batch_to_block(
+            &mut block,
+            &[
+                "ctory: C:\\repo".to_string(),
+                "assets".to_string(),
+                "docs".to_string(),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            block.output_lines,
+            vec![
+                "Directory: C:\\repo".to_string(),
+                "assets".to_string(),
+                "docs".to_string(),
+            ]
+        );
+        assert_eq!(added, 2);
+    }
+
+    #[test]
+    fn parse_markdown_blocks_separates_headings_lists_and_code_blocks() {
+        let blocks = parse_markdown_blocks("# Title\n\n- item\n\n```sh\nls\n```\n");
+
+        assert_eq!(
+            blocks,
+            vec![
+                MarkdownBlock::Heading {
+                    level: 1,
+                    text: "Title".to_string(),
+                },
+                MarkdownBlock::ListItem {
+                    ordered: false,
+                    index: None,
+                    text: "item".to_string(),
+                },
+                MarkdownBlock::CodeBlock {
+                    language: Some("sh".to_string()),
+                    lines: vec!["ls".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_markdown_inline_detects_strong_emphasis_code_and_links() {
+        let segments = parse_markdown_inline(
+            "Hello **world** and *friends* with `ls` and [docs](https://example.com)",
+        );
+
+        assert_eq!(
+            segments,
+            vec![
+                MarkdownInlineSegment::Text("Hello ".to_string()),
+                MarkdownInlineSegment::Strong("world".to_string()),
+                MarkdownInlineSegment::Text(" and ".to_string()),
+                MarkdownInlineSegment::Emphasis("friends".to_string()),
+                MarkdownInlineSegment::Text(" with ".to_string()),
+                MarkdownInlineSegment::Code("ls".to_string()),
+                MarkdownInlineSegment::Text(" and ".to_string()),
+                MarkdownInlineSegment::Link {
+                    label: "docs".to_string(),
+                    url: "https://example.com".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_compact_list_items_detects_inline_code_enumerations() {
+        let items =
+            extract_compact_list_items("`a`, `b`, `c`, `d`").expect("expected compact list items");
+
+        assert_eq!(
+            items,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_placeholder_status_can_be_updated_in_place() {
+        let mut block = Block {
+            command: "Codex> oi".into(),
+            output_lines: vec![AGENT_CONNECTING_PLACEHOLDER.into()],
+            has_error: false,
+            context: None,
+            agent_placeholder_active: true,
+            pending_permission: None,
+            agent_stream_text: String::new(),
+            agent_stream_line_index: None,
+            agent_response: None,
+            agent_response_line_count: 0,
+        };
+
+        assert!(update_agent_placeholder_block(
+            &mut block,
+            AGENT_SENDING_PROMPT_PLACEHOLDER
+        ));
+
+        assert_eq!(
+            block.output_lines,
+            vec![AGENT_SENDING_PROMPT_PLACEHOLDER.to_string()]
+        );
+    }
+}

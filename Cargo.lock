@@ -3792,6 +3792,7 @@ dependencies = [
  "git2",
  "gpui",
  "lucide-icons",
+ "once_cell",
  "portable-pty",
  "semver",
  "serde",

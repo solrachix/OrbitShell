@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use orbitshell::acp::client::session_new_params;
+use orbitshell::acp::client::{extract_model_options_from_session_new, session_new_params};
 use orbitshell::acp::manager::AgentSpec;
 use orbitshell::acp::resolve::{
     AgentCandidate, AgentKey, AgentSourceKind, ConflictPolicy, resolve_agent,
@@ -8,6 +8,7 @@ use orbitshell::acp::resolve::{
 };
 use orbitshell::mcp::config::{GlobalMcpConfig, McpServerConfig};
 use orbitshell::mcp::probe::resolve_runtime_mcp_servers;
+use serde_json::json;
 
 fn agent_spec(id: &str, name: &str, command: &str) -> AgentSpec {
     AgentSpec {
@@ -56,7 +57,7 @@ fn session_new_uses_enabled_global_mcp_servers() {
     };
 
     let runtime = resolve_runtime_mcp_servers(&config);
-    let params = session_new_params("C:/repo", &runtime);
+    let params = session_new_params("C:/repo", &runtime, None);
     let servers = params
         .get("mcpServers")
         .and_then(|value| value.as_array())
@@ -67,6 +68,83 @@ fn session_new_uses_enabled_global_mcp_servers() {
         servers[0].get("id").and_then(|value| value.as_str()),
         Some("fs")
     );
+}
+
+#[test]
+fn session_new_includes_selected_model_override() {
+    let runtime = resolve_runtime_mcp_servers(&GlobalMcpConfig { servers: vec![] });
+    let params = session_new_params("C:/repo", &runtime, Some("gpt-5.4"));
+    assert_eq!(
+        params.get("model").and_then(|value| value.as_str()),
+        Some("gpt-5.4")
+    );
+}
+
+#[test]
+fn session_new_omits_model_when_not_selected() {
+    let runtime = resolve_runtime_mcp_servers(&GlobalMcpConfig { servers: vec![] });
+    let params = session_new_params("C:/repo", &runtime, None);
+    assert_eq!(params.get("model"), None);
+}
+
+#[test]
+fn session_new_config_options_extract_model_selector() {
+    let result = json!({
+        "sessionId": "sess_123",
+        "configOptions": [
+            {
+                "id": "mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "ask",
+                "options": [
+                    { "value": "ask", "name": "Ask" }
+                ]
+            },
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-5.4",
+                "options": [
+                    { "value": "gpt-5.3", "name": "GPT-5.3", "description": "Stable" },
+                    { "value": "gpt-5.4", "name": "GPT-5.4", "description": "Best" }
+                ]
+            }
+        ]
+    });
+
+    let models = extract_model_options_from_session_new(&result);
+
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id, "gpt-5.3");
+    assert_eq!(models[0].label, "GPT-5.3");
+    assert!(!models[0].is_default);
+    assert_eq!(models[1].id, "gpt-5.4");
+    assert!(models[1].is_default);
+}
+
+#[test]
+fn session_new_config_options_ignore_non_model_selectors() {
+    let result = json!({
+        "sessionId": "sess_123",
+        "configOptions": [
+            {
+                "id": "mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "ask",
+                "options": [
+                    { "value": "ask", "name": "Ask" }
+                ]
+            }
+        ]
+    });
+
+    let models = extract_model_options_from_session_new(&result);
+
+    assert!(models.is_empty());
 }
 
 #[test]

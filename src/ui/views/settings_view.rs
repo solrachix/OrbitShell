@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use gpui::prelude::*;
+
 use gpui::*;
 use lucide_icons::Icon;
 use std::fs;
@@ -33,7 +33,7 @@ use crate::acp::resolve::{
 use crate::acp::storage;
 use crate::mcp::config::{GlobalMcpConfig, McpServerConfig};
 use crate::mcp::probe::{McpProbeResult, probe_server_config};
-use crate::ui::icons::lucide_icon;
+use crate::ui::icons::{lucide_icon, registry_avatar};
 use crate::ui::text_edit::TextEditState;
 
 const ACCENT: u32 = 0x6b9eff;
@@ -47,6 +47,7 @@ pub struct CatalogAgentRowUI {
     pub name: String,
     pub description: String,
     pub version: Option<String>,
+    pub icon: Option<String>,
     pub install_status: CatalogInstallStatus,
     pub can_install: bool,
     pub can_update: bool,
@@ -573,6 +574,10 @@ impl SettingsView {
                     name: row.name,
                     description: row.description,
                     version: row.version,
+                    icon: row
+                        .registry_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.icon.clone()),
                     install_status: row.install_status,
                     can_install,
                     can_update,
@@ -954,8 +959,20 @@ impl SettingsView {
 
         let cwd = std::env::current_dir()?.to_string_lossy().to_string();
         let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
-        let session_id = client.ensure_session(&cwd, &runtime_mcp)?;
-        let _ = tx.unbounded_send(format!("[test] session/new OK (sessionId={session_id})"));
+        let bootstrap = client.ensure_session(&cwd, &runtime_mcp, None)?;
+        let _ = tx.unbounded_send(format!(
+            "[test] session/new OK (sessionId={})",
+            bootstrap.session_id
+        ));
+        if !bootstrap.model_options.is_empty() {
+            let labels = bootstrap
+                .model_options
+                .iter()
+                .map(|option| option.label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = tx.unbounded_send(format!("[test] models: {labels}"));
+        }
         Ok(())
     }
 
@@ -999,14 +1016,20 @@ impl SettingsView {
                         install_root: version_root.clone(),
                         resolved_command: resolved_command.clone(),
                         resolved_args: Vec::new(),
+                        launcher_command: Some(launch.command.clone()),
+                        launcher_args: launch.args.clone(),
                     });
                     state.set_active_version(&manifest.version);
                     state.distribution_kind = Some("npx".into());
                     state.install_root = Some(version_root);
                     state.resolved_command = Some(resolved_command);
                     state.resolved_args.clear();
-                    let _ = tx
-                        .unbounded_send(format!("[install] prepared npx wrapper {}", dist.package));
+                    state.launcher_command = Some(launch.command.clone());
+                    state.launcher_args = launch.args.clone();
+                    let _ = tx.unbounded_send(format!(
+                        "[install] prepared npx wrapper {} via {}",
+                        dist.package, launch.command
+                    ));
                 }
                 RegistryInstallStrategy::Uvx(dist) => {
                     let launch = build_uvx_package_launch(&dist.package, &dist.args);
@@ -1018,14 +1041,20 @@ impl SettingsView {
                         install_root: version_root.clone(),
                         resolved_command: resolved_command.clone(),
                         resolved_args: Vec::new(),
+                        launcher_command: Some(launch.command.clone()),
+                        launcher_args: launch.args.clone(),
                     });
                     state.set_active_version(&manifest.version);
                     state.distribution_kind = Some("uvx".into());
                     state.install_root = Some(version_root);
                     state.resolved_command = Some(resolved_command);
                     state.resolved_args.clear();
-                    let _ = tx
-                        .unbounded_send(format!("[install] prepared uvx wrapper {}", dist.package));
+                    state.launcher_command = Some(launch.command.clone());
+                    state.launcher_args = launch.args.clone();
+                    let _ = tx.unbounded_send(format!(
+                        "[install] prepared uvx wrapper {} via {}",
+                        dist.package, launch.command
+                    ));
                 }
                 RegistryInstallStrategy::Binary { target, .. } => {
                     let sha256 = target.sha256.clone().ok_or_else(|| {
@@ -1365,19 +1394,21 @@ impl SettingsView {
             .border_color(if active { rgb(0x2e75ad) } else { rgb(0x2a2a2a) })
             .text_size(px(12.0))
             .text_color(if active { rgb(0xffffff) } else { rgb(0xd0d0d0) })
+            .cursor(CursorStyle::PointingHand)
             .child(label)
     }
 
     fn render_action_button(&self, label: &'static str) -> Div {
         div()
-            .px(px(10.0))
+            .px(px(11.0))
             .py(px(6.0))
             .rounded(px(6.0))
-            .bg(rgb(0x101010))
+            .bg(rgb(0x121212))
             .border_1()
-            .border_color(rgb(0x2a2a2a))
+            .border_color(rgb(0x303030))
             .text_size(px(12.0))
-            .text_color(rgb(0xd0d0d0))
+            .text_color(rgb(0xe1e1e1))
+            .cursor(CursorStyle::PointingHand)
             .child(label)
     }
 
@@ -1753,6 +1784,10 @@ impl SettingsView {
                     .into_iter()
                     .rev()
                     .collect();
+                let wrapped_recent_logs: Vec<String> = recent_logs
+                    .iter()
+                    .flat_map(|line| wrap_log_line(line, 72))
+                    .collect();
                 content = content
                     .child(
                         div()
@@ -1984,12 +2019,12 @@ impl SettingsView {
                                 },
                             ))
                             .child(div().mt(px(8.0)).flex().flex_col().gap(px(4.0)).children(
-                                recent_logs.into_iter().map(|line| {
+                                wrapped_recent_logs.into_iter().map(|line| {
                                     div()
+                                        .min_w(px(0.0))
                                         .text_size(px(11.0))
                                         .text_color(rgb(0xbdbdbd))
                                         .font_family("Cascadia Code")
-                                        .truncate()
                                         .child(line)
                                 }),
                             ))
@@ -2011,6 +2046,10 @@ impl SettingsView {
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
+                    .collect();
+                let wrapped_recent_logs: Vec<String> = recent_logs
+                    .iter()
+                    .flat_map(|line| wrap_log_line(line, 72))
                     .collect();
 
                 content = content
@@ -2164,42 +2203,72 @@ impl SettingsView {
 
                                     div()
                                         .flex()
-                                        .items_center()
+                                        .items_start()
                                         .justify_between()
-                                        .px(px(10.0))
-                                        .py(px(8.0))
-                                        .rounded(px(8.0))
-                                        .bg(rgb(0x101010))
+                                        .gap(px(14.0))
+                                        .px(px(12.0))
+                                        .py(px(10.0))
+                                        .rounded(px(10.0))
+                                        .bg(rgb(0x111111))
                                         .border_1()
-                                        .border_color(rgb(0x1f1f1f))
+                                        .border_color(rgb(0x242424))
                                         .child(
                                             div()
                                                 .flex()
                                                 .flex_col()
-                                                .gap(px(2.0))
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .gap(px(5.0))
                                                 .child(
                                                     div()
                                                         .flex()
                                                         .items_center()
-                                                        .gap(px(6.0))
+                                                        .gap(px(8.0))
+                                                        .child(registry_avatar(
+                                                            &row.name,
+                                                            row.icon.is_some(),
+                                                        ))
                                                         .child(
                                                             div()
                                                                 .flex_1()
                                                                 .min_w(px(0.0))
-                                                                .text_size(px(12.0))
-                                                                .text_color(rgb(0xd0d0d0))
-                                                                .truncate()
-                                                                .child(format!("{} ({})", row.name, row.acp_id)),
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap(px(3.0))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(13.0))
+                                                                        .text_color(rgb(0xe6e6e6))
+                                                                        .truncate()
+                                                                        .child(row.name.clone()),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(11.0))
+                                                                        .text_color(rgb(0x8b8b8b))
+                                                                        .font_family("Cascadia Code")
+                                                                        .truncate()
+                                                                        .child(row.acp_id.clone()),
+                                                                ),
                                                         )
-                                                        .child(self.render_source_badge(row.source_type))
-                                                        .child(self.render_status_badge(row.install_status)),
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(6.0))
+                                                                .child(self.render_source_badge(
+                                                                    row.source_type,
+                                                                ))
+                                                                .child(self.render_status_badge(
+                                                                    row.install_status,
+                                                                )),
+                                                        ),
                                                 )
                                                 .child(
                                                     div()
-                                                        .flex_1()
                                                         .min_w(px(0.0))
                                                         .text_size(px(11.0))
-                                                        .text_color(rgb(0x8a8a8a))
+                                                        .text_color(rgb(0xa0a0a0))
                                                         .truncate()
                                                         .child(if row.description.is_empty() {
                                                             "No description available".to_string()
@@ -2209,13 +2278,12 @@ impl SettingsView {
                                                 )
                                                 .child(
                                                     div()
-                                                        .flex_1()
                                                         .min_w(px(0.0))
                                                         .text_size(px(11.0))
-                                                        .text_color(rgb(0x6f6f6f))
+                                                        .text_color(rgb(0x727272))
                                                         .font_family("Cascadia Code")
                                                         .truncate()
-                                                .child(row.display_command.clone().unwrap_or_else(|| {
+                                                        .child(row.display_command.clone().unwrap_or_else(|| {
                                                             row.version
                                                                 .as_ref()
                                                                 .map(|version| format!("registry v{version}"))
@@ -2224,10 +2292,9 @@ impl SettingsView {
                                                 )
                                                 .child(if let Some(other_sources) = other_sources {
                                                     div()
-                                                        .flex_1()
                                                         .min_w(px(0.0))
                                                         .text_size(px(11.0))
-                                                        .text_color(rgb(0x9b89ff))
+                                                        .text_color(rgb(0xb698ff))
                                                         .truncate()
                                                         .child(format!("Other sources: {other_sources}"))
                                                 } else {
@@ -2238,7 +2305,9 @@ impl SettingsView {
                                             div()
                                                 .flex()
                                                 .items_center()
+                                                .flex_shrink_0()
                                                 .gap(px(8.0))
+                                                .pt(px(2.0))
                                                 .child(if can_install {
                                                     self.render_action_button("Install")
                                                         .on_mouse_down(
@@ -2367,7 +2436,7 @@ impl SettingsView {
                                     .gap(px(4.0))
                                     .min_w(px(0.0))
                                     .overflow_hidden()
-                                    .children(recent_logs.into_iter().map(|line| {
+                                    .children(wrapped_recent_logs.into_iter().map(|line| {
                                         div()
                                             .min_w(px(0.0))
                                             .text_size(px(11.0))
@@ -2486,6 +2555,36 @@ fn sanitize_action_log_line(line: &str) -> Option<String> {
     }
 }
 
+fn wrap_log_line(line: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || line.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_len = 0usize;
+
+    for ch in line.chars() {
+        chunk.push(ch);
+        chunk_len += 1;
+
+        if chunk_len >= max_chars {
+            wrapped.push(std::mem::take(&mut chunk));
+            chunk_len = 0;
+        }
+    }
+
+    if !chunk.is_empty() {
+        wrapped.push(chunk);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -2519,6 +2618,18 @@ fn strip_ansi(input: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_log_line;
+
+    #[test]
+    fn wrap_log_line_breaks_long_text_in_fixed_chunks() {
+        let line = "abcdefghijklmnopqrstuvwxyz";
+        let wrapped = wrap_log_line(line, 10);
+        assert_eq!(wrapped, vec!["abcdefghij", "klmnopqrst", "uvwxyz"]);
+    }
 }
 
 impl Render for SettingsView {
