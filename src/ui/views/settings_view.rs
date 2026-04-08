@@ -5,6 +5,7 @@ use futures::channel::mpsc;
 use gpui::*;
 use lucide_icons::Icon;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 
@@ -33,6 +34,9 @@ use crate::acp::resolve::{
 use crate::acp::storage;
 use crate::mcp::config::{GlobalMcpConfig, McpServerConfig};
 use crate::mcp::probe::{McpProbeResult, probe_server_config};
+use crate::ui::appearance::{
+    AppearanceSettings, IconThemeOption, icon_theme_options, resolve_themed_icon,
+};
 use crate::ui::icons::{lucide_icon, registry_avatar};
 use crate::ui::text_edit::TextEditState;
 
@@ -59,6 +63,26 @@ pub struct CatalogAgentRowUI {
     pub display_command: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeCatalogFilter {
+    All,
+    Installed,
+    NotInstalled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppearanceTab {
+    Themes,
+    IconThemes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveSettingsInput {
+    Menu,
+    Acp,
+    Appearance,
+}
+
 pub struct SettingsView {
     sections: Vec<&'static str>,
     active_section: usize,
@@ -79,10 +103,21 @@ pub struct SettingsView {
     mcp_error: Option<String>,
     mcp_action_lines: Vec<String>,
     mcp_action_busy: bool,
+    content_scroll: ScrollHandle,
+    appearance_scroll: ScrollHandle,
     acp_scroll: ScrollHandle,
     mcp_scroll: ScrollHandle,
     all_catalog_rows: Vec<CatalogAgentRow>,
     visible_catalog_rows: Vec<CatalogAgentRowUI>,
+    appearance_settings: AppearanceSettings,
+    appearance_status: Option<String>,
+    theme_catalog_filter: ThemeCatalogFilter,
+    appearance_tab: AppearanceTab,
+    appearance_search_query: String,
+    appearance_search_cursor: usize,
+    appearance_search_selection: Option<(usize, usize)>,
+    appearance_search_anchor: Option<usize>,
+    appearance_search_focus: FocusHandle,
     acp_search_query: String,
     acp_search_cursor: usize,
     acp_search_selection: Option<(usize, usize)>,
@@ -100,6 +135,7 @@ impl SettingsView {
             Ok(config) => (config, None),
             Err(err) => (GlobalMcpConfig::default(), Some(err.to_string())),
         };
+        let appearance_settings = AppearanceSettings::load();
 
         let mut view = Self {
             sections: vec![
@@ -131,10 +167,21 @@ impl SettingsView {
             mcp_error,
             mcp_action_lines: Vec::new(),
             mcp_action_busy: false,
+            content_scroll: ScrollHandle::new(),
+            appearance_scroll: ScrollHandle::new(),
             acp_scroll: ScrollHandle::new(),
             mcp_scroll: ScrollHandle::new(),
             all_catalog_rows: Vec::new(),
             visible_catalog_rows: Vec::new(),
+            appearance_settings,
+            appearance_status: None,
+            theme_catalog_filter: ThemeCatalogFilter::All,
+            appearance_tab: AppearanceTab::IconThemes,
+            appearance_search_query: String::new(),
+            appearance_search_cursor: 0,
+            appearance_search_selection: None,
+            appearance_search_anchor: None,
+            appearance_search_focus: cx.focus_handle(),
             acp_search_query: String::new(),
             acp_search_cursor: 0,
             acp_search_selection: None,
@@ -154,36 +201,49 @@ impl SettingsView {
         }
     }
 
+    fn active_input_target(&self, window: &Window) -> Option<ActiveSettingsInput> {
+        if self.acp_search_focus.is_focused(window) {
+            Some(ActiveSettingsInput::Acp)
+        } else if self.appearance_search_focus.is_focused(window) {
+            Some(ActiveSettingsInput::Appearance)
+        } else if self.focus_handle.is_focused(window) {
+            Some(ActiveSettingsInput::Menu)
+        } else {
+            None
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ctrl = event.keystroke.modifiers.control;
         let shift = event.keystroke.modifiers.shift;
-
-        let acp_focused = self.acp_search_focus.is_focused(window);
-        let menu_focused = self.focus_handle.is_focused(window);
-
-        if !acp_focused && !menu_focused {
+        let Some(target) = self.active_input_target(window) else {
             return;
-        }
+        };
 
         if ctrl && event.keystroke.key.eq_ignore_ascii_case("a") {
-            let (query, cursor, selection, anchor) = if acp_focused {
-                (
+            let (query, cursor, selection, anchor) = match target {
+                ActiveSettingsInput::Acp => (
                     &mut self.acp_search_query,
                     &mut self.acp_search_cursor,
                     &mut self.acp_search_selection,
                     &mut self.acp_search_anchor,
-                )
-            } else {
-                (
+                ),
+                ActiveSettingsInput::Appearance => (
+                    &mut self.appearance_search_query,
+                    &mut self.appearance_search_cursor,
+                    &mut self.appearance_search_selection,
+                    &mut self.appearance_search_anchor,
+                ),
+                ActiveSettingsInput::Menu => (
                     &mut self.search_query,
                     &mut self.search_cursor,
                     &mut self.search_selection,
                     &mut self.search_anchor,
-                )
+                ),
             };
             TextEditState::select_all(query, cursor, selection, anchor);
             cx.notify();
-            if acp_focused {
+            if matches!(target, ActiveSettingsInput::Acp) {
                 self.update_visible_rows();
             }
             cx.stop_propagation();
@@ -192,26 +252,30 @@ impl SettingsView {
 
         match event.keystroke.key.as_str() {
             "backspace" => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (query, cursor, selection, anchor) = if acp_focused {
-                    (
+                let (query, cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &mut self.acp_search_query,
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &mut self.appearance_search_query,
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &mut self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
 
                 if TextEditState::delete_selection_if_any(query, cursor, selection, anchor) {
                     cx.notify();
-                    if acp_focused {
+                    if matches!(target, ActiveSettingsInput::Acp) {
                         self.update_visible_rows();
                     }
                     cx.stop_propagation();
@@ -220,26 +284,29 @@ impl SettingsView {
                 if *cursor > 0 {
                     TextEditState::pop_char_before_cursor(query, cursor, selection, anchor);
                     cx.notify();
-                    if acp_focused {
+                    if matches!(target, ActiveSettingsInput::Acp) {
                         self.update_visible_rows();
                     }
                 }
                 cx.stop_propagation();
             }
             "left" | "arrowleft" => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (cursor, selection, anchor) = if acp_focused {
-                    (
+                let (cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
 
                 if shift {
@@ -260,21 +327,25 @@ impl SettingsView {
                 cx.stop_propagation();
             }
             "right" | "arrowright" => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (query, cursor, selection, anchor) = if acp_focused {
-                    (
+                let (query, cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &self.acp_search_query,
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &self.appearance_search_query,
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
 
                 let max = query.chars().count();
@@ -294,19 +365,22 @@ impl SettingsView {
                 cx.stop_propagation();
             }
             "home" => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (cursor, selection, anchor) = if acp_focused {
-                    (
+                let (cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
                 *cursor = 0;
                 TextEditState::clear_selection(selection, anchor);
@@ -314,21 +388,25 @@ impl SettingsView {
                 cx.stop_propagation();
             }
             "end" => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (query, cursor, selection, anchor) = if acp_focused {
-                    (
+                let (query, cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &self.acp_search_query,
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &self.appearance_search_query,
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
                 *cursor = query.chars().count();
                 TextEditState::clear_selection(selection, anchor);
@@ -336,28 +414,32 @@ impl SettingsView {
                 cx.stop_propagation();
             }
             _ => {
-                let acp_focused = self.acp_search_focus.is_focused(window);
-                let (query, cursor, selection, anchor) = if acp_focused {
-                    (
+                let (query, cursor, selection, anchor) = match target {
+                    ActiveSettingsInput::Acp => (
                         &mut self.acp_search_query,
                         &mut self.acp_search_cursor,
                         &mut self.acp_search_selection,
                         &mut self.acp_search_anchor,
-                    )
-                } else {
-                    (
+                    ),
+                    ActiveSettingsInput::Appearance => (
+                        &mut self.appearance_search_query,
+                        &mut self.appearance_search_cursor,
+                        &mut self.appearance_search_selection,
+                        &mut self.appearance_search_anchor,
+                    ),
+                    ActiveSettingsInput::Menu => (
                         &mut self.search_query,
                         &mut self.search_cursor,
                         &mut self.search_selection,
                         &mut self.search_anchor,
-                    )
+                    ),
                 };
 
                 if let Some(text) = event.keystroke.key_char.as_deref() {
                     if !text.is_empty() && !ctrl {
                         TextEditState::insert_text(query, cursor, selection, anchor, text);
                         cx.notify();
-                        if acp_focused {
+                        if matches!(target, ActiveSettingsInput::Acp) {
                             self.update_visible_rows();
                         }
                         cx.stop_propagation();
@@ -366,7 +448,7 @@ impl SettingsView {
                     let key = event.keystroke.key.clone();
                     TextEditState::insert_text(query, cursor, selection, anchor, &key);
                     cx.notify();
-                    if acp_focused {
+                    if matches!(target, ActiveSettingsInput::Acp) {
                         self.update_visible_rows();
                     }
                     cx.stop_propagation();
@@ -482,6 +564,187 @@ impl SettingsView {
             .text_size(px(11.0))
             .text_color(if active { rgb(0xf0b44c) } else { rgb(0x9a9a9a) })
             .child(label.to_string())
+    }
+
+    fn select_icon_theme(&mut self, theme_id: &str, cx: &mut Context<Self>) {
+        if self.appearance_settings.icon_theme == theme_id {
+            self.appearance_status = Some("This icon theme is already active.".to_string());
+            return;
+        }
+
+        self.appearance_settings.icon_theme = theme_id.to_string();
+        if let Err(err) = self.appearance_settings.save() {
+            eprintln!("failed to save appearance settings: {err}");
+            self.appearance_status = Some(format!("Failed to save icon theme: {err}"));
+        } else if let Some(theme) = icon_theme_options()
+            .iter()
+            .find(|theme| theme.id == theme_id)
+        {
+            self.appearance_status = Some(format!("Icon theme applied: {}", theme.name));
+        }
+        cx.notify();
+    }
+
+    fn render_icon_theme_preview(&self, theme: IconThemeOption) -> Div {
+        let sample_border = rgb(0x2a2a2a);
+        let (folder_icon, folder_color) =
+            resolve_themed_icon(theme.id, Path::new("src"), true, true);
+        let (file_icon, file_color) =
+            resolve_themed_icon(theme.id, Path::new("Cargo.toml"), false, false);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .rounded(px(999.0))
+                    .bg(rgb(theme.accent)),
+            )
+            .child(
+                div()
+                    .w(px(24.0))
+                    .h(px(18.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(0x151515))
+                    .border_1()
+                    .border_color(sample_border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(lucide_icon(folder_icon, 12.0, folder_color)),
+            )
+            .child(
+                div()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(0x151515))
+                    .border_1()
+                    .border_color(sample_border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(lucide_icon(file_icon, 11.0, file_color)),
+            )
+    }
+
+    fn render_icon_theme_card(&self, theme: IconThemeOption, cx: &Context<Self>) -> Div {
+        let is_selected = self.appearance_settings.icon_theme == theme.id;
+        let handle = cx.entity().downgrade();
+        let button_handle = cx.entity().downgrade();
+        let theme_id = theme.id.to_string();
+        let button_theme_id = theme_id.clone();
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.0))
+            .p(px(14.0))
+            .rounded(px(10.0))
+            .bg(if is_selected {
+                rgb(0x102132)
+            } else {
+                rgb(0x101010)
+            })
+            .border_1()
+            .border_color(if is_selected {
+                rgba(ACCENT_BORDER)
+            } else {
+                rgb(0x1f1f1f)
+            })
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = handle.update(cx, |view, cx| {
+                    view.select_icon_theme(&theme_id, cx);
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .flex_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(if is_selected {
+                                        rgb(0xffffff)
+                                    } else {
+                                        rgb(0xe2e2e2)
+                                    })
+                                    .child(theme.name),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(0x18311a))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(0x7fd08c))
+                                    .child("Icon theme"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x9a9a9a))
+                            .child(theme.description),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x777777))
+                            .child(format!("by {}", theme.author)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(self.render_icon_theme_preview(theme))
+                    .child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(if is_selected {
+                                rgb(0x1e7ce5)
+                            } else {
+                                rgb(0x161616)
+                            })
+                            .border_1()
+                            .border_color(if is_selected {
+                                rgb(0x54a3ff)
+                            } else {
+                                rgb(0x2a2a2a)
+                            })
+                            .text_size(px(12.0))
+                            .text_color(if is_selected {
+                                rgb(0xffffff)
+                            } else {
+                                rgb(0xcfcfcf)
+                            })
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                cx.stop_propagation();
+                                let _ = button_handle.update(cx, |view, cx| {
+                                    view.select_icon_theme(&button_theme_id, cx);
+                                });
+                            })
+                            .child(if is_selected { "Selected" } else { "Use theme" }),
+                    ),
+            )
     }
 
     fn load_registry_data_from_disk() -> Result<CachedRegistryData> {
@@ -1412,6 +1675,83 @@ impl SettingsView {
             .child(label)
     }
 
+    fn filtered_icon_themes(&self) -> Vec<IconThemeOption> {
+        let needle = self.appearance_search_query.trim().to_ascii_lowercase();
+        let mut themes: Vec<IconThemeOption> = icon_theme_options()
+            .iter()
+            .copied()
+            .filter(|theme| match self.theme_catalog_filter {
+                ThemeCatalogFilter::All => true,
+                ThemeCatalogFilter::Installed => theme.id == self.appearance_settings.icon_theme,
+                ThemeCatalogFilter::NotInstalled => theme.id != self.appearance_settings.icon_theme,
+            })
+            .filter(|theme| {
+                needle.is_empty()
+                    || theme.name.to_ascii_lowercase().contains(&needle)
+                    || theme.description.to_ascii_lowercase().contains(&needle)
+                    || theme.author.to_ascii_lowercase().contains(&needle)
+            })
+            .collect();
+        themes.sort_by_key(|theme| theme.id != self.appearance_settings.icon_theme);
+        themes
+    }
+
+    fn render_theme_filter_button(
+        &self,
+        label: &'static str,
+        active: bool,
+        filter: ThemeCatalogFilter,
+        cx: &Context<Self>,
+    ) -> Div {
+        let handle = cx.entity().downgrade();
+        div()
+            .px(px(12.0))
+            .py(px(7.0))
+            .rounded(px(7.0))
+            .bg(if active { rgb(0x1e7ce5) } else { rgb(0x0f1115) })
+            .border_1()
+            .border_color(if active { rgb(0x54a3ff) } else { rgb(0x27303b) })
+            .text_size(px(12.0))
+            .text_color(if active { rgb(0xffffff) } else { rgb(0xcfd6df) })
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = handle.update(cx, |view, cx| {
+                    view.theme_catalog_filter = filter;
+                    cx.notify();
+                });
+            })
+            .child(label)
+    }
+
+    fn render_appearance_tab_button(
+        &self,
+        label: &'static str,
+        tab: AppearanceTab,
+        cx: &Context<Self>,
+    ) -> Div {
+        let active = self.appearance_tab == tab;
+        let handle = cx.entity().downgrade();
+        div()
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .bg(if active { rgb(0x18311a) } else { rgb(0x0b0f14) })
+            .border_1()
+            .border_color(if active { rgb(0x2f8f47) } else { rgb(0x20252d) })
+            .text_size(px(12.0))
+            .text_color(if active { rgb(0x9ff0b0) } else { rgb(0xd0d7de) })
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+                let _ = handle.update(cx, |view, cx| {
+                    view.appearance_tab = tab;
+                    cx.notify();
+                });
+            })
+            .child(label)
+    }
+
     fn resolve_command_candidates(command: &str) -> Vec<String> {
         if !cfg!(windows) {
             return vec![command.to_string()];
@@ -1619,73 +1959,237 @@ impl SettingsView {
                     );
             }
             "Appearance" => {
+                let filtered_themes = self.filtered_icon_themes();
+                let appearance_body = match self.appearance_tab {
+                    AppearanceTab::Themes => div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x8a8a8a))
+                                .child("Application themes"),
+                        )
+                        .child(
+                            div()
+                                .rounded(px(10.0))
+                                .bg(rgb(0x0f1115))
+                                .border_1()
+                                .border_color(rgb(0x20252d))
+                                .p(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.0))
+                                                .text_color(rgb(0xe6e6e6))
+                                                .child("Dark"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(0x7f7f7f))
+                                                .child("OrbitShell currently ships with a single application theme."),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .rounded(px(6.0))
+                                        .bg(rgb(0x1e7ce5))
+                                        .border_1()
+                                        .border_color(rgb(0x54a3ff))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0xffffff))
+                                        .child("Selected"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7f8b99))
+                                .child("`Sync with OS` was removed because it had no implementation behind it. Additional app themes can be added later once the color system is configurable."),
+                        ),
+                    AppearanceTab::IconThemes => div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .gap(px(12.0))
+                        .child(if let Some(status) = &self.appearance_status {
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x8bd06f))
+                                .child(status.clone())
+                        } else {
+                            div()
+                        })
+                        .child(
+                            div()
+                                .rounded(px(10.0))
+                                .bg(rgb(0x0f1115))
+                                .border_1()
+                                .border_color(rgb(0x1f1f1f))
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(12.0))
+                                        .p(px(12.0))
+                                        .border_b_1()
+                                        .border_color(rgb(0x20252d))
+                                        .child(
+                                            div()
+                                                .text_size(px(20.0))
+                                                .text_color(rgb(0xf1f5f9))
+                                                .child("Icon Themes"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(12.0))
+                                                .py(px(7.0))
+                                                .rounded(px(7.0))
+                                                .bg(rgb(0x1f8f42))
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(0xffffff))
+                                                .child("Builtin themes"),
+                                        ),
+                                )
+                                .child(
+                                    {
+                                        let appearance_focus_handle =
+                                            self.appearance_search_focus.clone();
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.0))
+                                            .p(px(12.0))
+                                            .border_b_1()
+                                            .border_color(rgb(0x20252d))
+                                            .child(
+                                                div()
+                                                    .id("appearance_search_input")
+                                                    .track_focus(&appearance_focus_handle)
+                                                    .flex_1()
+                                                    .rounded(px(8.0))
+                                                    .bg(rgb(0x0f141b))
+                                                    .border_1()
+                                                    .border_color(
+                                                        if self
+                                                            .appearance_search_focus
+                                                            .is_focused(window)
+                                                        {
+                                                            rgb(ACCENT)
+                                                        } else {
+                                                            rgb(0x2a2a2a)
+                                                        },
+                                                    )
+                                                    .px(px(10.0))
+                                                    .py(px(8.0))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        move |_event, window, cx| {
+                                                            cx.stop_propagation();
+                                                            window.focus(&appearance_focus_handle);
+                                                        },
+                                                    )
+                                                    .child(self.render_search_input(
+                                                        &self.appearance_search_query,
+                                                        self.appearance_search_cursor,
+                                                        self.appearance_search_selection,
+                                                        self.appearance_search_focus
+                                                            .is_focused(window),
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .child(self.render_theme_filter_button(
+                                                        "All",
+                                                        self.theme_catalog_filter
+                                                            == ThemeCatalogFilter::All,
+                                                        ThemeCatalogFilter::All,
+                                                        cx,
+                                                    ))
+                                                    .child(self.render_theme_filter_button(
+                                                        "Installed",
+                                                        self.theme_catalog_filter
+                                                            == ThemeCatalogFilter::Installed,
+                                                        ThemeCatalogFilter::Installed,
+                                                        cx,
+                                                    ))
+                                                    .child(self.render_theme_filter_button(
+                                                        "Not Installed",
+                                                        self.theme_catalog_filter
+                                                            == ThemeCatalogFilter::NotInstalled,
+                                                        ThemeCatalogFilter::NotInstalled,
+                                                        cx,
+                                                    )),
+                                            )
+                                    },
+                                )
+                                .child(
+                                    div()
+                                        .px(px(12.0))
+                                        .py(px(10.0))
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x7f8b99))
+                                        .child("Preview and select a file icon set. The file tree updates icons by folder name and file extension."),
+                                )
+                                .child(
+                                    div()
+                                        .id("appearance_theme_list")
+                                        .track_scroll(&self.appearance_scroll)
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scroll()
+                                        .scrollbar_width(px(12.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(10.0))
+                                        .p(px(12.0))
+                                        .children(filtered_themes.into_iter().map(|theme| {
+                                            self.render_icon_theme_card(theme, cx)
+                                        })),
+                                ),
+                        ),
+                };
                 content = content
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(0x9a9a9a))
-                            .child("Themes"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Create your own custom theme"),
-                    )
-                    .child(
-                        div()
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Sync with OS"),
-                            )
-                            .child(self.render_toggle(false)),
+                            .gap(px(8.0))
+                            .child(self.render_appearance_tab_button(
+                                "Themes",
+                                AppearanceTab::Themes,
+                                cx,
+                            ))
+                            .child(self.render_appearance_tab_button(
+                                "Icon Themes",
+                                AppearanceTab::IconThemes,
+                                cx,
+                            )),
                     )
-                    .child(
-                        div()
-                            .rounded(px(10.0))
-                            .bg(rgb(0x101010))
-                            .border_1()
-                            .border_color(rgb(0x1f1f1f))
-                            .p(px(12.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Current theme"),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(8.0))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0xd0d0d0))
-                                    .child("Dark"),
-                            ),
-                    )
-                    .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(0x9a9a9a))
-                            .child("Window"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Open new windows with custom size"),
-                            )
-                            .child(self.render_toggle(false)),
-                    );
+                    .child(appearance_body);
             }
             "Keyboard shortcuts" => {
                 let rows = vec![
@@ -2740,21 +3244,23 @@ impl Render for SettingsView {
                     .child(
                         // Right content
                         div()
+                            .id("settings_content")
+                            .track_scroll(&self.content_scroll)
                             .flex()
                             .flex_col()
                             .flex_1()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .p(px(28.0))
-                            .gap(px(18.0))
+                            .overflow_scroll()
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .flex_1()
+                                    .p(px(28.0))
+                                    .gap(px(18.0))
                                     .min_w(px(0.0))
                                     .min_h(px(0.0))
-                                    .gap(px(16.0))
                                     .child(self.render_section_content(window, cx)),
                             ),
                     ),

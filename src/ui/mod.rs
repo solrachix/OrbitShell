@@ -22,6 +22,7 @@ pub mod views {
     pub mod welcome_view;
 }
 
+pub mod appearance;
 pub mod icons;
 pub mod recent;
 pub mod text_edit;

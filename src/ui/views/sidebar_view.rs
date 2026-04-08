@@ -20,6 +20,7 @@ enum SearchMessage {
 }
 
 use crate::git::{GitChange, GitStatus, get_git_changes, get_git_status};
+use crate::ui::appearance::{AppearanceSettings, resolve_themed_icon};
 use crate::ui::icons::lucide_icon;
 use crate::ui::text_edit::TextEditState;
 
@@ -216,8 +217,11 @@ impl SidebarView {
     }
 
     fn render_entry(&self, entry: &FileEntry, depth: usize, cx: &Context<Self>) -> Div {
+        let theme_id = AppearanceSettings::load().icon_theme;
         let is_expanded = entry.is_dir && self.expanded_folders.contains(&entry.path);
         let indent = 8.0 + (depth as f32) * 14.0;
+        let (entry_icon, entry_color) =
+            resolve_themed_icon(&theme_id, &entry.path, entry.is_dir, is_expanded);
 
         let row = {
             let mut row = div()
@@ -242,22 +246,7 @@ impl SidebarView {
                 } else {
                     div().w(px(12.0)).h(px(12.0))
                 })
-                .child(
-                    lucide_icon(
-                        if entry.is_dir {
-                            if is_expanded {
-                                Icon::FolderOpen
-                            } else {
-                                Icon::Folder
-                            }
-                        } else {
-                            Icon::File
-                        },
-                        14.0,
-                        0x9a9a9a,
-                    )
-                    .cursor(CursorStyle::PointingHand),
-                )
+                .child(lucide_icon(entry_icon, 14.0, entry_color).cursor(CursorStyle::PointingHand))
                 .child(
                     div()
                         .text_size(px(13.0))
@@ -760,6 +749,7 @@ impl SidebarView {
     }
 
     fn render_search_results(&self, cx: &Context<Self>) -> AnyElement {
+        let theme_id = AppearanceSettings::load().icon_theme;
         if self.search_pending && self.search_results.is_empty() {
             return div()
                 .px(px(12.0))
@@ -832,6 +822,8 @@ impl SidebarView {
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| relative.to_string_lossy().to_string());
+                        let (file_icon, file_color) =
+                            resolve_themed_icon(&theme_id, path, false, false);
                         let parent_rel = relative
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
@@ -878,7 +870,7 @@ impl SidebarView {
                                         )
                                         .cursor(CursorStyle::PointingHand),
                                     )
-                                    .child(lucide_icon(Icon::File, 13.0, 0xe09b4f))
+                                    .child(lucide_icon(file_icon, 13.0, file_color))
                                     .child(
                                         div()
                                             .flex()
@@ -1101,51 +1093,56 @@ impl Render for SidebarView {
                     ),
             )
             .child(match mode {
-                SidebarMode::Explorer => div()
-                    .id("sidebar_explorer")
-                    .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex_col()
-                    .gap(px(2.0))
-                    .p(px(8.0))
-                    .track_scroll(&self.explorer_scroll)
-                    .overflow_scroll()
-                    .scrollbar_width(px(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(0x262626))
-                            .child(
-                                lucide_icon(Icon::ChevronDown, 12.0, 0xcccccc)
-                                    .cursor(CursorStyle::PointingHand),
-                            )
-                            .child(
-                                lucide_icon(Icon::FolderOpen, 14.0, 0xcccccc)
-                                    .cursor(CursorStyle::PointingHand),
-                            )
-                            .child(
-                                div().text_size(px(14.0)).text_color(rgb(0xeeeeee)).child(
-                                    self.current_path
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| {
-                                            self.current_path.to_string_lossy().to_string()
-                                        }),
+                SidebarMode::Explorer => {
+                    let theme_id = AppearanceSettings::load().icon_theme;
+                    let (root_icon, root_color) =
+                        resolve_themed_icon(&theme_id, &self.current_path, true, true);
+                    div()
+                        .id("sidebar_explorer")
+                        .flex()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p(px(8.0))
+                        .track_scroll(&self.explorer_scroll)
+                        .overflow_scroll()
+                        .scrollbar_width(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(rgb(0x262626))
+                                .child(
+                                    lucide_icon(Icon::ChevronDown, 12.0, 0xcccccc)
+                                        .cursor(CursorStyle::PointingHand),
+                                )
+                                .child(
+                                    lucide_icon(root_icon, 14.0, root_color)
+                                        .cursor(CursorStyle::PointingHand),
+                                )
+                                .child(
+                                    div().text_size(px(14.0)).text_color(rgb(0xeeeeee)).child(
+                                        self.current_path
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| {
+                                                self.current_path.to_string_lossy().to_string()
+                                            }),
+                                    ),
                                 ),
-                            ),
-                    )
-                    .children(
-                        self.entries
-                            .iter()
-                            .map(|entry| self.render_entry(entry, 1, cx)),
-                    )
-                    .into_any_element(),
+                        )
+                        .children(
+                            self.entries
+                                .iter()
+                                .map(|entry| self.render_entry(entry, 1, cx)),
+                        )
+                        .into_any_element()
+                }
                 SidebarMode::Search => div()
                     .id("sidebar_search")
                     .flex()
@@ -1221,6 +1218,7 @@ impl Render for SidebarView {
 
 impl SidebarView {
     fn render_git_section(&self, title: &str, items: &[GitChange]) -> Div {
+        let theme_id = AppearanceSettings::load().icon_theme;
         let count = items.len();
         let list = if items.is_empty() {
             div()
@@ -1238,6 +1236,8 @@ impl SidebarView {
                         .file_name()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| item.path.clone());
+                    let (file_icon, themed_file_color) =
+                        resolve_themed_icon(&theme_id, &path, false, false);
                     let parent = relative
                         .parent()
                         .map(|p| p.to_string_lossy().to_string())
@@ -1265,13 +1265,13 @@ impl SidebarView {
                                 .min_w(px(0.0))
                                 .child(
                                     lucide_icon(
-                                        Icon::File,
+                                        file_icon,
                                         12.0,
                                         match item.kind.as_str() {
                                             "A" => 0x8bd06f,
                                             "D" => 0xff7b72,
                                             "M" => 0xe3b341,
-                                            _ => 0x9a9a9a,
+                                            _ => themed_file_color,
                                         },
                                     )
                                     .cursor(CursorStyle::PointingHand),
