@@ -598,7 +598,7 @@ impl Render for TabBar {
                             let mut tab_container = div()
                                 .flex()
                                 .items_center()
-                                .gap(px(8.0))
+                                .justify_between()
                                 .px(px(10.0))
                                 .w(px(self.tab_width(i)))
                                 .h(px(TAB_H))
@@ -648,6 +648,8 @@ impl Render for TabBar {
                                         .flex()
                                         .items_center()
                                         .gap(px(2.0))
+                                        .flex_1()
+                                        .min_w(px(0.0))
                                         .text_size(px(12.0))
                                         .text_color(rgb(0xffffff))
                                         .font_family("Cascadia Code")
@@ -656,6 +658,8 @@ impl Render for TabBar {
                                         .child(edit_right)
                                 } else {
                                     div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
                                         .text_size(px(12.0))
                                         .text_color(if is_active {
                                             rgb(0xffffff)
@@ -663,10 +667,17 @@ impl Render for TabBar {
                                             rgb(0x7a7a7a)
                                         })
                                         .font_family("Cascadia Code")
+                                        .truncate()
                                         .child(tab.name.clone())
                                 })
                                 .child(
                                     div()
+                                        .flex_none()
+                                        .w(px(16.0))
+                                        .h(px(16.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .on_mouse_down(MouseButton::Left, {
                                             let index = i;
                                             let handle = cx.entity().downgrade();
