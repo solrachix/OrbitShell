@@ -30,7 +30,7 @@ OrbitShell focuses on:
 - Sidebar with **Explorer**, **Search**, and **Git** views
 - Search across files with incremental results
 - Welcome tab with recent projects
-- Settings tab (Account, Code, Appearance, Keyboard Shortcuts, Referrals, MCP servers, Privacy, About)
+- Settings tab (Appearance, Keyboard Shortcuts, ACP Registry, MCP servers, Privacy, About)
 - Windows installer via NSIS
 
 ---
@@ -124,6 +124,30 @@ bash installer/linux/install.sh
 ```
 
 This installs the binary to `~/.local/bin/orbitshell` and adds a `.desktop` entry.
+
+---
+
+## GitHub Releases
+
+Releases are published from Git tags through GitHub Actions.
+
+Create and push a version tag that matches `Cargo.toml`:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow publishes these assets to GitHub Releases:
+
+- Linux `x86_64` tarball
+- Linux `aarch64` tarball
+- Linux `.deb` for `amd64`
+- Linux `.deb` for `arm64`
+- Linux `AppImage` for `x86_64`
+- Linux `AppImage` for `aarch64`
+- Windows portable `.exe`
+- Windows NSIS installer
 
 ---
 

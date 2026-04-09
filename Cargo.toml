@@ -2,6 +2,24 @@
 name = "orbitshell"
 version = "0.1.0"
 edition = "2024"
+description = "Modern block-based terminal UI built with Rust and GPUI."
+repository = "https://github.com/solrachix/OrbitShell"
+homepage = "https://carlos-miguel.dev"
+
+[package.metadata.deb]
+maintainer = "Carlos Miguel <eu@carlos-miguel.dev>"
+copyright = "2026, Carlos Miguel"
+section = "utility"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+OrbitShell is a local-first desktop terminal experience with block-based output,
+inline file previews, ACP/MCP surfaces, and project-oriented navigation.
+"""
+merge-assets = [
+  ["packaging/linux/orbitshell.desktop", "usr/share/applications/orbitshell.desktop", "644"],
+  ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
+]
 
 [dependencies]
 gpui = "0.2.2"

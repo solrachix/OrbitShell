@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=OrbitShell
+Comment=Modern block-based terminal UI
+Exec=orbitshell
+Icon=orbitshell
+Type=Application
+Terminal=false
+Categories=Development;Utility;TerminalEmulator;
+StartupNotify=true

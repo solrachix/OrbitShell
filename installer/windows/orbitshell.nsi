@@ -3,10 +3,15 @@
 !define APP_NAME "OrbitShell"
 !define APP_EXE "orbitshell.exe"
 !define APP_PUBLISHER "OrbitShell"
+!ifndef APP_VERSION
 !define APP_VERSION "0.1.0"
+!endif
+!ifndef OUTPUT_NAME
+!define OUTPUT_NAME "OrbitShell-Setup-${APP_VERSION}.exe"
+!endif
 
 Name "${APP_NAME}"
-OutFile "OrbitShell-Setup.exe"
+OutFile "${OUTPUT_NAME}"
 Icon "..\\..\\assets\\logo.ico"
 InstallDir "$PROGRAMFILES64\\OrbitShell"
 InstallDirRegKey HKCU "Software\\OrbitShell" "InstallDir"
@@ -34,6 +39,8 @@ Section "Install"
   WriteUninstaller "$INSTDIR\\Uninstall.exe"
   WriteRegStr HKCU "Software\\OrbitShell" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "DisplayName" "${APP_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "UninstallString" "$INSTDIR\\Uninstall.exe"
 SectionEnd
 

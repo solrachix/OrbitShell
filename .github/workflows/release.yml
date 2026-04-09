@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            appimage_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            label: aarch64
+            rust_target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            appimage_arch: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "${VERSION}" || -z "${CARGO_VERSION}" ]]; then
+            echo "failed to resolve version metadata" >&2
+            exit 1
+          fi
+          if [[ "${VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "tag version ${VERSION} does not match Cargo.toml version ${CARGO_VERSION}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            fuse \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libssl-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb1-dev \
+            libxcursor-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            zsync
+
+      - name: Install cargo-deb
+        shell: bash
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/stage
+          install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "dist/stage/orbitshell"
+          install -Dm755 installer/linux/install.sh "dist/stage/install.sh"
+          tar -C dist/stage -czf "dist/orbitshell-${VERSION}-linux-${{ matrix.label }}.tar.gz" .
+
+      - name: Build deb package
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+          cargo deb \
+            --no-build \
+            --target "${{ matrix.rust_target }}" \
+            --output "dist/orbitshell_${VERSION}_${{ matrix.deb_arch }}.deb"
+
+      - name: Build AppImage
+        shell: bash
+        env:
+          ARCH: ${{ matrix.appimage_arch }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps dist
+          install -Dm755 packaging/linux/AppRun AppDir/AppRun
+          install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "AppDir/usr/bin/orbitshell"
+          install -Dm644 packaging/linux/orbitshell.desktop "AppDir/usr/share/applications/orbitshell.desktop"
+          install -Dm644 assets/logo.png "AppDir/usr/share/icons/hicolor/256x256/apps/orbitshell.png"
+          curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
+          curl -L -o linuxdeploy-plugin-appimage.AppImage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${{ matrix.appimage_arch }}.AppImage"
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy.AppImage \
+            --appdir AppDir \
+            -e "AppDir/usr/bin/orbitshell" \
+            -d "AppDir/usr/share/applications/orbitshell.desktop" \
+            -i "AppDir/usr/share/icons/hicolor/256x256/apps/orbitshell.png" \
+            --output appimage
+          mv ./*.AppImage "dist/OrbitShell-${VERSION}-${{ matrix.label }}.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.label }}
+          path: dist/*
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ -z "${VERSION}" || -z "${CARGO_VERSION}" ]]; then
+            echo "failed to resolve version metadata" >&2
+            exit 1
+          fi
+          if [[ "${VERSION}" != "${CARGO_VERSION}" ]]; then
+            echo "tag version ${VERSION} does not match Cargo.toml version ${CARGO_VERSION}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        shell: powershell
+        run: choco install nsis -y --no-progress
+
+      - name: Build release binary
+        shell: powershell
+        run: cargo build --release
+
+      - name: Package Windows artifacts
+        shell: powershell
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\orbitshell.exe "dist\orbitshell-$version-windows-x86_64.exe"
+          Push-Location installer\windows
+          makensis /DAPP_VERSION=$version /DOUTPUT_NAME=OrbitShell-Setup-$version-x86_64.exe orbitshell.nsi
+          Pop-Location
+          Copy-Item "installer\windows\OrbitShell-Setup-$version-x86_64.exe" "dist\OrbitShell-Setup-$version-x86_64.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: dist\*
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - linux
+      - windows
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "${TAG}" >/dev/null 2>&1 || gh release create "${TAG}" --title "${TAG}" --generate-notes
+          gh release upload "${TAG}" dist/* --clobber
