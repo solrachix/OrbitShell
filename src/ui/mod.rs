@@ -1,8 +1,15 @@
 use gpui::*;
 use std::path::PathBuf;
 
+const DEFAULT_SIDEBAR_WIDTH: f32 = 240.0;
+const MIN_SIDEBAR_WIDTH: f32 = 180.0;
+const MAX_SIDEBAR_WIDTH: f32 = 420.0;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.0;
+
 pub struct Workspace {
     sidebar_visible: bool,
+    sidebar_width: f32,
+    sidebar_resize_dragging: bool,
     tabs: Vec<Entity<views::tab_view::TabView>>,
     tab_ids: Vec<EntityId>,
     tab_paths: Vec<PathBuf>,
@@ -56,6 +63,8 @@ impl Workspace {
 
         let mut workspace = Self {
             sidebar_visible: true,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_resize_dragging: false,
             tabs: Vec::new(),
             tab_ids: Vec::new(),
             tab_paths: Vec::new(),
@@ -76,6 +85,51 @@ impl Workspace {
 
         workspace.add_welcome_tab(cx);
         workspace
+    }
+
+    fn clamp_sidebar_width(width: f32) -> f32 {
+        width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+    }
+
+    fn on_sidebar_resize_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_resize_dragging = true;
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_sidebar_resize_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_resize_dragging || !event.dragging() {
+            return;
+        }
+
+        let x: f32 = event.position.x.into();
+        let next_width = Self::clamp_sidebar_width(x);
+        if (self.sidebar_width - next_width).abs() > f32::EPSILON {
+            self.sidebar_width = next_width;
+            cx.notify();
+        }
+    }
+
+    fn on_sidebar_resize_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_resize_dragging {
+            self.sidebar_resize_dragging = false;
+            cx.notify();
+        }
     }
 
     fn add_welcome_tab(&mut self, cx: &mut Context<Self>) {
@@ -487,6 +541,7 @@ impl Render for Workspace {
             .copied()
             .unwrap_or(false);
         let show_sidebar = self.sidebar_visible && !is_welcome;
+        let sidebar_width = Self::clamp_sidebar_width(self.sidebar_width);
 
         let mut root = div()
             .flex()
@@ -504,14 +559,49 @@ impl Render for Workspace {
                     .flex()
                     .flex_1()
                     .min_h(px(0.0))
+                    .on_mouse_move(_cx.listener(Self::on_sidebar_resize_mouse_move))
+                    .on_mouse_up(MouseButton::Left, _cx.listener(Self::on_sidebar_resize_mouse_up))
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        _cx.listener(Self::on_sidebar_resize_mouse_up),
+                    )
                     .child(
                         // Sidebar
                         if show_sidebar {
-                            div().w(px(240.0)).child(self.sidebar.clone())
+                            div()
+                                .flex_none()
+                                .w(px(sidebar_width))
+                                .child(self.sidebar.clone())
                         } else {
                             div()
                         },
                     )
+                    .child(if show_sidebar {
+                        div()
+                            .flex_none()
+                            .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+                            .h_full()
+                            .cursor(CursorStyle::ResizeLeftRight)
+                            .bg(if self.sidebar_resize_dragging {
+                                rgb(0x2a4a73)
+                            } else {
+                                rgb(0x141414)
+                            })
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(if self.sidebar_resize_dragging {
+                                rgb(0x3f669c)
+                            } else {
+                                rgb(0x1f1f1f)
+                            })
+                            .hover(|style| style.bg(rgb(0x1a1f28)).border_color(rgb(0x2f3b4f)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                _cx.listener(Self::on_sidebar_resize_mouse_down),
+                            )
+                    } else {
+                        div()
+                    })
                     .child(
                         // Terminal view
                         div().flex_1().min_h(px(0.0)).child(
@@ -533,5 +623,17 @@ impl Render for Workspace {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Workspace;
+
+    #[test]
+    fn sidebar_width_is_clamped_to_session_limits() {
+        assert_eq!(Workspace::clamp_sidebar_width(120.0), 180.0);
+        assert_eq!(Workspace::clamp_sidebar_width(240.0), 240.0);
+        assert_eq!(Workspace::clamp_sidebar_width(520.0), 420.0);
     }
 }

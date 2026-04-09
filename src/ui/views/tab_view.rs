@@ -32,6 +32,11 @@ use crate::ui::views::agent_view::AgentView;
 use crate::ui::views::settings_view::SettingsView;
 use crate::ui::views::welcome_view::{OpenRepositoryEvent, WelcomeView};
 
+const DEFAULT_PREVIEW_TERMINAL_HEIGHT: f32 = 260.0;
+const MIN_PREVIEW_TERMINAL_HEIGHT: f32 = 180.0;
+const MAX_PREVIEW_TERMINAL_HEIGHT: f32 = 520.0;
+const PREVIEW_TERMINAL_RESIZE_HANDLE_HEIGHT: f32 = 6.0;
+
 pub struct TabView {
     blocks: Vec<Block>,
     pty: Option<TerminalPty>,
@@ -88,6 +93,10 @@ pub struct TabView {
     preview_selecting: bool,
     preview_active_line: Option<usize>,
     file_preview_mode: FilePreviewMode,
+    preview_terminal_height: f32,
+    preview_terminal_resize_dragging: bool,
+    preview_terminal_resize_start_y: Option<f32>,
+    preview_terminal_resize_start_height: f32,
 }
 
 #[derive(Clone)]
@@ -942,6 +951,10 @@ impl TabView {
             && matches!(preview.kind, FilePreviewKind::Text { .. })
     }
 
+    fn clamp_preview_terminal_height(height: f32) -> f32 {
+        height.clamp(MIN_PREVIEW_TERMINAL_HEIGHT, MAX_PREVIEW_TERMINAL_HEIGHT)
+    }
+
     #[cfg(test)]
     fn preview_scroll_uses_custom_step(delta: ScrollDelta) -> bool {
         let _ = delta;
@@ -1169,6 +1182,57 @@ impl TabView {
     ) {
         self.toggle_file_preview_mode(cx);
         cx.stop_propagation();
+    }
+
+    fn on_preview_terminal_resize_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let y: f32 = event.position.y.into();
+        self.preview_terminal_resize_dragging = true;
+        self.preview_terminal_resize_start_y = Some(y);
+        self.preview_terminal_resize_start_height = self.preview_terminal_height;
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_preview_terminal_resize_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.preview_terminal_resize_dragging || !event.dragging() {
+            return;
+        }
+
+        let Some(start_y) = self.preview_terminal_resize_start_y else {
+            return;
+        };
+
+        let current_y: f32 = event.position.y.into();
+        let delta = start_y - current_y;
+        let next_height =
+            Self::clamp_preview_terminal_height(self.preview_terminal_resize_start_height + delta);
+        if (self.preview_terminal_height - next_height).abs() > f32::EPSILON {
+            self.preview_terminal_height = next_height;
+            cx.notify();
+        }
+    }
+
+    fn on_preview_terminal_resize_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview_terminal_resize_dragging {
+            self.preview_terminal_resize_dragging = false;
+            self.preview_terminal_resize_start_y = None;
+            cx.notify();
+        }
     }
 
     fn copy_selected_preview(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1467,6 +1531,10 @@ impl TabView {
             preview_selecting: false,
             preview_active_line: None,
             file_preview_mode: FilePreviewMode::Code,
+            preview_terminal_height: DEFAULT_PREVIEW_TERMINAL_HEIGHT,
+            preview_terminal_resize_dragging: false,
+            preview_terminal_resize_start_y: None,
+            preview_terminal_resize_start_height: DEFAULT_PREVIEW_TERMINAL_HEIGHT,
         }
     }
 
@@ -1953,6 +2021,9 @@ impl TabView {
             .borrow()
             .base_handle
             .set_offset(point(px(0.0), px(0.0)));
+        self.preview_terminal_resize_dragging = false;
+        self.preview_terminal_resize_start_y = None;
+        self.preview_terminal_resize_start_height = self.preview_terminal_height;
         self.preview_active_line = Some(0);
         self.clear_preview_selection();
         self.focus_preview();
@@ -1969,6 +2040,9 @@ impl TabView {
             .borrow()
             .base_handle
             .set_offset(point(px(0.0), px(0.0)));
+        self.preview_terminal_resize_dragging = false;
+        self.preview_terminal_resize_start_y = None;
+        self.preview_terminal_resize_start_height = self.preview_terminal_height;
         self.preview_active_line = None;
         self.clear_preview_selection();
         self.blur_preview();
@@ -2411,6 +2485,8 @@ impl TabView {
 
     fn render_terminal_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         if let Some(preview) = self.file_preview.clone() {
+            let terminal_height =
+                Self::clamp_preview_terminal_height(self.preview_terminal_height);
             div()
                 .flex()
                 .flex_col()
@@ -2418,6 +2494,15 @@ impl TabView {
                 .min_h(px(0.0))
                 .min_w(px(0.0))
                 .overflow_hidden()
+                .on_mouse_move(cx.listener(Self::on_preview_terminal_resize_mouse_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::on_preview_terminal_resize_mouse_up),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(Self::on_preview_terminal_resize_mouse_up),
+                )
                 .child(
                     div()
                         .flex()
@@ -2427,11 +2512,33 @@ impl TabView {
                         .overflow_hidden()
                         .child(self.render_file_preview(&preview, cx)),
                 )
-                .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
                 .child(
                     div()
                         .flex_none()
-                        .h(px(260.0))
+                        .h(px(PREVIEW_TERMINAL_RESIZE_HANDLE_HEIGHT))
+                        .cursor(CursorStyle::ResizeUpDown)
+                        .bg(if self.preview_terminal_resize_dragging {
+                            rgb(0x2a4a73)
+                        } else {
+                            rgb(0x141414)
+                        })
+                        .border_t_1()
+                        .border_b_1()
+                        .border_color(if self.preview_terminal_resize_dragging {
+                            rgb(0x3f669c)
+                        } else {
+                            rgb(0x1f1f1f)
+                        })
+                        .hover(|style| style.bg(rgb(0x1a1f28)).border_color(rgb(0x2f3b4f)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(Self::on_preview_terminal_resize_mouse_down),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(terminal_height))
                         .min_h(px(180.0))
                         .bg(rgb(0x0a0a0a))
                         .child(self.render_terminal_panel(window, cx)),
@@ -7321,6 +7428,13 @@ mod tests {
         assert_eq!(picker.selected, 0);
         assert_eq!(picker.options.len(), 2);
         assert_eq!(picker.options[0].acp_id, "codex");
+    }
+
+    #[test]
+    fn preview_terminal_height_is_clamped_to_session_limits() {
+        assert_eq!(TabView::clamp_preview_terminal_height(120.0), 180.0);
+        assert_eq!(TabView::clamp_preview_terminal_height(260.0), 260.0);
+        assert_eq!(TabView::clamp_preview_terminal_height(720.0), 520.0);
     }
 
     #[test]
