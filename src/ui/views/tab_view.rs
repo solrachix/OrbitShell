@@ -81,6 +81,7 @@ pub struct TabView {
     output_selection_head: Option<(usize, usize)>,
     output_selecting: bool,
     file_preview: Option<FilePreviewState>,
+    preview_code_scroll_handle: UniformListScrollHandle,
     preview_focus: bool,
     preview_selection_anchor: Option<usize>,
     preview_selection_head: Option<usize>,
@@ -483,9 +484,14 @@ struct FilePreviewState {
 
 #[derive(Clone)]
 enum FilePreviewKind {
-    Text { contents: String },
+    Text {
+        contents: String,
+        lines: Arc<Vec<String>>,
+    },
     Image,
-    Unsupported { message: String },
+    Unsupported {
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -936,17 +942,16 @@ impl TabView {
             && matches!(preview.kind, FilePreviewKind::Text { .. })
     }
 
+    #[cfg(test)]
     fn preview_scroll_uses_custom_step(delta: ScrollDelta) -> bool {
         let _ = delta;
         false
     }
 
-    fn preview_text_lines(&self) -> Option<Vec<String>> {
+    fn preview_text_lines(&self) -> Option<&[String]> {
         let preview = self.file_preview.as_ref()?;
         match &preview.kind {
-            FilePreviewKind::Text { contents } => {
-                Some(contents.lines().map(|line| line.to_string()).collect())
-            }
+            FilePreviewKind::Text { lines, .. } => Some(lines.as_slice()),
             _ => None,
         }
     }
@@ -961,17 +966,10 @@ impl TabView {
         Self::normalize_linear_selection(self.preview_selection_anchor, self.preview_selection_head)
     }
 
-    fn is_preview_line_selected(&self, line_index: usize) -> bool {
-        let Some((start, end)) = self.normalize_preview_selection() else {
-            return false;
-        };
-        line_index >= start && line_index <= end
-    }
-
     fn selected_preview_text(&self) -> Option<String> {
         let lines = self.preview_text_lines()?;
         Self::selected_text_from_lines(
-            &lines,
+            lines,
             self.preview_selection_anchor,
             self.preview_selection_head,
         )
@@ -1437,6 +1435,7 @@ impl TabView {
             pending_echo: None,
             scroll_handle: ScrollHandle::new(),
             preview_scroll_handle: ScrollHandle::new(),
+            preview_code_scroll_handle: UniformListScrollHandle::new(),
             input_visible: true,
             overlay: None,
             needs_git_refresh: false,
@@ -1504,7 +1503,11 @@ impl TabView {
                     message: "Binary file preview is not supported yet.".into(),
                 },
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(contents) => FilePreviewKind::Text { contents },
+                    Ok(contents) => {
+                        let lines =
+                            Arc::new(contents.lines().map(|line| line.to_string()).collect());
+                        FilePreviewKind::Text { contents, lines }
+                    }
                     Err(_) => FilePreviewKind::Unsupported {
                         message: "This file is not valid UTF-8 text.".into(),
                     },
@@ -1943,6 +1946,13 @@ impl TabView {
 
         let root = expand_tilde(&self.current_path);
         self.file_preview = Some(Self::build_file_preview_state(&path, Some(root.as_path())));
+        self.preview_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        self.preview_code_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(0.0)));
         self.preview_active_line = Some(0);
         self.clear_preview_selection();
         self.focus_preview();
@@ -1952,6 +1962,13 @@ impl TabView {
 
     fn close_file_preview(&mut self, cx: &mut Context<Self>) {
         self.file_preview = None;
+        self.preview_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        self.preview_code_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.0), px(0.0)));
         self.preview_active_line = None;
         self.clear_preview_selection();
         self.blur_preview();
@@ -1973,6 +1990,86 @@ impl TabView {
         };
         self.preview_selecting = false;
         cx.notify();
+    }
+
+    fn render_preview_code_row(
+        language: PreviewLanguage,
+        selection: Option<(usize, usize)>,
+        line: &str,
+        index: usize,
+        view_handle: &WeakEntity<Self>,
+    ) -> Div {
+        let segments = Self::highlight_line(line, language);
+        let is_selected = selection
+            .map(|(start, end)| index >= start && index <= end)
+            .unwrap_or(false);
+
+        let mut row = div()
+            .h(px(22.0))
+            .min_h(px(22.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .cursor(CursorStyle::IBeam)
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(if is_selected { 0xbdd9ff } else { 0x5f6b7a }))
+                    .font_family("Cascadia Code")
+                    .child((index + 1).to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(0.0))
+                    .overflow_hidden()
+                    .text_size(px(12.0))
+                    .font_family("Cascadia Code")
+                    .whitespace_nowrap()
+                    .children(if segments.is_empty() {
+                        vec![
+                            div()
+                                .text_color(rgb(0xd8dee9))
+                                .child(" ")
+                                .into_any_element(),
+                        ]
+                    } else {
+                        segments
+                            .into_iter()
+                            .map(|segment| {
+                                let mut span =
+                                    div().text_color(rgb(segment.color)).child(segment.text);
+                                if segment.bold {
+                                    span = span.font_weight(FontWeight::BOLD);
+                                }
+                                span.into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+            );
+
+        let mouse_down_handle = view_handle.clone();
+        row = row.on_mouse_down(MouseButton::Left, move |event, _window, cx| {
+            let _ = mouse_down_handle.update(cx, |view, cx| {
+                view.on_preview_line_mouse_down_at(index, event, cx);
+            });
+        });
+
+        let mouse_move_handle = view_handle.clone();
+        row = row.on_mouse_move(move |event, _window, cx| {
+            let _ = mouse_move_handle.update(cx, |view, cx| {
+                view.on_preview_line_mouse_move_at(index, event, cx);
+            });
+        });
+
+        if is_selected {
+            row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
+        }
+
+        row
     }
 
     pub fn set_recent(&mut self, recent: Vec<RecentEntry>, cx: &mut Context<Self>) {
@@ -2002,6 +2099,7 @@ impl TabView {
         let supports_markdown_preview = Self::preview_supports_rendered_markdown(preview);
         let show_rendered_preview =
             supports_markdown_preview && self.file_preview_mode == FilePreviewMode::Preview;
+        let preview_view_handle = cx.entity().downgrade();
         let markdown_toggle: AnyElement = if supports_markdown_preview {
             div()
                 .size(px(28.0))
@@ -2048,7 +2146,7 @@ impl TabView {
 
         let body: AnyElement = if show_rendered_preview {
             match &preview.kind {
-                FilePreviewKind::Text { contents } => div()
+                FilePreviewKind::Text { contents, .. } => div()
                     .id("file_preview_markdown")
                     .track_scroll(&self.preview_scroll_handle)
                     .flex()
@@ -2075,96 +2173,43 @@ impl TabView {
             }
         } else {
             match &preview.kind {
-                FilePreviewKind::Text { contents } => {
-                    let lines: Vec<String> =
-                        contents.lines().map(|line| line.to_string()).collect();
+                FilePreviewKind::Text { lines, .. } => {
+                    let lines = Arc::clone(lines);
+                    let selection = self.normalize_preview_selection();
+                    let language = preview.language;
                     div()
                         .id("file_preview_text")
-                        .track_scroll(&self.preview_scroll_handle)
                         .flex()
                         .flex_col()
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_focus))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
                         .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
-                        .overflow_y_scroll()
-                        .scrollbar_width(px(12.0))
                         .flex_1()
                         .min_h(px(0.0))
                         .min_w(px(0.0))
                         .p(px(16.0))
-                        .children(lines.into_iter().enumerate().map(|(index, line)| {
-                            let segments = Self::highlight_line(&line, preview.language);
-                            let is_selected = self.is_preview_line_selected(index);
-                            let mut row = div()
-                                .flex()
-                                .items_start()
-                                .gap(px(12.0))
-                                .cursor(CursorStyle::IBeam)
-                                .child(
-                                    div()
-                                        .w(px(44.0))
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(if is_selected {
-                                            0xbdd9ff
-                                        } else {
-                                            0x5f6b7a
-                                        }))
-                                        .font_family("Cascadia Code")
-                                        .child((index + 1).to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(0.0))
-                                        .text_size(px(12.0))
-                                        .font_family("Cascadia Code")
-                                        .whitespace_nowrap()
-                                        .children(if segments.is_empty() {
-                                            vec![
-                                                div()
-                                                    .text_color(rgb(0xd8dee9))
-                                                    .child(" ")
-                                                    .into_any_element(),
-                                            ]
-                                        } else {
-                                            segments
-                                                .into_iter()
-                                                .map(|segment| {
-                                                    let mut span = div()
-                                                        .text_color(rgb(segment.color))
-                                                        .child(segment.text);
-                                                    if segment.bold {
-                                                        span = span.font_weight(FontWeight::BOLD);
-                                                    }
-                                                    span.into_any_element()
-                                                })
-                                                .collect::<Vec<_>>()
-                                        }),
-                                );
-
-                            row = row
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(
-                                        move |view, event: &MouseDownEvent, _window, cx| {
-                                            view.on_preview_line_mouse_down_at(index, event, cx);
-                                        },
-                                    ),
-                                )
-                                .on_mouse_move(cx.listener(
-                                    move |view, event: &MouseMoveEvent, _window, cx| {
-                                        view.on_preview_line_mouse_move_at(index, event, cx);
-                                    },
-                                ));
-
-                            if is_selected {
-                                row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
-                            }
-
-                            row
-                        }))
+                        .child(
+                            uniform_list("file_preview_text_list", lines.len(), {
+                                let lines = Arc::clone(&lines);
+                                let view_handle = preview_view_handle.clone();
+                                move |range, _window, _cx| {
+                                    range
+                                        .map(|index| {
+                                            Self::render_preview_code_row(
+                                                language,
+                                                selection,
+                                                &lines[index],
+                                                index,
+                                                &view_handle,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                }
+                            })
+                            .track_scroll(self.preview_code_scroll_handle.clone())
+                            .w_full()
+                            .h_full(),
+                        )
                         .into_any_element()
                 }
                 FilePreviewKind::Image => div()
@@ -7237,6 +7282,7 @@ mod tests {
     use gpui::{CursorStyle, ScrollDelta, point, px};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn row(id: &str, name: &str) -> EffectiveAgentRow {
@@ -7290,7 +7336,11 @@ mod tests {
 
         assert_eq!(preview.relative_label, "docs/README.md");
         match preview.kind {
-            FilePreviewKind::Text { contents } => assert_eq!(contents, "# OrbitShell\n"),
+            FilePreviewKind::Text { contents, lines } => {
+                assert_eq!(contents, "# OrbitShell\n");
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0], "# OrbitShell");
+            }
             other => panic!(
                 "expected text preview, got {:?}",
                 std::mem::discriminant(&other)
@@ -7460,6 +7510,7 @@ mod tests {
             language: PreviewLanguage::Markdown,
             kind: FilePreviewKind::Text {
                 contents: "# Title".into(),
+                lines: Arc::new(vec!["# Title".into()]),
             },
         };
         let rust = FilePreviewState {
@@ -7468,6 +7519,7 @@ mod tests {
             language: PreviewLanguage::Rust,
             kind: FilePreviewKind::Text {
                 contents: "fn main() {}".into(),
+                lines: Arc::new(vec!["fn main() {}".into()]),
             },
         };
 
