@@ -2486,8 +2486,7 @@ impl TabView {
 
     fn render_terminal_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         if let Some(preview) = self.file_preview.clone() {
-            let terminal_height =
-                Self::clamp_preview_terminal_height(self.preview_terminal_height);
+            let terminal_height = Self::clamp_preview_terminal_height(self.preview_terminal_height);
             div()
                 .flex()
                 .flex_col()

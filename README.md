@@ -49,6 +49,31 @@ OrbitShell focuses on:
 cargo run
 ```
 
+### Run with auto-restart (dev)
+
+OrbitShell does not currently support true UI hot reload / fast refresh. The recommended
+development loop is file watch + rebuild + app restart using `cargo-watch`.
+
+Install it once:
+
+```bash
+cargo install cargo-watch
+```
+
+Then run:
+
+```bash
+cargo dev-watch
+```
+
+This uses the repository alias from `.cargo/config.toml`, which expands to:
+
+```bash
+cargo watch -x run
+```
+
+This is intended for local development only.
+
 ### Build (release)
 
 ```bash

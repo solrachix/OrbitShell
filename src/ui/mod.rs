@@ -560,7 +560,10 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h(px(0.0))
                     .on_mouse_move(_cx.listener(Self::on_sidebar_resize_mouse_move))
-                    .on_mouse_up(MouseButton::Left, _cx.listener(Self::on_sidebar_resize_mouse_up))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        _cx.listener(Self::on_sidebar_resize_mouse_up),
+                    )
                     .on_mouse_up_out(
                         MouseButton::Left,
                         _cx.listener(Self::on_sidebar_resize_mouse_up),

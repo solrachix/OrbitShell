@@ -28,6 +28,26 @@ const ACCENT: u32 = 0x6b9eff;
 const ACCENT_BG: u32 = 0x6b9eff22;
 const ACCENT_BORDER: u32 = 0x6b9eff66;
 
+fn sidebar_row_hover_bg() -> u32 {
+    0x141414
+}
+
+fn sidebar_row_hover_border() -> u32 {
+    0x242424
+}
+
+fn sidebar_button_hover_bg(active: bool) -> u32 {
+    if active { 0x203552 } else { 0x1a1a1a }
+}
+
+fn sidebar_button_hover_border(active: bool) -> u32 {
+    if active { 0x4f7fc4 } else { 0x343434 }
+}
+
+fn sidebar_clickable_cursor() -> CursorStyle {
+    CursorStyle::PointingHand
+}
+
 #[derive(Clone)]
 struct FileEntry {
     name: String,
@@ -240,6 +260,12 @@ impl SidebarView {
                 .py(px(6.0))
                 .rounded(px(6.0))
                 .ml(px(indent))
+                .cursor(sidebar_clickable_cursor())
+                .hover(|style| {
+                    style
+                        .bg(rgb(sidebar_row_hover_bg()))
+                        .border_color(rgb(sidebar_row_hover_border()))
+                })
                 .child(if entry.is_dir {
                     lucide_icon(
                         if is_expanded {
@@ -307,6 +333,7 @@ impl SidebarView {
             .w(px(26.0))
             .h(px(26.0))
             .rounded(px(6.0))
+            .cursor(sidebar_clickable_cursor())
             .bg(if active {
                 rgba(ACCENT_BG)
             } else {
@@ -317,6 +344,11 @@ impl SidebarView {
                 rgba(ACCENT_BORDER)
             } else {
                 rgb(0x2a2a2a)
+            })
+            .hover(move |style| {
+                style
+                    .bg(rgb(sidebar_button_hover_bg(active)))
+                    .border_color(rgb(sidebar_button_hover_border(active)))
             })
             .child(lucide_icon(
                 icon,
@@ -864,6 +896,12 @@ impl SidebarView {
                             .bg(rgb(0x101010))
                             .border_1()
                             .border_color(rgb(0x1f1f1f))
+                            .cursor(sidebar_clickable_cursor())
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(sidebar_row_hover_bg()))
+                                    .border_color(rgb(sidebar_row_hover_border()))
+                            })
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                                 let _ = handle.update(cx, |v, cx| {
                                     v.toggle_search_file(&file_path, cx);
@@ -957,6 +995,12 @@ impl SidebarView {
                                             .bg(rgb(0x0c0c0c))
                                             .border_1()
                                             .border_color(rgb(0x141414))
+                                            .cursor(sidebar_clickable_cursor())
+                                            .hover(|style| {
+                                                style
+                                                    .bg(rgb(0x101010))
+                                                    .border_color(rgb(sidebar_row_hover_border()))
+                                            })
                                             .child(
                                                 div()
                                                     .w(px(54.0))
@@ -1137,6 +1181,12 @@ impl Render for SidebarView {
                                 .py(px(6.0))
                                 .rounded(px(6.0))
                                 .bg(rgb(0x262626))
+                                .cursor(sidebar_clickable_cursor())
+                                .hover(|style| {
+                                    style
+                                        .bg(rgb(0x2d2d2d))
+                                        .border_color(rgb(sidebar_row_hover_border()))
+                                })
                                 .child(
                                     lucide_icon(Icon::ChevronDown, 12.0, 0xcccccc)
                                         .cursor(CursorStyle::PointingHand),
@@ -1278,6 +1328,12 @@ impl SidebarView {
                         .bg(rgb(0x101010))
                         .border_1()
                         .border_color(rgb(0x1f1f1f))
+                        .cursor(sidebar_clickable_cursor())
+                        .hover(|style| {
+                            style
+                                .bg(rgb(sidebar_row_hover_bg()))
+                                .border_color(rgb(sidebar_row_hover_border()))
+                        })
                         .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                             let _ = open_handle.update(cx, |view: &mut SidebarView, cx| {
                                 view.open_file(open_path.clone(), cx);
@@ -1387,6 +1443,35 @@ impl SidebarView {
                     ),
             )
             .child(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::CursorStyle;
+
+    use super::{
+        sidebar_button_hover_bg, sidebar_button_hover_border, sidebar_clickable_cursor,
+        sidebar_row_hover_bg, sidebar_row_hover_border,
+    };
+
+    #[test]
+    fn sidebar_hover_tokens_stay_subtle() {
+        assert_eq!(sidebar_row_hover_bg(), 0x141414);
+        assert_eq!(sidebar_row_hover_border(), 0x242424);
+    }
+
+    #[test]
+    fn sidebar_button_hover_tokens_preserve_active_contrast() {
+        assert_eq!(sidebar_button_hover_bg(false), 0x1a1a1a);
+        assert_eq!(sidebar_button_hover_border(false), 0x343434);
+        assert_eq!(sidebar_button_hover_bg(true), 0x203552);
+        assert_eq!(sidebar_button_hover_border(true), 0x4f7fc4);
+    }
+
+    #[test]
+    fn sidebar_clickable_rows_use_pointing_hand_cursor() {
+        assert_eq!(sidebar_clickable_cursor(), CursorStyle::PointingHand);
     }
 }
 
