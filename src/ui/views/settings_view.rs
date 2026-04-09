@@ -4,6 +4,7 @@ use futures::channel::mpsc;
 
 use gpui::*;
 use lucide_icons::Icon;
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -127,6 +128,40 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
+    fn default_sections() -> Vec<&'static str> {
+        vec![
+            "Appearance",
+            "Keyboard shortcuts",
+            "ACP Registry",
+            "MCP servers",
+            "Privacy",
+            "About",
+        ]
+    }
+
+    fn about_repository_url() -> &'static str {
+        "https://github.com/solrachix/OrbitShell"
+    }
+
+    fn about_website_url() -> &'static str {
+        "https://carlos-miguel.dev"
+    }
+
+    fn about_support_email_target() -> &'static str {
+        "mailto:eu@carlos-miguel.dev"
+    }
+
+    fn about_instagram_url() -> &'static str {
+        "https://instagram.com/solrachix"
+    }
+
+    fn open_external_target(target: &str) {
+        let target = target.to_string();
+        thread::spawn(move || {
+            let _ = webbrowser::open(&target);
+        });
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let registry_data = Self::load_registry_data_from_disk().unwrap_or_default();
         let effective_agents =
@@ -138,17 +173,7 @@ impl SettingsView {
         let appearance_settings = AppearanceSettings::load();
 
         let mut view = Self {
-            sections: vec![
-                "Account",
-                "Code",
-                "Appearance",
-                "Keyboard shortcuts",
-                "Referrals",
-                "ACP Registry",
-                "MCP servers",
-                "Privacy",
-                "About",
-            ],
+            sections: Self::default_sections(),
             active_section: 0,
             focus_handle: cx.focus_handle(),
             search_query: String::new(),
@@ -537,22 +562,6 @@ impl SettingsView {
             .child(text_normal(right))
     }
 
-    fn render_toggle(&self, on: bool) -> Div {
-        div()
-            .w(px(44.0))
-            .h(px(24.0))
-            .rounded(px(999.0))
-            .bg(if on { rgb(ACCENT) } else { rgb(0x2a2a2a) })
-            .child(
-                div()
-                    .w(px(20.0))
-                    .h(px(20.0))
-                    .rounded(px(999.0))
-                    .bg(rgb(0xffffff))
-                    .ml(px(if on { 22.0 } else { 2.0 })),
-            )
-    }
-
     fn render_kbd_chip(&self, label: &str, active: bool) -> Div {
         div()
             .px(px(8.0))
@@ -564,6 +573,72 @@ impl SettingsView {
             .text_size(px(11.0))
             .text_color(if active { rgb(0xf0b44c) } else { rgb(0x9a9a9a) })
             .child(label.to_string())
+    }
+
+    fn render_about_link_row(
+        &self,
+        icon: Icon,
+        label: impl Into<String>,
+        value: impl Into<String>,
+        target: impl Into<Cow<'static, str>>,
+    ) -> Div {
+        let label = label.into();
+        let value = value.into();
+        let target = target.into().into_owned();
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .w_full()
+            .px(px(12.0))
+            .py(px(10.0))
+            .rounded(px(8.0))
+            .bg(rgb(0x121212))
+            .border_1()
+            .border_color(rgb(0x202020))
+            .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(rgb(0x171717)).border_color(rgb(0x303030)))
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+                Self::open_external_target(&target);
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(lucide_icon(icon, 14.0, 0x8fb7ff))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x7f7f7f))
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xe6e6e6))
+                                    .truncate()
+                                    .child(value),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(lucide_icon(Icon::ExternalLink, 13.0, 0x6f6f6f)),
+            )
     }
 
     fn select_icon_theme(&mut self, theme_id: &str, cx: &mut Context<Self>) {
@@ -1796,168 +1871,6 @@ impl SettingsView {
             );
 
         match title {
-            "Account" => {
-                content = content
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.0))
-                            .child(
-                                div()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
-                                    .rounded(px(999.0))
-                                    .bg(rgb(0x1f1f1f))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .text_color(rgb(0xdddddd))
-                                            .child("S"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .text_color(rgb(0xffffff))
-                                            .child("Solra"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .text_color(rgb(0x8a8a8a))
-                                            .child("solra@email.com"),
-                                    ),
-                            ),
-                    )
-                    .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Settings sync"),
-                            )
-                            .child(self.render_toggle(true)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Earn rewards by sharing OrbitShell with friends & colleagues"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(0x101010))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0xd0d0d0))
-                                    .child("Refer a friend"),
-                            )
-                            .child(
-                                div()
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(0x101010))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0xd0d0d0))
-                                    .child("Relaunch OrbitShell"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Version v0.2026.02.05-stable"),
-                    )
-                    .child(
-                        div()
-                            .px(px(12.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(0x0f0f0f))
-                            .border_1()
-                            .border_color(rgb(0x2a2a2a))
-                            .text_size(px(12.0))
-                            .text_color(rgb(0xd0d0d0))
-                            .child("Log out"),
-                    );
-            }
-            "Code" => {
-                content = content
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(0x9a9a9a))
-                            .child("Codebase index"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("OrbitShell can automatically index code repositories as you navigate them, helping agents quickly understand context."),
-                    )
-                    .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Index new folders by default"),
-                            )
-                            .child(self.render_toggle(false)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x8a8a8a))
-                                    .child("Indexed folders"),
-                            )
-                            .child(
-                                div()
-                                    .px(px(10.0))
-                                    .py(px(6.0))
-                                    .rounded(px(6.0))
-                                    .bg(rgb(0x101010))
-                                    .border_1()
-                                    .border_color(rgb(0x2a2a2a))
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0xd0d0d0))
-                                    .child("Index new folder"),
-                            ),
-                    );
-            }
             "Appearance" => {
                 let filtered_themes = self.filtered_icon_themes();
                 let appearance_body = match self.appearance_tab {
@@ -2252,27 +2165,6 @@ impl SettingsView {
                                     )
                             }),
                         ));
-            }
-            "Referrals" => {
-                content = content
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("Invite your team and earn rewards."),
-                    )
-                    .child(
-                        div()
-                            .px(px(12.0))
-                            .py(px(8.0))
-                            .rounded(px(6.0))
-                            .bg(rgb(0x101010))
-                            .border_1()
-                            .border_color(rgb(0x2a2a2a))
-                            .text_size(px(12.0))
-                            .text_color(rgb(0xd0d0d0))
-                            .child("Invite a friend"),
-                    );
             }
             "MCP servers" => {
                 let add_stdio_handle = cx.entity().downgrade();
@@ -2957,39 +2849,54 @@ impl SettingsView {
                         div()
                             .text_size(px(13.0))
                             .text_color(rgb(0x9a9a9a))
-                            .child("Secret redaction"),
+                            .child("Local-first by default"),
                     )
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x8a8a8a))
-                            .child("When enabled, OrbitShell scans for sensitive info and prevents sending to servers."),
+                            .child("Browsing folders, searching files, rendering previews, and editing local settings all happen on your machine."),
                     )
                     .child(
                         div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x9a9a9a))
+                            .child("When network access happens"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x8a8a8a))
+                            .child("OrbitShell can contact external services when you explicitly use features such as ACP Registry refresh, MCP server configuration, package installs, agent runtimes, or other connected integrations."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x9a9a9a))
+                            .child("Practical expectation"),
+                    )
+                    .child(
+                        div()
+                            .rounded(px(10.0))
+                            .bg(rgb(0x101010))
+                            .border_1()
+                            .border_color(rgb(0x1f1f1f))
+                            .p(px(12.0))
                             .flex()
-                            .items_center()
-                            .justify_between()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xd0d0d0))
+                                    .child("Opening local files or searching your workspace does not send file contents anywhere by default."),
+                            )
                             .child(
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(rgb(0x9a9a9a))
-                                    .child("Help improve OrbitShell"),
-                            )
-                            .child(self.render_toggle(true)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(0x9a9a9a))
-                                    .child("Send crash reports"),
-                            )
-                            .child(self.render_toggle(true)),
+                                    .child("Before enabling connected tools or registries, review what that feature needs and which services it talks to."),
+                            ),
                     );
             }
             "About" => {
@@ -2997,30 +2904,117 @@ impl SettingsView {
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(260.0))
+                            .flex_col()
+                            .gap(px(4.0))
                             .child(
                                 div()
-                                    .text_size(px(54.0))
+                                    .text_size(px(42.0))
                                     .text_color(rgb(0xffffff))
                                     .child("OrbitShell"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child(
+                                        "A modern, block-based terminal UI built with Rust and GPUI.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x8a8a8a))
+                                    .child("v0.2026.02.05-stable"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .rounded(px(10.0))
+                            .bg(rgb(0x101010))
+                            .border_1()
+                            .border_color(rgb(0x1f1f1f))
+                            .p(px(14.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0xffffff))
+                                    .child("About this app"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child(
+                                        "Open links externally in your default browser or mail app.",
+                                    ),
                             ),
                     )
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8a8a8a))
-                            .child("v0.2026.02.05-stable"),
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(self.render_about_link_row(
+                                Icon::Star,
+                                "Repository",
+                                "github.com/solrachix/OrbitShell",
+                                Self::about_repository_url(),
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x9a9a9a))
+                                    .child(
+                                        "If OrbitShell helps you, consider starring the repository on GitHub.",
+                                    ),
+                            )
+                            .child(self.render_about_link_row(
+                                Icon::Globe,
+                                "Website",
+                                "carlos-miguel.dev",
+                                Self::about_website_url(),
+                            ))
+                            .child(self.render_about_link_row(
+                                Icon::Mail,
+                                "Support",
+                                "eu@carlos-miguel.dev",
+                                Self::about_support_email_target(),
+                            ))
+                            .child(self.render_about_link_row(
+                                Icon::AtSign,
+                                "Instagram",
+                                "@solrachix",
+                                Self::about_instagram_url(),
+                            )),
                     )
                     .child(
                         div()
+                            .rounded(px(10.0))
+                            .bg(rgb(0x101010))
+                            .border_1()
+                            .border_color(rgb(0x1f1f1f))
+                            .p(px(12.0))
                             .flex()
-                            .items_center()
-                            .justify_center()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0xffffff))
+                                    .child("Author"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0xd0d0d0))
+                                    .child("Carlos Miguel"),
+                            ),
+                    )
+                    .child(
+                        div()
                             .text_size(px(11.0))
                             .text_color(rgb(0x6f6f6f))
                             .child("Copyright 2026 OrbitShell"),
@@ -3126,13 +3120,48 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_log_line;
+    use super::{SettingsView, wrap_log_line};
 
     #[test]
     fn wrap_log_line_breaks_long_text_in_fixed_chunks() {
         let line = "abcdefghijklmnopqrstuvwxyz";
         let wrapped = wrap_log_line(line, 10);
         assert_eq!(wrapped, vec!["abcdefghij", "klmnopqrst", "uvwxyz"]);
+    }
+
+    #[test]
+    fn default_sections_hide_placeholder_panels() {
+        assert_eq!(
+            SettingsView::default_sections(),
+            vec![
+                "Appearance",
+                "Keyboard shortcuts",
+                "ACP Registry",
+                "MCP servers",
+                "Privacy",
+                "About",
+            ]
+        );
+    }
+
+    #[test]
+    fn about_targets_match_project_metadata() {
+        assert_eq!(
+            SettingsView::about_repository_url(),
+            "https://github.com/solrachix/OrbitShell"
+        );
+        assert_eq!(
+            SettingsView::about_website_url(),
+            "https://carlos-miguel.dev"
+        );
+        assert_eq!(
+            SettingsView::about_support_email_target(),
+            "mailto:eu@carlos-miguel.dev"
+        );
+        assert_eq!(
+            SettingsView::about_instagram_url(),
+            "https://instagram.com/solrachix"
+        );
     }
 }
 
@@ -3149,21 +3178,6 @@ impl Render for SettingsView {
             .bg(rgb(0x0a0a0a))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .py(px(10.0))
-                    .border_b_1()
-                    .border_color(rgb(0x1f1f1f))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x9a9a9a))
-                            .child("Settings"),
-                    ),
-            )
             .child(
                 div()
                     .flex()

@@ -338,7 +338,10 @@ impl Workspace {
 
         let handle_settings = cx.entity().downgrade();
         let handle_settings_settings = handle_settings.clone();
-        let handle_settings_invite = handle_settings.clone();
+        let handle_settings_appearance = handle_settings.clone();
+        let handle_settings_shortcuts = handle_settings.clone();
+        let handle_settings_registry = handle_settings.clone();
+        let handle_settings_about = handle_settings.clone();
         let menu = div()
             .absolute()
             .right(px(16.0))
@@ -383,6 +386,31 @@ impl Workspace {
                         });
                     }),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xe6e6e6))
+                    .child("Appearance")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = handle_settings_appearance.update(cx, |view, cx| {
+                            view.user_menu_open = false;
+                            view.add_settings_tab(cx);
+                            if let Some(tab) = view.tabs.get(view.active_tab) {
+                                let _ = tab.update(cx, |tab_view, cx| {
+                                    tab_view.set_settings_section("Appearance", cx);
+                                });
+                            }
+                        });
+                    }),
+            )
             .child({
                 let handle = cx.entity().downgrade();
                 div()
@@ -405,7 +433,6 @@ impl Workspace {
                     })
             })
             .child({
-                let handle = cx.entity().downgrade();
                 div()
                     .flex()
                     .items_center()
@@ -419,7 +446,7 @@ impl Workspace {
                     .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
-                        let _ = handle.update(cx, |view, cx| {
+                        let _ = handle_settings_shortcuts.update(cx, |view, cx| {
                             view.user_menu_open = false;
                             view.add_settings_tab(cx);
                             if let Some(tab) = view.tabs.get(view.active_tab) {
@@ -439,17 +466,42 @@ impl Workspace {
                     .rounded(px(6.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe6e6e6))
-                    .child("Invite a friend")
+                    .child("ACP Registry")
                     .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
                     .cursor(CursorStyle::PointingHand)
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
-                        let _ = handle_settings_invite.update(cx, |view, cx| {
+                        let _ = handle_settings_registry.update(cx, |view, cx| {
                             view.user_menu_open = false;
                             view.add_settings_tab(cx);
                             if let Some(tab) = view.tabs.get(view.active_tab) {
                                 let _ = tab.update(cx, |tab_view, cx| {
-                                    tab_view.set_settings_section("Referrals", cx);
+                                    tab_view.set_settings_section("ACP Registry", cx);
+                                });
+                            }
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xe6e6e6))
+                    .child("About")
+                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = handle_settings_about.update(cx, |view, cx| {
+                            view.user_menu_open = false;
+                            view.add_settings_tab(cx);
+                            if let Some(tab) = view.tabs.get(view.active_tab) {
+                                let _ = tab.update(cx, |tab_view, cx| {
+                                    tab_view.set_settings_section("About", cx);
                                 });
                             }
                         });
@@ -468,19 +520,7 @@ impl Workspace {
                     .cursor(CursorStyle::PointingHand)
                     .child("Feedback"),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .rounded(px(6.0))
-                    .text_size(px(13.0))
-                    .text_color(rgb(0xe6e6e6))
-                    .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
-                    .cursor(CursorStyle::PointingHand)
-                    .child("Log out"),
-            );
+            ;
 
         div().absolute().size_full().child(overlay).child(menu)
     }
