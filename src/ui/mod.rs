@@ -66,6 +66,14 @@ impl Workspace {
             tab_bar,
         };
 
+        cx.subscribe(
+            &workspace.sidebar,
+            |workspace, _sidebar, event: &views::sidebar_view::OpenFileEvent, cx| {
+                workspace.open_file_in_active_tab(event.path.clone(), cx);
+            },
+        )
+        .detach();
+
         workspace.add_welcome_tab(cx);
         workspace
     }
@@ -160,6 +168,16 @@ impl Workspace {
             tab_bar.set_active(self.active_tab, cx);
         });
         cx.notify();
+    }
+
+    fn open_file_in_active_tab(&mut self, file_path: PathBuf, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+
+        let _ = tab.update(cx, |view, cx| {
+            view.open_file_preview(file_path.clone(), cx);
+        });
     }
 
     fn sync_sidebar_root(&mut self, cx: &mut Context<Self>) {

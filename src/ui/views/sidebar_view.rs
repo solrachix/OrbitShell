@@ -77,6 +77,10 @@ enum SidebarMode {
     Git,
 }
 
+pub struct OpenFileEvent {
+    pub path: PathBuf,
+}
+
 pub struct SidebarView {
     current_path: PathBuf,
     expanded_folders: HashSet<PathBuf>,
@@ -216,6 +220,10 @@ impl SidebarView {
         cx.notify();
     }
 
+    fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.emit(OpenFileEvent { path });
+    }
+
     fn render_entry(&self, entry: &FileEntry, depth: usize, cx: &Context<Self>) -> Div {
         let theme_id = AppearanceSettings::load().icon_theme;
         let is_expanded = entry.is_dir && self.expanded_folders.contains(&entry.path);
@@ -261,6 +269,16 @@ impl SidebarView {
                     move |_event, _window, cx| {
                         let _ = handle.update(cx, |view, cx| {
                             view.toggle_folder(path.clone(), cx);
+                        });
+                    }
+                });
+            } else {
+                let path = entry.path.clone();
+                row = row.on_mouse_down(gpui::MouseButton::Left, {
+                    let handle = cx.entity().downgrade();
+                    move |_event, _window, cx| {
+                        let _ = handle.update(cx, |view, cx| {
+                            view.open_file(path.clone(), cx);
                         });
                     }
                 });
@@ -913,10 +931,12 @@ impl SidebarView {
                             )
                             .id(("search_file", id_key));
 
-                        file_header.interactivity().tooltip(move |_window, cx| {
-                            let text = full_path.clone();
-                            cx.new(|_| TooltipView { text }).into()
-                        });
+                        file_header
+                            .interactivity()
+                            .tooltip(move |_window, cx: &mut App| {
+                                let text = full_path.clone();
+                                cx.new(|_| TooltipView { text }).into()
+                            });
 
                         let mut section = div().flex().flex_col().gap(px(4.0)).child(file_header);
 
@@ -1208,8 +1228,8 @@ impl Render for SidebarView {
                                         ),
                                 ),
                         )
-                        .child(self.render_git_section("Staged Changes", &staged))
-                        .child(self.render_git_section("Changes", &unstaged))
+                        .child(self.render_git_section("Staged Changes", &staged, cx))
+                        .child(self.render_git_section("Changes", &unstaged, cx))
                         .into_any_element()
                 }
             })
@@ -1217,7 +1237,7 @@ impl Render for SidebarView {
 }
 
 impl SidebarView {
-    fn render_git_section(&self, title: &str, items: &[GitChange]) -> Div {
+    fn render_git_section(&self, title: &str, items: &[GitChange], cx: &Context<Self>) -> Div {
         let theme_id = AppearanceSettings::load().icon_theme;
         let count = items.len();
         let list = if items.is_empty() {
@@ -1245,6 +1265,8 @@ impl SidebarView {
                     let full_path = path.to_string_lossy().to_string();
 
                     let id_key = Self::git_id_key(item, &path);
+                    let open_handle = cx.entity().downgrade();
+                    let open_path = path.clone();
                     let mut row = div()
                         .flex()
                         .items_center()
@@ -1256,6 +1278,11 @@ impl SidebarView {
                         .bg(rgb(0x101010))
                         .border_1()
                         .border_color(rgb(0x1f1f1f))
+                        .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                            let _ = open_handle.update(cx, |view: &mut SidebarView, cx| {
+                                view.open_file(open_path.clone(), cx);
+                            });
+                        })
                         .child(
                             div()
                                 .flex()
@@ -1453,3 +1480,5 @@ impl SidebarView {
         hasher.finish()
     }
 }
+
+impl EventEmitter<OpenFileEvent> for SidebarView {}

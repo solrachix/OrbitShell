@@ -55,6 +55,7 @@ pub struct TabView {
     auto_focus: bool,
     pending_echo: Option<String>,
     scroll_handle: ScrollHandle,
+    preview_scroll_handle: ScrollHandle,
     input_visible: bool,
     overlay: Option<Overlay>,
     needs_git_refresh: bool,
@@ -79,6 +80,13 @@ pub struct TabView {
     output_selection_anchor: Option<(usize, usize)>,
     output_selection_head: Option<(usize, usize)>,
     output_selecting: bool,
+    file_preview: Option<FilePreviewState>,
+    preview_focus: bool,
+    preview_selection_anchor: Option<usize>,
+    preview_selection_head: Option<usize>,
+    preview_selecting: bool,
+    preview_active_line: Option<usize>,
+    file_preview_mode: FilePreviewMode,
 }
 
 #[derive(Clone)]
@@ -465,6 +473,55 @@ enum TabViewMode {
     Settings(Entity<SettingsView>),
 }
 
+#[derive(Clone)]
+struct FilePreviewState {
+    path: PathBuf,
+    relative_label: String,
+    language: PreviewLanguage,
+    kind: FilePreviewKind,
+}
+
+#[derive(Clone)]
+enum FilePreviewKind {
+    Text { contents: String },
+    Image,
+    Unsupported { message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewLanguage {
+    Rust,
+    Markdown,
+    Json,
+    Toml,
+    Yaml,
+    Shell,
+    JavaScript,
+    JavaScriptReact,
+    TypeScript,
+    TypeScriptReact,
+    Html,
+    Css,
+    Sql,
+    Python,
+    Go,
+    Dockerfile,
+    PlainText,
+}
+
+#[derive(Clone)]
+struct HighlightSegment {
+    text: String,
+    color: u32,
+    bold: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilePreviewMode {
+    Code,
+    Preview,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Terminal,
@@ -507,6 +564,7 @@ struct AgentPermissionEvent {
 const AGENT_CONNECTING_PLACEHOLDER: &str = "[agent] connecting...";
 const AGENT_STARTING_SESSION_PLACEHOLDER: &str = "[agent] starting session...";
 const AGENT_SENDING_PROMPT_PLACEHOLDER: &str = "[agent] sending prompt...";
+const MAX_TEXT_PREVIEW_BYTES: usize = 512 * 1024;
 
 fn model_trigger_label(state: &ModelButtonState) -> (String, bool) {
     match state {
@@ -867,6 +925,67 @@ impl TabView {
         self.output_selecting = false;
     }
 
+    fn clear_preview_selection(&mut self) {
+        self.preview_selection_anchor = None;
+        self.preview_selection_head = None;
+        self.preview_selecting = false;
+    }
+
+    fn preview_supports_rendered_markdown(preview: &FilePreviewState) -> bool {
+        matches!(preview.language, PreviewLanguage::Markdown)
+            && matches!(preview.kind, FilePreviewKind::Text { .. })
+    }
+
+    fn preview_scroll_uses_custom_step(delta: ScrollDelta) -> bool {
+        let _ = delta;
+        false
+    }
+
+    fn preview_text_lines(&self) -> Option<Vec<String>> {
+        let preview = self.file_preview.as_ref()?;
+        match &preview.kind {
+            FilePreviewKind::Text { contents } => {
+                Some(contents.lines().map(|line| line.to_string()).collect())
+            }
+            _ => None,
+        }
+    }
+
+    fn preview_line_count(&self) -> usize {
+        self.preview_text_lines()
+            .map(|lines| lines.len())
+            .unwrap_or(0)
+    }
+
+    fn normalize_preview_selection(&self) -> Option<(usize, usize)> {
+        Self::normalize_linear_selection(self.preview_selection_anchor, self.preview_selection_head)
+    }
+
+    fn is_preview_line_selected(&self, line_index: usize) -> bool {
+        let Some((start, end)) = self.normalize_preview_selection() else {
+            return false;
+        };
+        line_index >= start && line_index <= end
+    }
+
+    fn selected_preview_text(&self) -> Option<String> {
+        let lines = self.preview_text_lines()?;
+        Self::selected_text_from_lines(
+            &lines,
+            self.preview_selection_anchor,
+            self.preview_selection_head,
+        )
+    }
+
+    fn focus_preview(&mut self) {
+        self.preview_focus = true;
+    }
+
+    fn blur_preview(&mut self) {
+        self.preview_focus = false;
+        self.preview_selecting = false;
+    }
+
     fn shift_output_indices_after_front_block_removal(&mut self) {
         self.selected_block = self.selected_block.and_then(|index| index.checked_sub(1));
 
@@ -998,6 +1117,240 @@ impl TabView {
         self.output_selecting = false;
     }
 
+    fn on_preview_line_mouse_down_at(
+        &mut self,
+        line_index: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_preview();
+        if event.modifiers.shift {
+            if self.preview_selection_anchor.is_none() {
+                self.preview_selection_anchor =
+                    Some(self.preview_active_line.unwrap_or(line_index));
+            }
+            self.preview_selection_head = Some(line_index);
+        } else {
+            self.preview_selection_anchor = Some(line_index);
+            self.preview_selection_head = Some(line_index);
+        }
+        self.preview_active_line = Some(line_index);
+        self.preview_selecting = true;
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_preview_line_mouse_move_at(
+        &mut self,
+        line_index: usize,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.preview_selecting || !event.dragging() {
+            return;
+        }
+        self.preview_selection_head = Some(line_index);
+        self.preview_active_line = Some(line_index);
+        cx.notify();
+    }
+
+    fn on_preview_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.preview_selecting = false;
+    }
+
+    fn on_toggle_file_preview_mode(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_file_preview_mode(cx);
+        cx.stop_propagation();
+    }
+
+    fn copy_selected_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_preview_text() else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn select_all_preview(&mut self) -> bool {
+        let count = self.preview_line_count();
+        if count == 0 {
+            return false;
+        }
+        self.preview_selection_anchor = Some(0);
+        self.preview_selection_head = Some(count.saturating_sub(1));
+        self.preview_active_line = Some(count.saturating_sub(1));
+        true
+    }
+
+    fn move_preview_selection_by(&mut self, delta: isize, extend: bool) -> bool {
+        let count = self.preview_line_count();
+        if count == 0 {
+            return false;
+        }
+
+        let (active_line, selection_anchor, selection_head) = Self::move_linear_selection(
+            count,
+            self.preview_active_line,
+            self.preview_selection_anchor,
+            self.preview_selection_head,
+            delta,
+            extend,
+        );
+        self.focus_preview();
+        self.preview_active_line = active_line;
+        self.preview_selection_anchor = selection_anchor;
+        self.preview_selection_head = selection_head;
+        true
+    }
+
+    fn move_preview_selection_to_edge(&mut self, to_end: bool, extend: bool) -> bool {
+        let count = self.preview_line_count();
+        if count == 0 {
+            return false;
+        }
+
+        let target = if to_end { count.saturating_sub(1) } else { 0 };
+        let current = self
+            .preview_active_line
+            .unwrap_or(target)
+            .min(count.saturating_sub(1));
+        self.focus_preview();
+        self.preview_active_line = Some(target);
+        if extend {
+            if self.preview_selection_anchor.is_none() {
+                self.preview_selection_anchor = Some(current);
+            }
+            self.preview_selection_head = Some(target);
+        } else {
+            self.preview_selection_anchor = Some(target);
+            self.preview_selection_head = Some(target);
+        }
+        true
+    }
+
+    fn normalize_linear_selection(
+        anchor: Option<usize>,
+        head: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let anchor = anchor?;
+        let head = head?;
+        if anchor == head {
+            return None;
+        }
+        Some((anchor.min(head), anchor.max(head)))
+    }
+
+    fn selected_text_from_lines(
+        lines: &[String],
+        anchor: Option<usize>,
+        head: Option<usize>,
+    ) -> Option<String> {
+        let (start, end) = Self::normalize_linear_selection(anchor, head)?;
+        if start >= lines.len() {
+            return None;
+        }
+        let end = end.min(lines.len().saturating_sub(1));
+        if start > end {
+            return None;
+        }
+        Some(lines[start..=end].join("\n"))
+    }
+
+    fn move_linear_selection(
+        count: usize,
+        active_line: Option<usize>,
+        selection_anchor: Option<usize>,
+        selection_head: Option<usize>,
+        delta: isize,
+        extend: bool,
+    ) -> (Option<usize>, Option<usize>, Option<usize>) {
+        if count == 0 {
+            return (active_line, selection_anchor, selection_head);
+        }
+
+        let current = active_line.unwrap_or(0).min(count.saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current + delta as usize).min(count.saturating_sub(1))
+        };
+
+        if extend {
+            let anchor = selection_anchor.or(Some(current));
+            (Some(next), anchor, Some(next))
+        } else {
+            (Some(next), Some(next), Some(next))
+        }
+    }
+
+    fn handle_preview_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.preview_focus || self.file_preview.is_none() {
+            return false;
+        }
+
+        let ctrl = event.keystroke.modifiers.control;
+        let shift = event.keystroke.modifiers.shift;
+        match event.keystroke.key.as_str() {
+            "c" if ctrl => {
+                self.copy_selected_preview(cx);
+                true
+            }
+            "a" if ctrl => {
+                if self.select_all_preview() {
+                    cx.notify();
+                }
+                true
+            }
+            "up" | "arrowup" => {
+                if self.move_preview_selection_by(-1, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            "down" | "arrowdown" => {
+                if self.move_preview_selection_by(1, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            "left" | "arrowleft" => {
+                if self.move_preview_selection_by(-1, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            "right" | "arrowright" => {
+                if self.move_preview_selection_by(1, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            "home" => {
+                if self.move_preview_selection_to_edge(false, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            "end" => {
+                if self.move_preview_selection_to_edge(true, shift) {
+                    cx.notify();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn format_path(path: &Path) -> String {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -1083,6 +1436,7 @@ impl TabView {
             auto_focus: true,
             pending_echo: None,
             scroll_handle: ScrollHandle::new(),
+            preview_scroll_handle: ScrollHandle::new(),
             input_visible: true,
             overlay: None,
             needs_git_refresh: false,
@@ -1107,7 +1461,518 @@ impl TabView {
             output_selection_anchor: None,
             output_selection_head: None,
             output_selecting: false,
+            file_preview: None,
+            preview_focus: false,
+            preview_selection_anchor: None,
+            preview_selection_head: None,
+            preview_selecting: false,
+            preview_active_line: None,
+            file_preview_mode: FilePreviewMode::Code,
         }
+    }
+
+    fn build_file_preview_state(path: &Path, root: Option<&Path>) -> FilePreviewState {
+        let relative_label = root
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(Self::format_path)
+            .unwrap_or_else(|| Self::format_path(path));
+        let language = Self::detect_preview_language(path);
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+
+        let image_extensions = [
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "avif", "tif", "tiff",
+        ];
+
+        let kind = if extension
+            .as_deref()
+            .map(|ext| image_extensions.contains(&ext))
+            .unwrap_or(false)
+        {
+            FilePreviewKind::Image
+        } else {
+            match std::fs::read(path) {
+                Ok(bytes) if bytes.len() > MAX_TEXT_PREVIEW_BYTES => FilePreviewKind::Unsupported {
+                    message: format!(
+                        "File too large to preview inline ({} KB limit).",
+                        MAX_TEXT_PREVIEW_BYTES / 1024
+                    ),
+                },
+                Ok(bytes) if bytes.contains(&0) => FilePreviewKind::Unsupported {
+                    message: "Binary file preview is not supported yet.".into(),
+                },
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(contents) => FilePreviewKind::Text { contents },
+                    Err(_) => FilePreviewKind::Unsupported {
+                        message: "This file is not valid UTF-8 text.".into(),
+                    },
+                },
+                Err(err) => FilePreviewKind::Unsupported {
+                    message: format!("Failed to read file: {err}"),
+                },
+            }
+        };
+
+        FilePreviewState {
+            path: path.to_path_buf(),
+            relative_label,
+            language,
+            kind,
+        }
+    }
+
+    fn detect_preview_language(path: &Path) -> PreviewLanguage {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        match file_name.as_str() {
+            "cargo.toml" | "agents.json" | "repo.config.json" | "registry-sample.json" => {
+                return if file_name.ends_with(".toml") {
+                    PreviewLanguage::Toml
+                } else {
+                    PreviewLanguage::Json
+                };
+            }
+            "dockerfile" => {
+                return PreviewLanguage::Dockerfile;
+            }
+            ".gitignore" | ".dockerignore" | ".eslintignore" | ".prettierignore" => {
+                return PreviewLanguage::PlainText;
+            }
+            _ => {}
+        }
+
+        match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("rs") => PreviewLanguage::Rust,
+            Some("md") => PreviewLanguage::Markdown,
+            Some("json") => PreviewLanguage::Json,
+            Some("toml") => PreviewLanguage::Toml,
+            Some("yaml") | Some("yml") => PreviewLanguage::Yaml,
+            Some("sh") | Some("bash") | Some("zsh") => PreviewLanguage::Shell,
+            Some("js") => PreviewLanguage::JavaScript,
+            Some("jsx") => PreviewLanguage::JavaScriptReact,
+            Some("ts") => PreviewLanguage::TypeScript,
+            Some("tsx") => PreviewLanguage::TypeScriptReact,
+            Some("html") | Some("htm") => PreviewLanguage::Html,
+            Some("css") | Some("scss") | Some("less") => PreviewLanguage::Css,
+            Some("sql") => PreviewLanguage::Sql,
+            Some("py") => PreviewLanguage::Python,
+            Some("go") => PreviewLanguage::Go,
+            _ => PreviewLanguage::PlainText,
+        }
+    }
+
+    fn preview_language_label(language: PreviewLanguage) -> &'static str {
+        match language {
+            PreviewLanguage::Rust => "Rust",
+            PreviewLanguage::Markdown => "Markdown",
+            PreviewLanguage::Json => "JSON",
+            PreviewLanguage::Toml => "TOML",
+            PreviewLanguage::Yaml => "YAML",
+            PreviewLanguage::Shell => "Shell",
+            PreviewLanguage::JavaScript => "JavaScript",
+            PreviewLanguage::JavaScriptReact => "JSX",
+            PreviewLanguage::TypeScript => "TypeScript",
+            PreviewLanguage::TypeScriptReact => "TSX",
+            PreviewLanguage::Html => "HTML",
+            PreviewLanguage::Css => "CSS",
+            PreviewLanguage::Sql => "SQL",
+            PreviewLanguage::Python => "Python",
+            PreviewLanguage::Go => "Go",
+            PreviewLanguage::Dockerfile => "Dockerfile",
+            PreviewLanguage::PlainText => "Plain text",
+        }
+    }
+
+    fn highlight_line(line: &str, language: PreviewLanguage) -> Vec<HighlightSegment> {
+        match language {
+            PreviewLanguage::Markdown => Self::highlight_markdown_line(line),
+            PreviewLanguage::Html => Self::highlight_html_line(line),
+            PreviewLanguage::PlainText => vec![HighlightSegment {
+                text: line.to_string(),
+                color: 0xd8dee9,
+                bold: false,
+            }],
+            _ => Self::highlight_code_like_line(line, language),
+        }
+    }
+
+    fn highlight_markdown_line(line: &str) -> Vec<HighlightSegment> {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            return vec![HighlightSegment {
+                text: line.to_string(),
+                color: 0xe3b341,
+                bold: true,
+            }];
+        }
+        if trimmed.starts_with('#') {
+            return vec![HighlightSegment {
+                text: line.to_string(),
+                color: 0x79c0ff,
+                bold: true,
+            }];
+        }
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            return vec![
+                HighlightSegment {
+                    text: line.chars().take_while(|ch| ch.is_whitespace()).collect(),
+                    color: 0xd8dee9,
+                    bold: false,
+                },
+                HighlightSegment {
+                    text: trimmed.chars().take(1).collect(),
+                    color: 0xe3b341,
+                    bold: true,
+                },
+                HighlightSegment {
+                    text: trimmed.chars().skip(1).collect(),
+                    color: 0xd8dee9,
+                    bold: false,
+                },
+            ];
+        }
+
+        vec![HighlightSegment {
+            text: line.to_string(),
+            color: 0xd8dee9,
+            bold: false,
+        }]
+    }
+
+    fn highlight_html_line(line: &str) -> Vec<HighlightSegment> {
+        if let Some(comment_start) = line.find("<!--")
+            && let Some(comment_end) = line[comment_start..].find("-->")
+        {
+            let comment_end = comment_start + comment_end + 3;
+            let mut head = Self::highlight_html_line(&line[..comment_start]);
+            head.push(HighlightSegment {
+                text: line[comment_start..comment_end].to_string(),
+                color: 0x6a9955,
+                bold: false,
+            });
+            if comment_end < line.len() {
+                head.extend(Self::highlight_html_line(&line[comment_end..]));
+            }
+            return head;
+        }
+
+        let mut segments = Vec::new();
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '<' {
+                let start = index;
+                index += 1;
+                while index < chars.len() && !chars[index].is_whitespace() && chars[index] != '>' {
+                    index += 1;
+                }
+                segments.push(HighlightSegment {
+                    text: chars[start..index].iter().collect(),
+                    color: 0x79c0ff,
+                    bold: true,
+                });
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                let quote = ch;
+                let start = index;
+                index += 1;
+                while index < chars.len() {
+                    let current = chars[index];
+                    index += 1;
+                    if current == quote {
+                        break;
+                    }
+                }
+                segments.push(HighlightSegment {
+                    text: chars[start..index].iter().collect(),
+                    color: 0xce9178,
+                    bold: false,
+                });
+                continue;
+            }
+            if ch.is_ascii_alphabetic() || ch == '-' {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index].is_ascii_alphanumeric() || matches!(chars[index], '-' | '_'))
+                {
+                    index += 1;
+                }
+                let token: String = chars[start..index].iter().collect();
+                let is_attr = index < chars.len() && chars[index] == '=';
+                segments.push(HighlightSegment {
+                    text: token,
+                    color: if is_attr { 0x9cdcfe } else { 0xd8dee9 },
+                    bold: is_attr,
+                });
+                continue;
+            }
+            segments.push(HighlightSegment {
+                text: ch.to_string(),
+                color: 0x8b949e,
+                bold: false,
+            });
+            index += 1;
+        }
+
+        segments
+    }
+
+    fn highlight_code_like_line(line: &str, language: PreviewLanguage) -> Vec<HighlightSegment> {
+        let comment_prefix = match language {
+            PreviewLanguage::Rust | PreviewLanguage::JavaScript | PreviewLanguage::TypeScript => {
+                Some("//")
+            }
+            PreviewLanguage::Toml
+            | PreviewLanguage::Yaml
+            | PreviewLanguage::Shell
+            | PreviewLanguage::Python
+            | PreviewLanguage::Dockerfile => Some("#"),
+            PreviewLanguage::Sql => Some("--"),
+            _ => None,
+        };
+
+        if let Some(prefix) = comment_prefix
+            && let Some(index) = line.find(prefix)
+        {
+            let mut head = Self::highlight_code_like_line(&line[..index], language);
+            head.push(HighlightSegment {
+                text: line[index..].to_string(),
+                color: 0x6a9955,
+                bold: false,
+            });
+            return head;
+        }
+
+        let keywords: &[&str] = match language {
+            PreviewLanguage::Rust => &[
+                "fn", "let", "mut", "pub", "struct", "enum", "impl", "match", "if", "else", "use",
+                "mod", "self", "Self", "return",
+            ],
+            PreviewLanguage::Json => &["true", "false", "null"],
+            PreviewLanguage::Toml | PreviewLanguage::Yaml => &["true", "false"],
+            PreviewLanguage::Shell | PreviewLanguage::Dockerfile => &[
+                "if",
+                "then",
+                "else",
+                "fi",
+                "for",
+                "do",
+                "done",
+                "case",
+                "from",
+                "run",
+                "copy",
+                "workdir",
+                "env",
+                "cmd",
+                "entrypoint",
+                "expose",
+                "arg",
+            ],
+            PreviewLanguage::JavaScript
+            | PreviewLanguage::TypeScript
+            | PreviewLanguage::JavaScriptReact
+            | PreviewLanguage::TypeScriptReact => &[
+                "const",
+                "let",
+                "function",
+                "return",
+                "if",
+                "else",
+                "import",
+                "from",
+                "export",
+                "class",
+                "extends",
+                "interface",
+                "type",
+                "async",
+                "await",
+                "props",
+            ],
+            PreviewLanguage::Css => &[
+                "display",
+                "position",
+                "color",
+                "background",
+                "padding",
+                "margin",
+                "gap",
+                "flex",
+                "grid",
+                "width",
+                "height",
+            ],
+            PreviewLanguage::Sql => &[
+                "select", "from", "where", "insert", "into", "update", "delete", "join", "left",
+                "right", "inner", "outer", "group", "by", "order", "limit", "and", "or", "as",
+                "on",
+            ],
+            PreviewLanguage::Python => &[
+                "def", "class", "return", "if", "elif", "else", "for", "while", "in", "import",
+                "from", "try", "except", "with", "as", "pass", "None", "True", "False",
+            ],
+            PreviewLanguage::Go => &[
+                "func",
+                "package",
+                "import",
+                "return",
+                "if",
+                "else",
+                "for",
+                "range",
+                "go",
+                "defer",
+                "struct",
+                "type",
+                "interface",
+                "map",
+                "var",
+                "const",
+            ],
+            PreviewLanguage::Markdown | PreviewLanguage::PlainText => &[],
+            PreviewLanguage::Html => &[],
+        };
+
+        let mut segments = Vec::new();
+        let chars: Vec<char> = line.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch.is_whitespace() {
+                let start = index;
+                while index < chars.len() && chars[index].is_whitespace() {
+                    index += 1;
+                }
+                segments.push(HighlightSegment {
+                    text: chars[start..index].iter().collect(),
+                    color: 0xd8dee9,
+                    bold: false,
+                });
+                continue;
+            }
+
+            if ch == '"' || ch == '\'' {
+                let quote = ch;
+                let start = index;
+                index += 1;
+                while index < chars.len() {
+                    let current = chars[index];
+                    index += 1;
+                    if current == '\\' && index < chars.len() {
+                        index += 1;
+                        continue;
+                    }
+                    if current == quote {
+                        break;
+                    }
+                }
+                segments.push(HighlightSegment {
+                    text: chars[start..index].iter().collect(),
+                    color: 0xce9178,
+                    bold: false,
+                });
+                continue;
+            }
+
+            if ch.is_ascii_digit() {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index].is_ascii_digit() || matches!(chars[index], '.' | '_'))
+                {
+                    index += 1;
+                }
+                segments.push(HighlightSegment {
+                    text: chars[start..index].iter().collect(),
+                    color: 0xb5cea8,
+                    bold: false,
+                });
+                continue;
+            }
+
+            if ch.is_ascii_alphabetic() || ch == '_' || ch == '$' {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index].is_ascii_alphanumeric()
+                        || matches!(chars[index], '_' | '-' | '$'))
+                {
+                    index += 1;
+                }
+                let word: String = chars[start..index].iter().collect();
+                let lower_word = word.to_ascii_lowercase();
+                let is_keyword = keywords.iter().any(|keyword| *keyword == lower_word);
+                segments.push(HighlightSegment {
+                    text: word,
+                    color: if is_keyword { 0x79c0ff } else { 0xd8dee9 },
+                    bold: is_keyword,
+                });
+                continue;
+            }
+
+            segments.push(HighlightSegment {
+                text: ch.to_string(),
+                color: 0x8b949e,
+                bold: false,
+            });
+            index += 1;
+        }
+
+        segments
+    }
+
+    pub fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !matches!(self.mode, TabViewMode::Terminal) {
+            return;
+        }
+
+        let root = expand_tilde(&self.current_path);
+        self.file_preview = Some(Self::build_file_preview_state(&path, Some(root.as_path())));
+        self.preview_active_line = Some(0);
+        self.clear_preview_selection();
+        self.focus_preview();
+        self.file_preview_mode = FilePreviewMode::Code;
+        cx.notify();
+    }
+
+    fn close_file_preview(&mut self, cx: &mut Context<Self>) {
+        self.file_preview = None;
+        self.preview_active_line = None;
+        self.clear_preview_selection();
+        self.blur_preview();
+        self.file_preview_mode = FilePreviewMode::Code;
+        cx.notify();
+    }
+
+    fn toggle_file_preview_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.file_preview.as_ref() else {
+            return;
+        };
+        if !Self::preview_supports_rendered_markdown(preview) {
+            return;
+        }
+
+        self.file_preview_mode = match self.file_preview_mode {
+            FilePreviewMode::Code => FilePreviewMode::Preview,
+            FilePreviewMode::Preview => FilePreviewMode::Code,
+        };
+        self.preview_selecting = false;
+        cx.notify();
     }
 
     pub fn set_recent(&mut self, recent: Vec<RecentEntry>, cx: &mut Context<Self>) {
@@ -1123,6 +1988,411 @@ impl TabView {
             let _ = settings.update(cx, |view, cx| {
                 view.set_active_section(section, cx);
             });
+        }
+    }
+
+    fn render_file_preview(&self, preview: &FilePreviewState, cx: &Context<Self>) -> Div {
+        let file_name = preview
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| preview.path.to_string_lossy().to_string());
+        let close_handle = cx.entity().downgrade();
+        let language_label = Self::preview_language_label(preview.language);
+        let supports_markdown_preview = Self::preview_supports_rendered_markdown(preview);
+        let show_rendered_preview =
+            supports_markdown_preview && self.file_preview_mode == FilePreviewMode::Preview;
+        let markdown_toggle: AnyElement = if supports_markdown_preview {
+            div()
+                .size(px(28.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(if show_rendered_preview {
+                    rgb(0x162235)
+                } else {
+                    rgb(0x121212)
+                })
+                .border_1()
+                .border_color(if show_rendered_preview {
+                    rgb(0x2f4f7a)
+                } else {
+                    rgb(0x2a2a2a)
+                })
+                .hover(|style| style.bg(rgb(0x1a1f2a)).border_color(rgb(0x3a3a3a)))
+                .child(
+                    lucide_icon(
+                        if show_rendered_preview {
+                            Icon::EyeOff
+                        } else {
+                            Icon::Eye
+                        },
+                        14.0,
+                        if show_rendered_preview {
+                            0x8fb7ff
+                        } else {
+                            0x9a9a9a
+                        },
+                    )
+                    .cursor(CursorStyle::PointingHand),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::on_toggle_file_preview_mode),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        let body: AnyElement = if show_rendered_preview {
+            match &preview.kind {
+                FilePreviewKind::Text { contents } => div()
+                    .id("file_preview_markdown")
+                    .track_scroll(&self.preview_scroll_handle)
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_focus))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(12.0))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .min_w(px(0.0))
+                    .p(px(20.0))
+                    .child(
+                        div()
+                            .max_w(px(960.0))
+                            .min_h(px(0.0))
+                            .min_w(px(0.0))
+                            .pr(px(24.0))
+                            .child(render_markdown_response_content(contents, false)),
+                    )
+                    .into_any_element(),
+                _ => div().into_any_element(),
+            }
+        } else {
+            match &preview.kind {
+                FilePreviewKind::Text { contents } => {
+                    let lines: Vec<String> =
+                        contents.lines().map(|line| line.to_string()).collect();
+                    div()
+                        .id("file_preview_text")
+                        .track_scroll(&self.preview_scroll_handle)
+                        .flex()
+                        .flex_col()
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_focus))
+                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+                        .overflow_y_scroll()
+                        .scrollbar_width(px(12.0))
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .min_w(px(0.0))
+                        .p(px(16.0))
+                        .children(lines.into_iter().enumerate().map(|(index, line)| {
+                            let segments = Self::highlight_line(&line, preview.language);
+                            let is_selected = self.is_preview_line_selected(index);
+                            let mut row = div()
+                                .flex()
+                                .items_start()
+                                .gap(px(12.0))
+                                .cursor(CursorStyle::IBeam)
+                                .child(
+                                    div()
+                                        .w(px(44.0))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(if is_selected {
+                                            0xbdd9ff
+                                        } else {
+                                            0x5f6b7a
+                                        }))
+                                        .font_family("Cascadia Code")
+                                        .child((index + 1).to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(0.0))
+                                        .text_size(px(12.0))
+                                        .font_family("Cascadia Code")
+                                        .whitespace_nowrap()
+                                        .children(if segments.is_empty() {
+                                            vec![
+                                                div()
+                                                    .text_color(rgb(0xd8dee9))
+                                                    .child(" ")
+                                                    .into_any_element(),
+                                            ]
+                                        } else {
+                                            segments
+                                                .into_iter()
+                                                .map(|segment| {
+                                                    let mut span = div()
+                                                        .text_color(rgb(segment.color))
+                                                        .child(segment.text);
+                                                    if segment.bold {
+                                                        span = span.font_weight(FontWeight::BOLD);
+                                                    }
+                                                    span.into_any_element()
+                                                })
+                                                .collect::<Vec<_>>()
+                                        }),
+                                );
+
+                            row = row
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        move |view, event: &MouseDownEvent, _window, cx| {
+                                            view.on_preview_line_mouse_down_at(index, event, cx);
+                                        },
+                                    ),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    move |view, event: &MouseMoveEvent, _window, cx| {
+                                        view.on_preview_line_mouse_move_at(index, event, cx);
+                                    },
+                                ));
+
+                            if is_selected {
+                                row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
+                            }
+
+                            row
+                        }))
+                        .into_any_element()
+                }
+                FilePreviewKind::Image => div()
+                    .id("file_preview_image")
+                    .track_scroll(&self.preview_scroll_handle)
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(12.0))
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .min_w(px(0.0))
+                    .p(px(20.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .min_h(px(0.0))
+                            .child(
+                                img(preview.path.clone())
+                                    .object_fit(ObjectFit::Contain)
+                                    .with_fallback(|| {
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(0xff7b72))
+                                            .child("Failed to render image.")
+                                            .into_any_element()
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+                FilePreviewKind::Unsupported { message } => div()
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x8a97a8))
+                            .child(message.clone()),
+                    )
+                    .into_any_element(),
+            }
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .bg(rgb(0x0a0a0a))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .border_b_1()
+                    .border_color(rgb(0x1f1f1f))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0xf0f0f0))
+                                    .child(file_name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x7f8b99))
+                                    .child(preview.relative_label.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(markdown_toggle)
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(999.0))
+                                    .bg(rgb(0x121826))
+                                    .border_1()
+                                    .border_color(rgb(0x26324d))
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8fb7ff))
+                                    .child(language_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(0x121212))
+                            .border_1()
+                            .border_color(rgb(0x2a2a2a))
+                            .hover(|style| style.bg(rgb(0x1a1a1a)).border_color(rgb(0x3a3a3a)))
+                            .child(
+                                lucide_icon(Icon::X, 14.0, 0x9a9a9a)
+                                    .cursor(CursorStyle::PointingHand),
+                            )
+                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                cx.stop_propagation();
+                                let _ = close_handle.update(cx, |view, cx| {
+                                    view.close_file_preview(cx);
+                                });
+                            }),
+                    ),
+            )
+            .child(body)
+    }
+
+    fn render_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let _ = window;
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .relative()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .relative()
+                    .child(
+                        div()
+                            .p(px(16.0))
+                            .id("terminal_output")
+                            .track_scroll(&self.scroll_handle)
+                            .on_scroll_wheel(cx.listener(Self::on_output_scroll_wheel))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_output_mouse_up))
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(Self::on_output_mouse_up),
+                            )
+                            .overflow_scroll()
+                            .scrollbar_width(px(16.0))
+                            .size_full()
+                            .font_family("Cascadia Code")
+                            .text_size(px(13.0))
+                            .text_color(rgb(0xcccccc))
+                            .child({
+                                let active_index = self.blocks.len().saturating_sub(1);
+                                let blocks: Vec<Div> = self
+                                    .blocks
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, block)| self.render_block(block, i, active_index, cx))
+                                    .collect();
+                                div()
+                                    .flex_col()
+                                    .gap(px(0.0))
+                                    .min_h(px(0.0))
+                                    .children(blocks)
+                            }),
+                    )
+                    .child(if self.follow_output {
+                        div()
+                    } else {
+                        self.render_jump_to_bottom(cx)
+                    }),
+            )
+            .child(self.render_overlay(cx));
+
+        if self.input_visible {
+            panel = panel.child(
+                div()
+                    .flex_none()
+                    .child(self.render_history_menu_container())
+                    .child(
+                        div()
+                            .px(px(16.0))
+                            .pb(px(12.0))
+                            .child(self.render_input_bar(window, cx)),
+                    ),
+            );
+        }
+
+        panel
+    }
+
+    fn render_terminal_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        if let Some(preview) = self.file_preview.clone() {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(self.render_file_preview(&preview, cx)),
+                )
+                .child(div().h(px(1.0)).bg(rgb(0x1f1f1f)))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(260.0))
+                        .min_h(px(180.0))
+                        .bg(rgb(0x0a0a0a))
+                        .child(self.render_terminal_panel(window, cx)),
+                )
+        } else {
+            self.render_terminal_panel(window, cx)
         }
     }
 
@@ -1200,6 +2470,10 @@ impl TabView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_overlay_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_preview_key(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1418,7 +2692,20 @@ impl TabView {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        self.blur_preview();
         window.focus(&self.focus_handle);
+    }
+
+    fn on_preview_focus(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_preview();
+        window.focus(&self.focus_handle);
+        cx.notify();
+        cx.stop_propagation();
     }
 
     fn on_open_path_picker(
@@ -5158,69 +6445,7 @@ impl Render for TabView {
                 .focusable()
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::on_focus_input))
-                .child(
-                    // Terminal output area
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .relative()
-                        .child(
-                            div()
-                                .p(px(16.0))
-                                .id("terminal_output")
-                                .track_scroll(&self.scroll_handle)
-                                .on_scroll_wheel(cx.listener(Self::on_output_scroll_wheel))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(Self::on_output_mouse_up),
-                                )
-                                .on_mouse_up_out(
-                                    MouseButton::Left,
-                                    cx.listener(Self::on_output_mouse_up),
-                                )
-                                .overflow_scroll()
-                                .scrollbar_width(px(16.0))
-                                .size_full()
-                                .font_family("Cascadia Code")
-                                .text_size(px(13.0))
-                                .text_color(rgb(0xcccccc))
-                                .child({
-                                    let active_index = self.blocks.len().saturating_sub(1);
-                                    let blocks: Vec<Div> = self
-                                        .blocks
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, block)| {
-                                            self.render_block(block, i, active_index, cx)
-                                        })
-                                        .collect();
-                                    div()
-                                        .flex_col()
-                                        .gap(px(0.0))
-                                        .min_h(px(0.0))
-                                        .children(blocks)
-                                }),
-                        )
-                        .child(if self.follow_output {
-                            div()
-                        } else {
-                            self.render_jump_to_bottom(cx)
-                        }),
-                )
-                .child(self.render_overlay(cx))
-                .child(if self.input_visible {
-                    div()
-                        .flex_none()
-                        .child(self.render_history_menu_container())
-                        .child(
-                            div()
-                                .px(px(16.0))
-                                .pb(px(12.0))
-                                .child(self.render_input_bar(window, cx)),
-                        )
-                } else {
-                    div().h(px(0.0))
-                });
+                .child(self.render_terminal_workspace(window, cx));
         } else if let TabViewMode::Welcome(ref welcome) = self.mode {
             root = root.child(div().flex_1().min_h(px(0.0)).child(welcome.clone()));
         } else if let TabViewMode::Agent(ref agent) = self.mode {
@@ -5995,21 +7220,24 @@ impl EventEmitter<TabViewEvent> for TabView {}
 mod tests {
     use super::{
         AGENT_CONNECTING_PLACEHOLDER, AGENT_SENDING_PROMPT_PLACEHOLDER, AgentStreamOp, Block,
-        InitialFocusTarget, MarkdownBlock, MarkdownInlineSegment, ModelButtonState,
-        PermissionDecision, PermissionRequest, PickerKind, PickerQueryState, TabView,
-        append_agent_stream_delta, append_output_batch_to_block, build_agent_picker_state,
-        build_model_picker_state, classify_agent_stream_op, clickable_cursor, compute_row_state,
-        compute_trigger_state, extract_compact_list_items, model_trigger_label,
-        parse_markdown_blocks, parse_markdown_inline, picker_has_search_input,
-        picker_header_is_static, picker_initial_focus_target, picker_typeahead_enabled,
-        renderable_output_window, replace_agent_stream_snapshot, streaming_snapshot_delta,
-        text_input_cursor, update_agent_placeholder_block, wrap_terminal_line,
-        wrap_terminal_text_lines,
+        FilePreviewKind, FilePreviewState, InitialFocusTarget, MarkdownBlock,
+        MarkdownInlineSegment, ModelButtonState, PermissionDecision, PermissionRequest, PickerKind,
+        PickerQueryState, PreviewLanguage, TabView, append_agent_stream_delta,
+        append_output_batch_to_block, build_agent_picker_state, build_model_picker_state,
+        classify_agent_stream_op, clickable_cursor, compute_row_state, compute_trigger_state,
+        extract_compact_list_items, model_trigger_label, parse_markdown_blocks,
+        parse_markdown_inline, picker_has_search_input, picker_header_is_static,
+        picker_initial_focus_target, picker_typeahead_enabled, renderable_output_window,
+        replace_agent_stream_snapshot, streaming_snapshot_delta, text_input_cursor,
+        update_agent_placeholder_block, wrap_terminal_line, wrap_terminal_text_lines,
     };
     use crate::acp::manager::AgentSpec;
     use crate::acp::model_discovery::AcpModelOption;
     use crate::acp::resolve::{AgentKey, AgentSourceKind, EffectiveAgentRow};
-    use gpui::CursorStyle;
+    use gpui::{CursorStyle, ScrollDelta, point, px};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
 
     fn row(id: &str, name: &str) -> EffectiveAgentRow {
         EffectiveAgentRow {
@@ -6047,6 +7275,214 @@ mod tests {
         assert_eq!(picker.selected, 0);
         assert_eq!(picker.options.len(), 2);
         assert_eq!(picker.options[0].acp_id, "codex");
+    }
+
+    #[test]
+    fn file_preview_uses_workspace_relative_label_for_text_files() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("workspace");
+        let nested = root.join("docs");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let file_path = nested.join("README.md");
+        fs::write(&file_path, "# OrbitShell\n").expect("write text file");
+
+        let preview = TabView::build_file_preview_state(&file_path, Some(root.as_path()));
+
+        assert_eq!(preview.relative_label, "docs/README.md");
+        match preview.kind {
+            FilePreviewKind::Text { contents } => assert_eq!(contents, "# OrbitShell\n"),
+            other => panic!(
+                "expected text preview, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn file_preview_marks_binary_files_as_unsupported() {
+        let temp = tempdir().expect("temp dir");
+        let file_path = temp.path().join("data.bin");
+        fs::write(&file_path, [0_u8, 159, 146, 150]).expect("write binary file");
+
+        let preview = TabView::build_file_preview_state(&file_path, Some(temp.path()));
+
+        assert_eq!(preview.relative_label, "data.bin");
+        match preview.kind {
+            FilePreviewKind::Unsupported { message } => {
+                assert!(message.contains("Binary file preview"));
+            }
+            other => panic!(
+                "expected unsupported preview, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn detect_preview_language_uses_extension_and_special_filenames() {
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/src/main.rs")),
+            PreviewLanguage::Rust
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/Cargo.toml")),
+            PreviewLanguage::Toml
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/.gitignore")),
+            PreviewLanguage::PlainText
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/readme.md")),
+            PreviewLanguage::Markdown
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/app.tsx")),
+            PreviewLanguage::TypeScriptReact
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/component.jsx")),
+            PreviewLanguage::JavaScriptReact
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/index.html")),
+            PreviewLanguage::Html
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/site.css")),
+            PreviewLanguage::Css
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/query.sql")),
+            PreviewLanguage::Sql
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/main.py")),
+            PreviewLanguage::Python
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/main.go")),
+            PreviewLanguage::Go
+        );
+        assert_eq!(
+            TabView::detect_preview_language(Path::new("/tmp/Dockerfile")),
+            PreviewLanguage::Dockerfile
+        );
+    }
+
+    #[test]
+    fn rust_highlight_marks_keywords_strings_and_comments() {
+        let segments = TabView::highlight_line(
+            "fn main() { let name = \"Orbit\"; // comment }",
+            PreviewLanguage::Rust,
+        );
+        let rendered = segments
+            .iter()
+            .map(|segment| (segment.text.as_str(), segment.color))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|(text, _)| *text == "fn"));
+        assert!(rendered.iter().any(|(text, _)| *text == "\"Orbit\""));
+        assert!(
+            rendered
+                .iter()
+                .any(|(text, _)| text.starts_with("// comment"))
+        );
+    }
+
+    #[test]
+    fn html_highlight_marks_tags_strings_and_comments() {
+        let segments = TabView::highlight_line(
+            "<div class=\"hero\">Hello</div><!-- note -->",
+            PreviewLanguage::Html,
+        );
+        let rendered = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|text| *text == "<div"));
+        assert!(rendered.iter().any(|text| *text == "\"hero\""));
+        assert!(
+            rendered
+                .iter()
+                .any(|text| text.starts_with("<!-- note -->"))
+        );
+    }
+
+    #[test]
+    fn python_highlight_marks_keywords_numbers_and_comments() {
+        let segments = TabView::highlight_line(
+            "def load(path): return 42  # comment",
+            PreviewLanguage::Python,
+        );
+        let rendered = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|text| *text == "def"));
+        assert!(rendered.iter().any(|text| *text == "return"));
+        assert!(rendered.iter().any(|text| *text == "42"));
+        assert!(rendered.iter().any(|text| text.starts_with("# comment")));
+    }
+
+    #[test]
+    fn preview_select_all_collects_all_lines_for_copy() {
+        let lines = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        assert_eq!(
+            TabView::selected_text_from_lines(&lines, Some(0), Some(2)).as_deref(),
+            Some("first\nsecond\nthird")
+        );
+    }
+
+    #[test]
+    fn preview_keyboard_selection_expands_from_active_line() {
+        let (active_line, anchor, head) =
+            TabView::move_linear_selection(3, Some(0), Some(0), Some(0), 1, true);
+
+        assert_eq!(active_line, Some(1));
+        assert_eq!(
+            TabView::normalize_linear_selection(anchor, head),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn markdown_preview_support_depends_on_language_and_text_kind() {
+        let markdown = FilePreviewState {
+            path: PathBuf::from("/tmp/README.md"),
+            relative_label: "README.md".into(),
+            language: PreviewLanguage::Markdown,
+            kind: FilePreviewKind::Text {
+                contents: "# Title".into(),
+            },
+        };
+        let rust = FilePreviewState {
+            path: PathBuf::from("/tmp/main.rs"),
+            relative_label: "main.rs".into(),
+            language: PreviewLanguage::Rust,
+            kind: FilePreviewKind::Text {
+                contents: "fn main() {}".into(),
+            },
+        };
+
+        assert!(TabView::preview_supports_rendered_markdown(&markdown));
+        assert!(!TabView::preview_supports_rendered_markdown(&rust));
+    }
+
+    #[test]
+    fn preview_scroll_uses_native_handling_for_all_input() {
+        assert!(!TabView::preview_scroll_uses_custom_step(
+            ScrollDelta::Lines(point(0.0, 1.0))
+        ));
+        assert!(!TabView::preview_scroll_uses_custom_step(
+            ScrollDelta::Pixels(point(px(0.0), px(16.0),))
+        ));
     }
 
     #[test]
