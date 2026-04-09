@@ -2418,8 +2418,9 @@ impl TabView {
         let mut panel = div()
             .flex()
             .flex_col()
-            .flex_1()
+            .size_full()
             .min_h(px(0.0))
+            .min_w(px(0.0))
             .relative()
             .child(
                 div()
@@ -2540,8 +2541,9 @@ impl TabView {
                         .flex_none()
                         .h(px(terminal_height))
                         .min_h(px(180.0))
+                        .min_w(px(0.0))
                         .bg(rgb(0x0a0a0a))
-                        .child(self.render_terminal_panel(window, cx)),
+                        .child(self.render_terminal_panel(window, cx).size_full()),
                 )
         } else {
             self.render_terminal_panel(window, cx)
@@ -6089,7 +6091,35 @@ impl TabView {
 
     fn is_prompt_line(line: &str) -> bool {
         let trimmed = line.trim();
-        trimmed.starts_with("PS ") && trimmed.ends_with('>')
+        if trimmed.starts_with("PS ") && trimmed.ends_with('>') {
+            return true;
+        }
+
+        let Some(prompt_char) = trimmed.chars().last() else {
+            return false;
+        };
+        if !matches!(prompt_char, '$' | '#' | '%') {
+            return false;
+        }
+
+        let body = trimmed[..trimmed.len() - prompt_char.len_utf8()].trim_end();
+        if body.is_empty() {
+            return false;
+        }
+
+        if body.contains('@') && body.contains(':') {
+            return true;
+        }
+
+        let looks_like_path = body.starts_with("~/")
+            || body.starts_with('/')
+            || body.starts_with("./")
+            || body.starts_with("../");
+        if looks_like_path && !body.contains(char::is_whitespace) {
+            return true;
+        }
+
+        false
     }
 
     fn should_skip_output_line(&mut self, line: &str) -> bool {
@@ -7435,6 +7465,22 @@ mod tests {
         assert_eq!(TabView::clamp_preview_terminal_height(120.0), 180.0);
         assert_eq!(TabView::clamp_preview_terminal_height(260.0), 260.0);
         assert_eq!(TabView::clamp_preview_terminal_height(720.0), 520.0);
+    }
+
+    #[test]
+    fn prompt_detection_supports_powershell_and_posix_shells() {
+        assert!(TabView::is_prompt_line("PS C:\\repo>"));
+        assert!(TabView::is_prompt_line(
+            "carlos@carlos-960XFH:~/projects/sympla/white-lion$"
+        ));
+        assert!(TabView::is_prompt_line("~/projects/OrbitShell$"));
+    }
+
+    #[test]
+    fn prompt_detection_ignores_regular_output_lines() {
+        assert!(!TabView::is_prompt_line("Downloads: $120"));
+        assert!(!TabView::is_prompt_line("assets docs packages"));
+        assert!(!TabView::is_prompt_line("error code #42"));
     }
 
     #[test]
