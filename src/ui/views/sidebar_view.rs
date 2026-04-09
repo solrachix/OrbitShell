@@ -99,6 +99,8 @@ enum SidebarMode {
 
 pub struct OpenFileEvent {
     pub path: PathBuf,
+    pub line: Option<usize>,
+    pub query: Option<String>,
 }
 
 pub struct SidebarView {
@@ -241,7 +243,25 @@ impl SidebarView {
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        cx.emit(OpenFileEvent { path });
+        cx.emit(OpenFileEvent {
+            path,
+            line: None,
+            query: None,
+        });
+    }
+
+    fn open_search_result(
+        &mut self,
+        path: PathBuf,
+        line: usize,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(OpenFileEvent {
+            path,
+            line: Some(line),
+            query: Some(query),
+        });
     }
 
     fn render_entry(&self, entry: &FileEntry, depth: usize, cx: &Context<Self>) -> Div {
@@ -885,6 +905,7 @@ impl SidebarView {
 
                         let handle = handle.clone();
                         let file_path = path.clone();
+                        let toggle_handle = handle.clone();
 
                         let mut file_header = div()
                             .flex()
@@ -903,7 +924,7 @@ impl SidebarView {
                                     .border_color(rgb(sidebar_row_hover_border()))
                             })
                             .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                                let _ = handle.update(cx, |v, cx| {
+                                let _ = toggle_handle.update(cx, |v, cx| {
                                     v.toggle_search_file(&file_path, cx);
                                 });
                             })
@@ -985,6 +1006,10 @@ impl SidebarView {
                                         let text = r.text.clone();
                                         let (pre, mid, post) =
                                             split_match(&text, &self.search_query);
+                                        let open_handle = handle.clone();
+                                        let open_path = r.path.clone();
+                                        let open_line = r.line;
+                                        let open_query = self.search_query.clone();
                                         div()
                                             .flex()
                                             .items_center()
@@ -1000,6 +1025,16 @@ impl SidebarView {
                                                 style
                                                     .bg(rgb(0x101010))
                                                     .border_color(rgb(sidebar_row_hover_border()))
+                                            })
+                                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                                let _ = open_handle.update(cx, |view, cx| {
+                                                    view.open_search_result(
+                                                        open_path.clone(),
+                                                        open_line,
+                                                        open_query.clone(),
+                                                        cx,
+                                                    );
+                                                });
                                             })
                                             .child(
                                                 div()

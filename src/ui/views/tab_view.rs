@@ -86,6 +86,7 @@ pub struct TabView {
     output_selection_head: Option<(usize, usize)>,
     output_selecting: bool,
     file_preview: Option<FilePreviewState>,
+    preview_search_match: Option<PreviewSearchMatch>,
     preview_code_scroll_handle: UniformListScrollHandle,
     preview_focus: bool,
     preview_selection_anchor: Option<usize>,
@@ -529,6 +530,20 @@ struct HighlightSegment {
     text: String,
     color: u32,
     bold: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewSearchMatch {
+    line_index: usize,
+    query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewSearchMatchSegment {
+    text: String,
+    color: u32,
+    bold: bool,
+    matched: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1135,6 +1150,13 @@ impl TabView {
         cx: &mut Context<Self>,
     ) {
         self.focus_preview();
+        if self
+            .preview_search_match
+            .as_ref()
+            .is_some_and(|search_match| search_match.line_index != line_index)
+        {
+            self.preview_search_match = None;
+        }
         if event.modifiers.shift {
             if self.preview_selection_anchor.is_none() {
                 self.preview_selection_anchor =
@@ -1252,6 +1274,95 @@ impl TabView {
         self.preview_selection_head = Some(count.saturating_sub(1));
         self.preview_active_line = Some(count.saturating_sub(1));
         true
+    }
+
+    fn build_preview_search_match(
+        line_number: usize,
+        query: &str,
+        line_count: usize,
+    ) -> Option<(usize, String)> {
+        let trimmed = query.trim();
+        if line_number == 0 || trimmed.is_empty() || line_count == 0 {
+            return None;
+        }
+
+        Some((line_number.saturating_sub(1).min(line_count - 1), trimmed.to_string()))
+    }
+
+    fn apply_preview_search_match_segments(
+        segments: &[HighlightSegment],
+        query: &str,
+    ) -> Vec<PreviewSearchMatchSegment> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return segments
+                .iter()
+                .map(|segment| PreviewSearchMatchSegment {
+                    text: segment.text.clone(),
+                    color: segment.color,
+                    bold: segment.bold,
+                    matched: false,
+                })
+                .collect();
+        }
+
+        let mut rendered = Vec::new();
+        let query_lower = trimmed.to_ascii_lowercase();
+
+        for segment in segments {
+            if segment.text.is_empty() {
+                continue;
+            }
+
+            let text = segment.text.as_str();
+            let text_lower = text.to_ascii_lowercase();
+            let mut search_from = 0usize;
+
+            while let Some(found_at) = text_lower[search_from..].find(&query_lower) {
+                let match_start = search_from + found_at;
+                let match_end = match_start + trimmed.len();
+
+                if match_start > search_from {
+                    rendered.push(PreviewSearchMatchSegment {
+                        text: text[search_from..match_start].to_string(),
+                        color: segment.color,
+                        bold: segment.bold,
+                        matched: false,
+                    });
+                }
+
+                rendered.push(PreviewSearchMatchSegment {
+                    text: text[match_start..match_end].to_string(),
+                    color: segment.color,
+                    bold: segment.bold,
+                    matched: true,
+                });
+                search_from = match_end;
+            }
+
+            if search_from < text.len() {
+                rendered.push(PreviewSearchMatchSegment {
+                    text: text[search_from..].to_string(),
+                    color: segment.color,
+                    bold: segment.bold,
+                    matched: false,
+                });
+            }
+        }
+
+        if rendered.is_empty() {
+            segments
+                .iter()
+                .map(|segment| PreviewSearchMatchSegment {
+                    text: segment.text.clone(),
+                    color: segment.color,
+                    bold: segment.bold,
+                    matched: false,
+                })
+                .collect()
+        } else {
+            rendered
+        }
     }
 
     fn move_preview_selection_by(&mut self, delta: isize, extend: bool) -> bool {
@@ -1525,6 +1636,7 @@ impl TabView {
             output_selection_head: None,
             output_selecting: false,
             file_preview: None,
+            preview_search_match: None,
             preview_focus: false,
             preview_selection_anchor: None,
             preview_selection_head: None,
@@ -2024,7 +2136,48 @@ impl TabView {
         self.preview_terminal_resize_dragging = false;
         self.preview_terminal_resize_start_y = None;
         self.preview_terminal_resize_start_height = self.preview_terminal_height;
+        self.preview_search_match = None;
         self.preview_active_line = Some(0);
+        self.clear_preview_selection();
+        self.focus_preview();
+        self.file_preview_mode = FilePreviewMode::Code;
+        cx.notify();
+    }
+
+    pub fn open_file_preview_at_search_result(
+        &mut self,
+        path: PathBuf,
+        line_number: usize,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.mode, TabViewMode::Terminal) {
+            return;
+        }
+
+        let root = expand_tilde(&self.current_path);
+        let preview = Self::build_file_preview_state(&path, Some(root.as_path()));
+        let line_count = match &preview.kind {
+            FilePreviewKind::Text { lines, .. } => lines.len(),
+            _ => 0,
+        };
+        let preview_search_match = Self::build_preview_search_match(line_number, &query, line_count)
+            .map(|(line_index, query)| PreviewSearchMatch { line_index, query });
+        let active_line = preview_search_match
+            .as_ref()
+            .map(|search_match| search_match.line_index)
+            .unwrap_or(0);
+
+        self.file_preview = Some(preview);
+        self.preview_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        self.preview_code_scroll_handle
+            .scroll_to_item_strict(active_line, ScrollStrategy::Center);
+        self.preview_terminal_resize_dragging = false;
+        self.preview_terminal_resize_start_y = None;
+        self.preview_terminal_resize_start_height = self.preview_terminal_height;
+        self.preview_search_match = preview_search_match;
+        self.preview_active_line = Some(active_line);
         self.clear_preview_selection();
         self.focus_preview();
         self.file_preview_mode = FilePreviewMode::Code;
@@ -2043,6 +2196,7 @@ impl TabView {
         self.preview_terminal_resize_dragging = false;
         self.preview_terminal_resize_start_y = None;
         self.preview_terminal_resize_start_height = self.preview_terminal_height;
+        self.preview_search_match = None;
         self.preview_active_line = None;
         self.clear_preview_selection();
         self.blur_preview();
@@ -2069,14 +2223,31 @@ impl TabView {
     fn render_preview_code_row(
         language: PreviewLanguage,
         selection: Option<(usize, usize)>,
+        active_line: Option<usize>,
+        persistent_match: Option<&PreviewSearchMatch>,
         line: &str,
         index: usize,
         view_handle: &WeakEntity<Self>,
     ) -> Div {
         let segments = Self::highlight_line(line, language);
+        let rendered_segments = persistent_match
+            .filter(|search_match| search_match.line_index == index)
+            .map(|search_match| Self::apply_preview_search_match_segments(&segments, &search_match.query))
+            .unwrap_or_else(|| {
+                segments
+                    .iter()
+                    .map(|segment| PreviewSearchMatchSegment {
+                        text: segment.text.clone(),
+                        color: segment.color,
+                        bold: segment.bold,
+                        matched: false,
+                    })
+                    .collect::<Vec<_>>()
+            });
         let is_selected = selection
             .map(|(start, end)| index >= start && index <= end)
             .unwrap_or(false);
+        let is_active_line = active_line == Some(index);
 
         let mut row = div()
             .h(px(22.0))
@@ -2103,7 +2274,7 @@ impl TabView {
                     .text_size(px(12.0))
                     .font_family("Cascadia Code")
                     .whitespace_nowrap()
-                    .children(if segments.is_empty() {
+                    .children(if rendered_segments.is_empty() {
                         vec![
                             div()
                                 .text_color(rgb(0xd8dee9))
@@ -2111,11 +2282,18 @@ impl TabView {
                                 .into_any_element(),
                         ]
                     } else {
-                        segments
+                        rendered_segments
                             .into_iter()
                             .map(|segment| {
-                                let mut span =
-                                    div().text_color(rgb(segment.color)).child(segment.text);
+                                let mut span = div()
+                                    .text_color(rgb(segment.color))
+                                    .child(segment.text);
+                                if segment.matched {
+                                    span = span
+                                        .px(px(1.0))
+                                        .rounded(px(3.0))
+                                        .bg(rgb(0x5c4a16));
+                                }
                                 if segment.bold {
                                     span = span.font_weight(FontWeight::BOLD);
                                 }
@@ -2141,6 +2319,8 @@ impl TabView {
 
         if is_selected {
             row = row.bg(rgb(0x1a2f4a)).rounded(px(4.0));
+        } else if is_active_line {
+            row = row.bg(rgb(0x122033)).rounded(px(4.0));
         }
 
         row
@@ -2251,6 +2431,8 @@ impl TabView {
                     let lines = Arc::clone(lines);
                     let selection = self.normalize_preview_selection();
                     let language = preview.language;
+                    let active_line = self.preview_active_line;
+                    let persistent_match = self.preview_search_match.clone();
                     div()
                         .id("file_preview_text")
                         .flex()
@@ -2272,6 +2454,8 @@ impl TabView {
                                             Self::render_preview_code_row(
                                                 language,
                                                 selection,
+                                                active_line,
+                                                persistent_match.as_ref(),
                                                 &lines[index],
                                                 index,
                                                 &view_handle,
@@ -7401,16 +7585,17 @@ impl EventEmitter<TabViewEvent> for TabView {}
 mod tests {
     use super::{
         AGENT_CONNECTING_PLACEHOLDER, AGENT_SENDING_PROMPT_PLACEHOLDER, AgentStreamOp, Block,
-        FilePreviewKind, FilePreviewState, InitialFocusTarget, MarkdownBlock,
+        FilePreviewKind, FilePreviewState, HighlightSegment, InitialFocusTarget, MarkdownBlock,
         MarkdownInlineSegment, ModelButtonState, PermissionDecision, PermissionRequest, PickerKind,
-        PickerQueryState, PreviewLanguage, TabView, append_agent_stream_delta,
-        append_output_batch_to_block, build_agent_picker_state, build_model_picker_state,
-        classify_agent_stream_op, clickable_cursor, compute_row_state, compute_trigger_state,
-        extract_compact_list_items, model_trigger_label, parse_markdown_blocks,
-        parse_markdown_inline, picker_has_search_input, picker_header_is_static,
-        picker_initial_focus_target, picker_typeahead_enabled, renderable_output_window,
-        replace_agent_stream_snapshot, streaming_snapshot_delta, text_input_cursor,
-        update_agent_placeholder_block, wrap_terminal_line, wrap_terminal_text_lines,
+        PickerQueryState, PreviewLanguage, PreviewSearchMatchSegment, TabView,
+        append_agent_stream_delta, append_output_batch_to_block, build_agent_picker_state,
+        build_model_picker_state, classify_agent_stream_op, clickable_cursor, compute_row_state,
+        compute_trigger_state, extract_compact_list_items, model_trigger_label,
+        parse_markdown_blocks, parse_markdown_inline, picker_has_search_input,
+        picker_header_is_static, picker_initial_focus_target, picker_typeahead_enabled,
+        renderable_output_window, replace_agent_stream_snapshot, streaming_snapshot_delta,
+        text_input_cursor, update_agent_placeholder_block, wrap_terminal_line,
+        wrap_terminal_text_lines,
     };
     use crate::acp::manager::AgentSpec;
     use crate::acp::model_discovery::AcpModelOption;
@@ -7480,6 +7665,53 @@ mod tests {
         assert!(!TabView::is_prompt_line("Downloads: $120"));
         assert!(!TabView::is_prompt_line("assets docs packages"));
         assert!(!TabView::is_prompt_line("error code #42"));
+    }
+
+    #[test]
+    fn preview_search_match_uses_one_based_line_numbers_and_trimmed_query() {
+        assert_eq!(
+            TabView::build_preview_search_match(5, "  needle  ", 12),
+            Some((4, "needle".to_string()))
+        );
+        assert_eq!(TabView::build_preview_search_match(0, "needle", 12), None);
+        assert_eq!(TabView::build_preview_search_match(3, "   ", 12), None);
+        assert_eq!(
+            TabView::build_preview_search_match(40, "needle", 12),
+            Some((11, "needle".to_string()))
+        );
+    }
+
+    #[test]
+    fn preview_search_match_segments_mark_the_matching_substring() {
+        let segments = vec![HighlightSegment {
+            text: "const needle = haystack".into(),
+            color: 0x79c0ff,
+            bold: false,
+        }];
+
+        assert_eq!(
+            TabView::apply_preview_search_match_segments(&segments, "needle"),
+            vec![
+                PreviewSearchMatchSegment {
+                    text: "const ".into(),
+                    color: 0x79c0ff,
+                    bold: false,
+                    matched: false,
+                },
+                PreviewSearchMatchSegment {
+                    text: "needle".into(),
+                    color: 0x79c0ff,
+                    bold: false,
+                    matched: true,
+                },
+                PreviewSearchMatchSegment {
+                    text: " = haystack".into(),
+                    color: 0x79c0ff,
+                    bold: false,
+                    matched: false,
+                },
+            ]
+        );
     }
 
     #[test]

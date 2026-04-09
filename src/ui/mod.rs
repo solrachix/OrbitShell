@@ -78,7 +78,12 @@ impl Workspace {
         cx.subscribe(
             &workspace.sidebar,
             |workspace, _sidebar, event: &views::sidebar_view::OpenFileEvent, cx| {
-                workspace.open_file_in_active_tab(event.path.clone(), cx);
+                workspace.open_file_in_active_tab(
+                    event.path.clone(),
+                    event.line,
+                    event.query.clone(),
+                    cx,
+                );
             },
         )
         .detach();
@@ -224,13 +229,23 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_file_in_active_tab(&mut self, file_path: PathBuf, cx: &mut Context<Self>) {
+    fn open_file_in_active_tab(
+        &mut self,
+        file_path: PathBuf,
+        line: Option<usize>,
+        query: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
 
         let _ = tab.update(cx, |view, cx| {
-            view.open_file_preview(file_path.clone(), cx);
+            if let (Some(line), Some(query)) = (line, query.clone()) {
+                view.open_file_preview_at_search_result(file_path.clone(), line, query, cx);
+            } else {
+                view.open_file_preview(file_path.clone(), cx);
+            }
         });
     }
 
