@@ -16,7 +16,8 @@ extended-description = """\
 OrbitShell is a local-first desktop terminal experience with block-based output,
 inline file previews, ACP/MCP surfaces, and project-oriented navigation.
 """
-merge-assets = [
+assets = [
+  "$auto",
   ["packaging/linux/orbitshell.desktop", "usr/share/applications/orbitshell.desktop", "644"],
   ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
 ]
