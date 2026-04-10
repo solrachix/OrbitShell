@@ -137,8 +137,7 @@ jobs:
           install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "AppDir/usr/bin/orbitshell"
           install -Dm644 packaging/linux/dev.carlosmiguel.orbitshell.desktop "AppDir/usr/share/applications/dev.carlosmiguel.orbitshell.desktop"
           install -Dm644 packaging/linux/dev.carlosmiguel.orbitshell.metainfo.xml "AppDir/usr/share/metainfo/dev.carlosmiguel.orbitshell.metainfo.xml"
-          convert assets/logomarca.png -resize 512x512 "dist/orbitshell-appimage-icon.png"
-          install -Dm644 "dist/orbitshell-appimage-icon.png" "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png"
+          install -Dm644 packaging/linux/orbitshell-icon.png "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png"
           if [[ ! -f linuxdeploy.AppImage ]]; then
             curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
           fi

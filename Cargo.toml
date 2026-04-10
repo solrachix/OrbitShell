@@ -21,7 +21,7 @@ assets = [
   "$auto",
   ["packaging/linux/dev.carlosmiguel.orbitshell.desktop", "usr/share/applications/dev.carlosmiguel.orbitshell.desktop", "644"],
   ["packaging/linux/dev.carlosmiguel.orbitshell.metainfo.xml", "usr/share/metainfo/dev.carlosmiguel.orbitshell.metainfo.xml", "644"],
-  ["assets/logomarca.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
+  ["packaging/linux/orbitshell-icon.png", "usr/share/icons/hicolor/512x512/apps/orbitshell.png", "644"],
   ["LICENSE", "usr/share/doc/orbitshell/LICENSE", "644"],
 ]
 
