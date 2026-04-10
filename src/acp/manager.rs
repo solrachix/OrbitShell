@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+use crate::acp::install::runner::launch_command_exists;
 use crate::acp::resolve::{AgentCandidate, AgentKey, AgentSourceKind};
 use crate::acp::storage;
 
@@ -34,19 +34,7 @@ pub struct AgentSpec {
 
 impl AgentSpec {
     pub fn is_available(&self) -> bool {
-        let command_path = Path::new(&self.command);
-        if command_path.is_absolute() || self.command.contains(['\\', '/']) {
-            return command_path.is_file();
-        }
-
-        let probe = if cfg!(windows) { "where" } else { "which" };
-        Command::new(probe)
-            .arg(&self.command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        launch_command_exists(&self.command)
     }
 
     pub fn display_command(&self) -> String {
@@ -68,33 +56,7 @@ impl AgentRegistry {
     pub fn load_default() -> Result<Self> {
         let path = Self::default_path();
         if !path.exists() {
-            return Ok(Self {
-                agents: vec![AgentSpec {
-                    id: "codex".to_string(),
-                    name: "Codex ACP (local)".to_string(),
-                    command: "codex-acp".to_string(),
-                    args: Vec::new(),
-                    fixed_env: BTreeMap::new(),
-                    env_keys: vec![
-                        "OPENAI_API_KEY".to_string(),
-                        "CODEX_API_KEY".to_string(),
-                        "OPENAI_BASE_URL".to_string(),
-                        "OPENAI_ORG_ID".to_string(),
-                    ],
-                    install: Some(AgentCommandSpec {
-                        command: "npm".to_string(),
-                        args: vec![
-                            "i".to_string(),
-                            "-g".to_string(),
-                            "@zed-industries/codex-acp".to_string(),
-                        ],
-                    }),
-                    auth: Some(AgentCommandSpec {
-                        command: "codex".to_string(),
-                        args: vec!["login".to_string()],
-                    }),
-                }],
-            });
+            return Ok(Self::default());
         }
         Self::load_from_path(&path)
     }

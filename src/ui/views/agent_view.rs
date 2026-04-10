@@ -1,4 +1,5 @@
 use crate::acp::client::{AcpClient, AcpResponseText, PermissionDecision, PermissionRequest};
+use crate::acp::install::runner::resolve_launch_command;
 use crate::acp::manager::{AgentCommandSpec, AgentSpec};
 use crate::acp::resolve::{AgentKey, ConflictPolicy, EffectiveAgentRow, load_effective_agent_rows};
 use futures::StreamExt;
@@ -198,7 +199,12 @@ impl AgentView {
             use std::io::{BufRead, BufReader};
             use std::process::{Command, Stdio};
 
-            let candidates = Self::resolve_command_candidates(&cmd.command);
+            let mut candidates = Self::resolve_command_candidates(&cmd.command);
+            if let Some(resolved) = resolve_launch_command(&cmd.command)
+                && !candidates.iter().any(|candidate| candidate == &resolved)
+            {
+                candidates.insert(0, resolved);
+            }
             let mut child_opt = None;
             let mut last_error: Option<std::io::Error> = None;
             for candidate in candidates {

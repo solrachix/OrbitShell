@@ -1,3 +1,4 @@
+use crate::acp::install::runner::resolve_launch_command;
 use crate::acp::manager::AgentSpec;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -97,7 +98,9 @@ impl AcpTransport {
     }
 
     fn spawn_child(spec: &AgentSpec, command_name: &str) -> Result<Child> {
-        let mut command = Command::new(command_name);
+        let resolved_command =
+            resolve_launch_command(command_name).unwrap_or_else(|| command_name.to_string());
+        let mut command = Command::new(&resolved_command);
         for arg in &spec.args {
             command.arg(arg);
         }
@@ -113,9 +116,12 @@ impl AcpTransport {
                 command.env(key, value);
             }
         }
-        command
-            .spawn()
-            .with_context(|| format!("failed to spawn process for command '{}'", command_name))
+        command.spawn().with_context(|| {
+            format!(
+                "failed to spawn process for command '{}' (resolved '{}')",
+                command_name, resolved_command
+            )
+        })
     }
 
     fn spawn_stdin_writer(mut stdin: ChildStdin, rx: Receiver<String>) {

@@ -15,7 +15,8 @@ use crate::acp::install::binary::{
     BinaryInstallSpec, download_binary_artifact, install_binary_from_file,
 };
 use crate::acp::install::runner::{
-    LaunchCommand, build_npx_package_launch, build_uvx_package_launch, write_launch_wrapper,
+    LaunchCommand, build_npx_package_launch, build_uvx_package_launch, resolve_launch_command,
+    write_launch_wrapper,
 };
 use crate::acp::install::state::{
     ManagedAgentState, ManagedAgentsStateFile, ManagedInstalledVersion,
@@ -51,6 +52,8 @@ pub struct CatalogAgentRowUI {
     pub acp_id: String,
     pub name: String,
     pub description: String,
+    pub authors: Option<String>,
+    pub package_hint: Option<String>,
     pub version: Option<String>,
     pub icon: Option<String>,
     pub install_status: CatalogInstallStatus,
@@ -906,11 +909,43 @@ impl SettingsView {
                     .selected_source
                     .as_ref()
                     .map(|s| s.spec.display_command());
+                let authors = row
+                    .registry_manifest
+                    .as_ref()
+                    .map(|manifest| {
+                        manifest
+                            .authors
+                            .iter()
+                            .map(|author| author.trim())
+                            .filter(|author| !author.is_empty() && *author != "...")
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|authors| !authors.is_empty());
+                let package_hint = row.registry_manifest.as_ref().and_then(|manifest| {
+                    if let Some(npx) = manifest.distribution.npx.as_ref() {
+                        return Some(format!("NPX package {}", npx.package));
+                    }
+                    if let Some(uvx) = manifest.distribution.uvx.as_ref() {
+                        return Some(format!("UVX package {}", uvx.package));
+                    }
+                    manifest
+                        .preferred_install_strategy()
+                        .and_then(|strategy| match strategy {
+                            RegistryInstallStrategy::Binary { target, .. } => {
+                                Some(format!("Binary command {}", target.cmd))
+                            }
+                            _ => None,
+                        })
+                });
 
                 CatalogAgentRowUI {
                     acp_id: row.acp_id,
                     name: row.name,
                     description: row.description,
+                    authors,
+                    package_hint,
                     version: row.version,
                     icon: row
                         .registry_manifest
@@ -932,6 +967,56 @@ impl SettingsView {
 
     fn visible_catalog_rows(&self) -> &[CatalogAgentRowUI] {
         &self.visible_catalog_rows
+    }
+
+    fn acp_summary_text(row: &CatalogAgentRowUI) -> String {
+        let description = row.description.trim();
+        if !description.is_empty() && description != "..." {
+            return description.to_string();
+        }
+
+        if let Some(authors) = row.authors.as_ref() {
+            let authors = authors.trim();
+            if !authors.is_empty() {
+                return format!("By {authors}");
+            }
+        }
+
+        if let Some(package_hint) = row.package_hint.as_ref() {
+            let package_hint = package_hint.trim();
+            if !package_hint.is_empty() {
+                return package_hint.to_string();
+            }
+        }
+
+        if let Some(version) = row.version.as_ref() {
+            return format!("Registry package v{version}");
+        }
+
+        if let Some(command) = row.display_command.as_ref() {
+            return command.clone();
+        }
+
+        row.acp_id.clone()
+    }
+
+    fn acp_detail_text(row: &CatalogAgentRowUI) -> String {
+        if let Some(package_hint) = row.package_hint.as_ref() {
+            let package_hint = package_hint.trim();
+            if !package_hint.is_empty() {
+                return package_hint.to_string();
+            }
+        }
+
+        if let Some(command) = row.display_command.as_ref() {
+            return command.clone();
+        }
+
+        if let Some(version) = row.version.as_ref() {
+            return format!("Registry version {version}");
+        }
+
+        format!("ACP id {}", row.acp_id)
     }
 
     fn refresh_registry_in_background(&mut self, cx: &mut Context<Self>) {
@@ -1073,7 +1158,13 @@ impl SettingsView {
 
             let mut child_opt = None;
             let mut last_error: Option<std::io::Error> = None;
-            for candidate in Self::resolve_command_candidates(&launch.command) {
+            let mut candidates = Self::resolve_command_candidates(&launch.command);
+            if let Some(resolved) = resolve_launch_command(&launch.command)
+                && !candidates.iter().any(|candidate| candidate == &resolved)
+            {
+                candidates.insert(0, resolved);
+            }
+            for candidate in candidates {
                 match Command::new(&candidate)
                     .args(&launch.args)
                     .stdout(Stdio::piped())
@@ -1748,6 +1839,204 @@ impl SettingsView {
             .text_color(rgb(0xe1e1e1))
             .cursor(CursorStyle::PointingHand)
             .child(label)
+    }
+
+    fn render_acp_action_row(
+        &self,
+        index: usize,
+        row: &CatalogAgentRowUI,
+        cx: &Context<Self>,
+    ) -> Div {
+        let install_handle = cx.entity().downgrade();
+        let update_action_handle = cx.entity().downgrade();
+        let remove_handle = cx.entity().downgrade();
+        let auth_handle = cx.entity().downgrade();
+        let test_handle = cx.entity().downgrade();
+
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(px(8.0))
+            .child(if row.can_install {
+                self.render_action_button("Install").on_mouse_down(
+                    MouseButton::Left,
+                    move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = install_handle.update(cx, |view, cx| {
+                            view.on_install_agent(index, cx);
+                        });
+                    },
+                )
+            } else {
+                div()
+            })
+            .child(if row.can_update {
+                self.render_action_button("Update").on_mouse_down(
+                    MouseButton::Left,
+                    move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = update_action_handle.update(cx, |view, cx| {
+                            view.on_update_agent(index, cx);
+                        });
+                    },
+                )
+            } else {
+                div()
+            })
+            .child(if row.can_auth {
+                self.render_action_button("Authenticate").on_mouse_down(
+                    MouseButton::Left,
+                    move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = auth_handle.update(cx, |view, cx| {
+                            view.on_auth_agent(index, cx);
+                        });
+                    },
+                )
+            } else {
+                div()
+            })
+            .child(if row.can_remove {
+                self.render_action_button("Remove").on_mouse_down(
+                    MouseButton::Left,
+                    move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = remove_handle.update(cx, |view, cx| {
+                            view.on_remove_agent(index, cx);
+                        });
+                    },
+                )
+            } else {
+                div()
+            })
+            .child(if row.can_test {
+                self.render_action_button("Test").on_mouse_down(
+                    MouseButton::Left,
+                    move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = test_handle.update(cx, |view, cx| {
+                            view.on_test_agent(index, cx);
+                        });
+                    },
+                )
+            } else {
+                div()
+            })
+    }
+
+    fn render_acp_list_row(
+        &self,
+        index: usize,
+        row: &CatalogAgentRowUI,
+        cx: &Context<Self>,
+    ) -> Div {
+        let summary = Self::acp_summary_text(row);
+        let detail = Self::acp_detail_text(row);
+
+        div()
+            .w_full()
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap(px(10.0))
+            .p(px(12.0))
+            .rounded(px(10.0))
+            .bg(rgb(0x111111))
+            .border_1()
+            .border_color(rgb(0x242424))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .child(registry_avatar(&row.name, row.icon.is_some()))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.0))
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.0))
+                                                    .text_color(rgb(0xf2f2f2))
+                                                    .truncate()
+                                                    .child(row.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(rgb(0x8b8b8b))
+                                                    .font_family("Cascadia Code")
+                                                    .truncate()
+                                                    .child(row.acp_id.clone()),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .flex_wrap()
+                                    .flex_shrink_0()
+                                    .child(self.render_source_badge(row.source_type))
+                                    .child(self.render_status_badge(row.install_status)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xc9c9c9))
+                            .line_height(px(18.0))
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x7f8b97))
+                            .font_family("Cascadia Code")
+                            .line_height(px(17.0))
+                            .child(detail),
+                    )
+                    .child(if let Some(other_sources) = row.other_sources.as_ref() {
+                        div()
+                            .min_w(px(0.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xb698ff))
+                            .line_height(px(17.0))
+                            .child(format!("Other sources: {other_sources}"))
+                    } else {
+                        div()
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_end()
+                    .flex_shrink_0()
+                    .child(self.render_acp_action_row(index, row, cx)),
+            )
     }
 
     fn filtered_icon_themes(&self) -> Vec<IconThemeOption> {
@@ -2570,241 +2859,35 @@ impl SettingsView {
                                     )),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("acp_list")
-                            .track_scroll(&self.acp_scroll)
-                            .overflow_scroll()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .children(
-                                self.visible_catalog_rows()
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, row)| {
-                                    let can_install = row.can_install;
-                                    let can_update = row.can_update;
-                                    let can_remove = row.can_remove;
-                                    let can_auth = row.can_auth;
-                                    let can_test = row.can_test;
-                                    let other_sources = row.other_sources.clone();
-
-                                    let install_handle = cx.entity().downgrade();
-                                    let update_action_handle = cx.entity().downgrade();
-                                    let remove_handle = cx.entity().downgrade();
-                                    let auth_handle = cx.entity().downgrade();
-                                    let test_handle = cx.entity().downgrade();
-
-                                    div()
-                                        .flex()
-                                        .items_start()
-                                        .justify_between()
-                                        .gap(px(14.0))
-                                        .px(px(12.0))
-                                        .py(px(10.0))
-                                        .rounded(px(10.0))
-                                        .bg(rgb(0x111111))
-                                        .border_1()
-                                        .border_color(rgb(0x242424))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .gap(px(5.0))
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(8.0))
-                                                        .child(registry_avatar(
-                                                            &row.name,
-                                                            row.icon.is_some(),
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
-                                                                .flex()
-                                                                .flex_col()
-                                                                .gap(px(3.0))
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(13.0))
-                                                                        .text_color(rgb(0xe6e6e6))
-                                                                        .truncate()
-                                                                        .child(row.name.clone()),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(11.0))
-                                                                        .text_color(rgb(0x8b8b8b))
-                                                                        .font_family("Cascadia Code")
-                                                                        .truncate()
-                                                                        .child(row.acp_id.clone()),
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap(px(6.0))
-                                                                .child(self.render_source_badge(
-                                                                    row.source_type,
-                                                                ))
-                                                                .child(self.render_status_badge(
-                                                                    row.install_status,
-                                                                )),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .min_w(px(0.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(rgb(0xa0a0a0))
-                                                        .truncate()
-                                                        .child(if row.description.is_empty() {
-                                                            "No description available".to_string()
-                                                        } else {
-                                                            row.description.clone()
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .min_w(px(0.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(rgb(0x727272))
-                                                        .font_family("Cascadia Code")
-                                                        .truncate()
-                                                        .child(row.display_command.clone().unwrap_or_else(|| {
-                                                            row.version
-                                                                .as_ref()
-                                                                .map(|version| format!("registry v{version}"))
-                                                                .unwrap_or_else(|| "registry".to_string())
-                                                        })),
-                                                )
-                                                .child(if let Some(other_sources) = other_sources {
-                                                    div()
-                                                        .min_w(px(0.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(rgb(0xb698ff))
-                                                        .truncate()
-                                                        .child(format!("Other sources: {other_sources}"))
-                                                } else {
-                                                    div()
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .flex_shrink_0()
-                                                .gap(px(8.0))
-                                                .pt(px(2.0))
-                                                .child(if can_install {
-                                                    self.render_action_button("Install")
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            move |_e, _w, cx| {
-                                                                cx.stop_propagation();
-                                                                let _ = install_handle.update(
-                                                                    cx,
-                                                                    |view, cx| {
-                                                                        view.on_install_agent(
-                                                                            index, cx
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        )
-                                                } else {
-                                                    div()
-                                                })
-                                                .child(if can_update {
-                                                    self.render_action_button("Update")
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            move |_e, _w, cx| {
-                                                                cx.stop_propagation();
-                                                                let _ = update_action_handle.update(
-                                                                    cx,
-                                                                    |view, cx| {
-                                                                        view.on_update_agent(
-                                                                            index, cx
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        )
-                                                } else {
-                                                    div()
-                                                })
-                                                .child(if can_auth {
-                                                    self.render_action_button("Authenticate")
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            move |_e, _w, cx| {
-                                                                cx.stop_propagation();
-                                                                let _ = auth_handle.update(
-                                                                    cx,
-                                                                    |view, cx| {
-                                                                        view.on_auth_agent(
-                                                                            index, cx
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        )
-                                                } else {
-                                                    div()
-                                                })
-                                                .child(if can_remove {
-                                                    self.render_action_button("Remove")
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            move |_e, _w, cx| {
-                                                                cx.stop_propagation();
-                                                                let _ = remove_handle.update(
-                                                                    cx,
-                                                                    |view, cx| {
-                                                                        view.on_remove_agent(
-                                                                            index, cx
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        )
-                                                } else {
-                                                    div()
-                                                })
-                                                .child(
-                                                    if can_test {
-                                                        self.render_action_button("Test")
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                move |_e, _w, cx| {
-                                                                    cx.stop_propagation();
-                                                                    let _ = test_handle.update(
-                                                                        cx,
-                                                                        |view, cx| {
-                                                                            view.on_test_agent(
-                                                                                index, cx
-                                                                            );
-                                                                        },
-                                                                    );
-                                                                },
-                                                            )
-                                                    } else {
-                                                        div()
-                                                    },
-                                                ),
-                                        )
-                                }),
-                        ),
-                    )
+                    .child({
+                        let acp_list_body: AnyElement = if self.visible_catalog_rows().is_empty() {
+                            div()
+                                .rounded(px(10.0))
+                                .bg(rgb(0x101010))
+                                .border_1()
+                                .border_color(rgb(0x242424))
+                                .p(px(16.0))
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x8f8f8f))
+                                .child("No ACP agents match the current filters.")
+                                .into_any_element()
+                        } else {
+                            div()
+                                .id("acp_list")
+                                .track_scroll(&self.acp_scroll)
+                                .overflow_y_scroll()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .children(self.visible_catalog_rows().iter().enumerate().map(
+                                    |(index, row)| self.render_acp_list_row(index, row, cx),
+                                ))
+                                .into_any_element()
+                        };
+                        acp_list_body
+                    })
                     .child(if recent_logs.is_empty() {
                         div()
                     } else {
@@ -3120,7 +3203,8 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsView, wrap_log_line};
+    use super::{CatalogAgentRowUI, SettingsView, wrap_log_line};
+    use crate::acp::resolve::CatalogInstallStatus;
 
     #[test]
     fn wrap_log_line_breaks_long_text_in_fixed_chunks() {
@@ -3161,6 +3245,34 @@ mod tests {
         assert_eq!(
             SettingsView::about_instagram_url(),
             "https://instagram.com/solrachix"
+        );
+    }
+
+    #[test]
+    fn acp_summary_text_falls_back_when_registry_description_is_ellipsis() {
+        let row = CatalogAgentRowUI {
+            acp_id: "codex-acp".into(),
+            name: "Codex ACP".into(),
+            description: "...".into(),
+            authors: Some("OpenAI".into()),
+            package_hint: Some("NPX package @openai/codex-acp".into()),
+            version: Some("0.10.0".into()),
+            icon: None,
+            install_status: CatalogInstallStatus::NotInstalled,
+            can_install: true,
+            can_update: false,
+            can_remove: false,
+            can_auth: false,
+            can_test: false,
+            other_sources: None,
+            source_type: None,
+            display_command: None,
+        };
+
+        assert_eq!(SettingsView::acp_summary_text(&row), "By OpenAI");
+        assert_eq!(
+            SettingsView::acp_detail_text(&row),
+            "NPX package @openai/codex-acp"
         );
     }
 }

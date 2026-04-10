@@ -1026,16 +1026,19 @@ impl SidebarView {
                                                     .bg(rgb(0x101010))
                                                     .border_color(rgb(sidebar_row_hover_border()))
                                             })
-                                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                                                let _ = open_handle.update(cx, |view, cx| {
-                                                    view.open_search_result(
-                                                        open_path.clone(),
-                                                        open_line,
-                                                        open_query.clone(),
-                                                        cx,
-                                                    );
-                                                });
-                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_event, _window, cx| {
+                                                    let _ = open_handle.update(cx, |view, cx| {
+                                                        view.open_search_result(
+                                                            open_path.clone(),
+                                                            open_line,
+                                                            open_query.clone(),
+                                                            cx,
+                                                        );
+                                                    });
+                                                },
+                                            )
                                             .child(
                                                 div()
                                                     .w(px(54.0))

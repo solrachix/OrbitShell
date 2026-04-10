@@ -519,8 +519,7 @@ impl Workspace {
                     .hover(|this| this.bg(rgb(0x242424)).border_color(rgb(0x4a4a4a)))
                     .cursor(CursorStyle::PointingHand)
                     .child("Feedback"),
-            )
-            ;
+            );
 
         div().absolute().size_full().child(overlay).child(menu)
     }

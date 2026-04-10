@@ -1286,7 +1286,10 @@ impl TabView {
             return None;
         }
 
-        Some((line_number.saturating_sub(1).min(line_count - 1), trimmed.to_string()))
+        Some((
+            line_number.saturating_sub(1).min(line_count - 1),
+            trimmed.to_string(),
+        ))
     }
 
     fn apply_preview_search_match_segments(
@@ -2161,8 +2164,9 @@ impl TabView {
             FilePreviewKind::Text { lines, .. } => lines.len(),
             _ => 0,
         };
-        let preview_search_match = Self::build_preview_search_match(line_number, &query, line_count)
-            .map(|(line_index, query)| PreviewSearchMatch { line_index, query });
+        let preview_search_match =
+            Self::build_preview_search_match(line_number, &query, line_count)
+                .map(|(line_index, query)| PreviewSearchMatch { line_index, query });
         let active_line = preview_search_match
             .as_ref()
             .map(|search_match| search_match.line_index)
@@ -2232,7 +2236,9 @@ impl TabView {
         let segments = Self::highlight_line(line, language);
         let rendered_segments = persistent_match
             .filter(|search_match| search_match.line_index == index)
-            .map(|search_match| Self::apply_preview_search_match_segments(&segments, &search_match.query))
+            .map(|search_match| {
+                Self::apply_preview_search_match_segments(&segments, &search_match.query)
+            })
             .unwrap_or_else(|| {
                 segments
                     .iter()
@@ -2285,14 +2291,10 @@ impl TabView {
                         rendered_segments
                             .into_iter()
                             .map(|segment| {
-                                let mut span = div()
-                                    .text_color(rgb(segment.color))
-                                    .child(segment.text);
+                                let mut span =
+                                    div().text_color(rgb(segment.color)).child(segment.text);
                                 if segment.matched {
-                                    span = span
-                                        .px(px(1.0))
-                                        .rounded(px(3.0))
-                                        .bg(rgb(0x5c4a16));
+                                    span = span.px(px(1.0)).rounded(px(3.0)).bg(rgb(0x5c4a16));
                                 }
                                 if segment.bold {
                                     span = span.font_weight(FontWeight::BOLD);

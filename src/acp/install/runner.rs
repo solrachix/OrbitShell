@@ -222,24 +222,98 @@ fn infer_package_executable(package_spec: &str) -> String {
 }
 
 pub fn launch_command_exists(command: &str) -> bool {
+    resolve_launch_command(command).is_some()
+}
+
+pub fn resolve_launch_command(command: &str) -> Option<String> {
+    resolve_launch_command_with(command, direct_command_lookup, login_shell_command_lookup)
+}
+
+fn resolve_launch_command_with<D, S>(
+    command: &str,
+    mut direct_lookup: D,
+    mut shell_lookup: S,
+) -> Option<String>
+where
+    D: FnMut(&str) -> Option<String>,
+    S: FnMut(&str) -> Option<String>,
+{
     let path = Path::new(command);
     if path.is_absolute() || command.contains(['\\', '/']) {
-        return path.is_file();
+        return path.is_file().then(|| command.to_string());
     }
 
+    if let Some(resolved) = direct_lookup(command) {
+        return Some(resolved);
+    }
+
+    if cfg!(windows) {
+        return None;
+    }
+
+    shell_lookup(command)
+}
+
+fn direct_command_lookup(command: &str) -> Option<String> {
     let probe = if cfg!(windows) { "where" } else { "which" };
     Command::new(probe)
         .arg(command)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .output()
+        .ok()
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            parse_first_command_path(&output.stdout)
+        })
+}
+
+fn login_shell_command_lookup(command: &str) -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    if shell.trim().is_empty() {
+        return None;
+    }
+
+    let script = format!("command -v -- {}", quote_shell_arg(command));
+    Command::new(shell)
+        .arg("-lc")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            parse_first_command_path(&output.stdout)
+        })
+}
+
+fn parse_first_command_path(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && Path::new(line).is_file())
+        .map(|line| line.to_string())
+}
+
+fn quote_shell_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_npx_package_launch;
+    use super::{build_npx_package_launch, resolve_launch_command_with};
 
     #[test]
     fn npx_windows_fallback_uses_npm_exec() {
@@ -259,6 +333,30 @@ mod tests {
         } else {
             assert_eq!(launch.command, "npx");
             assert_eq!(launch.args, vec!["-y", "@zed-industries/codex-acp@0.10.0"]);
+        }
+    }
+
+    #[test]
+    fn resolve_launch_command_uses_direct_lookup_first() {
+        let resolved = resolve_launch_command_with(
+            "npx",
+            |command| Some(format!("/usr/bin/{command}")),
+            |_| Some("/opt/node/bin/npx".to_string()),
+        );
+        assert_eq!(resolved.as_deref(), Some("/usr/bin/npx"));
+    }
+
+    #[test]
+    fn resolve_launch_command_uses_shell_lookup_when_direct_missing() {
+        let resolved = resolve_launch_command_with(
+            "npx",
+            |_| None,
+            |command| Some(format!("/opt/node/bin/{command}")),
+        );
+        if cfg!(windows) {
+            assert_eq!(resolved, None);
+        } else {
+            assert_eq!(resolved.as_deref(), Some("/opt/node/bin/npx"));
         }
     }
 }
