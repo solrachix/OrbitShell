@@ -19,7 +19,7 @@ inline file previews, ACP/MCP surfaces, and project-oriented navigation.
 assets = [
   "$auto",
   ["packaging/linux/orbitshell.desktop", "usr/share/applications/orbitshell.desktop", "644"],
-  ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
+  ["assets/logomarca.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
 ]
 
 [dependencies]

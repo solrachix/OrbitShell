@@ -113,7 +113,7 @@ jobs:
           install -Dm755 packaging/linux/AppRun AppDir/AppRun
           install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "AppDir/usr/bin/orbitshell"
           install -Dm644 packaging/linux/orbitshell.desktop "AppDir/usr/share/applications/orbitshell.desktop"
-          install -Dm644 assets/logo.png "AppDir/usr/share/icons/hicolor/256x256/apps/orbitshell.png"
+          install -Dm644 assets/logomarca.png "AppDir/usr/share/icons/hicolor/256x256/apps/orbitshell.png"
           curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
           curl -L -o linuxdeploy-plugin-appimage.AppImage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${{ matrix.appimage_arch }}.AppImage"
           chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage.AppImage
