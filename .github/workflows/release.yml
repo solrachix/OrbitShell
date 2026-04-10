@@ -125,7 +125,12 @@ jobs:
             -d "AppDir/usr/share/applications/orbitshell.desktop" \
             -i "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png" \
             --output appimage
-          mv ./*.AppImage "dist/OrbitShell-${VERSION}-${{ matrix.label }}.AppImage"
+          APPIMAGE_OUTPUT="$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'linuxdeploy*.AppImage' | head -n 1)"
+          if [[ -z "${APPIMAGE_OUTPUT}" ]]; then
+            echo "failed to locate generated AppImage artifact" >&2
+            exit 1
+          fi
+          mv "${APPIMAGE_OUTPUT}" "dist/OrbitShell-${VERSION}-${{ matrix.label }}.AppImage"
 
       - uses: actions/upload-artifact@v4
         with:
