@@ -113,8 +113,8 @@ jobs:
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/metainfo dist
           install -Dm755 packaging/linux/AppRun AppDir/AppRun
           install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "AppDir/usr/bin/orbitshell"
-          install -Dm644 packaging/linux/orbitshell.desktop "AppDir/usr/share/applications/orbitshell.desktop"
-          install -Dm644 packaging/linux/orbitshell.appdata.xml "AppDir/usr/share/metainfo/orbitshell.appdata.xml"
+          install -Dm644 packaging/linux/dev.carlosmiguel.orbitshell.desktop "AppDir/usr/share/applications/dev.carlosmiguel.orbitshell.desktop"
+          install -Dm644 packaging/linux/dev.carlosmiguel.orbitshell.metainfo.xml "AppDir/usr/share/metainfo/dev.carlosmiguel.orbitshell.metainfo.xml"
           convert assets/logomarca.png -resize 512x512 "dist/orbitshell-appimage-icon.png"
           install -Dm644 "dist/orbitshell-appimage-icon.png" "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png"
           curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
@@ -123,7 +123,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy.AppImage \
             --appdir AppDir \
             -e "AppDir/usr/bin/orbitshell" \
-            -d "AppDir/usr/share/applications/orbitshell.desktop" \
+            -d "AppDir/usr/share/applications/dev.carlosmiguel.orbitshell.desktop" \
             -i "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png" \
             --output appimage
           APPIMAGE_OUTPUT="$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'linuxdeploy*.AppImage' | head -n 1)"

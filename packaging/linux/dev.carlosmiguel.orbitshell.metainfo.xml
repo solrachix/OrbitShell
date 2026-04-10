@@ -1,15 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>orbitshell.desktop</id>
+  <id>dev.carlosmiguel.orbitshell</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <name>OrbitShell</name>
   <summary>Modern block-based terminal UI</summary>
-  <developer_name>Carlos Miguel</developer_name>
-  <launchable type="desktop-id">orbitshell.desktop</launchable>
+  <developer id="dev.carlosmiguel">
+    <name>Carlos Miguel</name>
+  </developer>
+  <launchable type="desktop-id">dev.carlosmiguel.orbitshell.desktop</launchable>
   <url type="homepage">https://carlos-miguel.dev</url>
   <url type="bugtracker">https://github.com/solrachix/OrbitShell/issues</url>
   <url type="vcs-browser">https://github.com/solrachix/OrbitShell</url>
+  <update_contact>eu_AT_carlos-miguel.dev</update_contact>
   <description>
     <p>OrbitShell is a local-first desktop terminal experience built with Rust and GPUI.</p>
     <p>It combines block-based command output, project-oriented navigation, inline file previews, and ACP/MCP surfaces in a single workspace UI.</p>
@@ -21,8 +24,7 @@
     </ul>
   </description>
   <categories>
-    <category>Development</category>
-    <category>Utility</category>
+    <category>System</category>
     <category>TerminalEmulator</category>
   </categories>
   <screenshots>

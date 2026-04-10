@@ -5,5 +5,5 @@ Exec=orbitshell
 Icon=orbitshell
 Type=Application
 Terminal=false
-Categories=Development;Utility;TerminalEmulator;
+Categories=System;TerminalEmulator;
 StartupNotify=true
