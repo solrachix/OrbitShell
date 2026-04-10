@@ -50,6 +50,18 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-${{ matrix.label }}
+          cache-on-failure: true
+
+      - name: Cache cargo-deb
+        id: cache-cargo-deb
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deb
+          key: cargo-deb-${{ runner.os }}-${{ runner.arch }}-2.15.1
+
       - name: Install Linux build dependencies
         shell: bash
         run: |
@@ -78,8 +90,18 @@ jobs:
             zsync
 
       - name: Install cargo-deb
+        if: steps.cache-cargo-deb.outputs.cache-hit != 'true'
         shell: bash
-        run: cargo install cargo-deb --locked
+        run: cargo install cargo-deb --locked --version 2.15.1
+
+      - name: Cache linuxdeploy tools
+        id: cache-linuxdeploy
+        uses: actions/cache@v4
+        with:
+          path: |
+            linuxdeploy.AppImage
+            linuxdeploy-plugin-appimage.AppImage
+          key: linuxdeploy-${{ runner.os }}-${{ matrix.appimage_arch }}-continuous-2026-04-10
 
       - name: Build release binary
         shell: bash
@@ -117,8 +139,12 @@ jobs:
           install -Dm644 packaging/linux/dev.carlosmiguel.orbitshell.metainfo.xml "AppDir/usr/share/metainfo/dev.carlosmiguel.orbitshell.metainfo.xml"
           convert assets/logomarca.png -resize 512x512 "dist/orbitshell-appimage-icon.png"
           install -Dm644 "dist/orbitshell-appimage-icon.png" "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png"
-          curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
-          curl -L -o linuxdeploy-plugin-appimage.AppImage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${{ matrix.appimage_arch }}.AppImage"
+          if [[ ! -f linuxdeploy.AppImage ]]; then
+            curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"
+          fi
+          if [[ ! -f linuxdeploy-plugin-appimage.AppImage ]]; then
+            curl -L -o linuxdeploy-plugin-appimage.AppImage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${{ matrix.appimage_arch }}.AppImage"
+          fi
           chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage.AppImage
           APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy.AppImage \
             --appdir AppDir \
@@ -162,6 +188,11 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-x86_64
+          cache-on-failure: true
 
       - name: Install NSIS
         shell: powershell
