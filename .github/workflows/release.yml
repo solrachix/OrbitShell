@@ -208,4 +208,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           gh release view "${TAG}" --repo "${GH_REPO}" >/dev/null 2>&1 || gh release create "${TAG}" --repo "${GH_REPO}" --title "${TAG}" --generate-notes
-          gh release upload "${TAG}" dist/* --repo "${GH_REPO}" --clobber
+          mapfile -t ASSETS < <(find dist -maxdepth 1 -type f | sort)
+          if [[ ${#ASSETS[@]} -eq 0 ]]; then
+            echo "no release assets found in dist/" >&2
+            exit 1
+          fi
+          gh release upload "${TAG}" --repo "${GH_REPO}" --clobber "${ASSETS[@]}"
