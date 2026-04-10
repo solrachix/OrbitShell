@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>orbitshell.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OrbitShell</name>
+  <summary>Modern block-based terminal UI</summary>
+  <developer_name>Carlos Miguel</developer_name>
+  <launchable type="desktop-id">orbitshell.desktop</launchable>
+  <url type="homepage">https://carlos-miguel.dev</url>
+  <url type="bugtracker">https://github.com/solrachix/OrbitShell/issues</url>
+  <url type="vcs-browser">https://github.com/solrachix/OrbitShell</url>
+  <description>
+    <p>OrbitShell is a local-first desktop terminal experience built with Rust and GPUI.</p>
+    <p>It combines block-based command output, project-oriented navigation, inline file previews, and ACP/MCP surfaces in a single workspace UI.</p>
+    <ul>
+      <li>Block-based terminal output with command history context</li>
+      <li>Sidebar explorer, search, and git views for local workspaces</li>
+      <li>Inline previews for text, markdown, and images inside the workspace</li>
+      <li>Settings, ACP Registry, and MCP server surfaces in-app</li>
+    </ul>
+  </description>
+  <categories>
+    <category>Development</category>
+    <category>Utility</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Welcome screen with recent projects and quick actions</caption>
+      <image>https://raw.githubusercontent.com/solrachix/OrbitShell/main/assets/screenshots/welcome.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Workspace view with sidebar, file preview, and terminal split</caption>
+      <image>https://raw.githubusercontent.com/solrachix/OrbitShell/main/assets/screenshots/workspace.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings screens for appearance and distribution metadata</caption>
+      <image>https://raw.githubusercontent.com/solrachix/OrbitShell/main/assets/screenshots/settings.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1" />
+</component>

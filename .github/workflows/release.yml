@@ -110,10 +110,11 @@ jobs:
           ARCH: ${{ matrix.appimage_arch }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/512x512/apps dist
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/512x512/apps AppDir/usr/share/metainfo dist
           install -Dm755 packaging/linux/AppRun AppDir/AppRun
           install -Dm755 "target/${{ matrix.rust_target }}/release/orbitshell" "AppDir/usr/bin/orbitshell"
           install -Dm644 packaging/linux/orbitshell.desktop "AppDir/usr/share/applications/orbitshell.desktop"
+          install -Dm644 packaging/linux/orbitshell.appdata.xml "AppDir/usr/share/metainfo/orbitshell.appdata.xml"
           convert assets/logomarca.png -resize 512x512 "dist/orbitshell-appimage-icon.png"
           install -Dm644 "dist/orbitshell-appimage-icon.png" "AppDir/usr/share/icons/hicolor/512x512/apps/orbitshell.png"
           curl -L -o linuxdeploy.AppImage "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.appimage_arch }}.AppImage"

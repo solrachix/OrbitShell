@@ -2,6 +2,7 @@
 name = "orbitshell"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Modern block-based terminal UI built with Rust and GPUI."
 repository = "https://github.com/solrachix/OrbitShell"
 homepage = "https://carlos-miguel.dev"
@@ -19,7 +20,9 @@ inline file previews, ACP/MCP surfaces, and project-oriented navigation.
 assets = [
   "$auto",
   ["packaging/linux/orbitshell.desktop", "usr/share/applications/orbitshell.desktop", "644"],
+  ["packaging/linux/orbitshell.appdata.xml", "usr/share/metainfo/orbitshell.appdata.xml", "644"],
   ["assets/logomarca.png", "usr/share/icons/hicolor/256x256/apps/orbitshell.png", "644"],
+  ["LICENSE", "usr/share/doc/orbitshell/LICENSE", "644"],
 ]
 
 [dependencies]
