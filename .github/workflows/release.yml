@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-deb
-          key: cargo-deb-${{ runner.os }}-${{ runner.arch }}-2.15.1
+          key: cargo-deb-${{ runner.os }}-${{ runner.arch }}-locked
 
       - name: Install Linux build dependencies
         shell: bash
@@ -92,7 +92,7 @@ jobs:
       - name: Install cargo-deb
         if: steps.cache-cargo-deb.outputs.cache-hit != 'true'
         shell: bash
-        run: cargo install cargo-deb --locked --version 2.15.1
+        run: cargo install cargo-deb --locked
 
       - name: Cache linuxdeploy tools
         id: cache-linuxdeploy
