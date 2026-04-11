@@ -3007,7 +3007,7 @@ impl SettingsView {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(rgb(0x8a8a8a))
-                                    .child("v0.2026.02.05-stable"),
+                                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                             ),
                     )
                     .child(

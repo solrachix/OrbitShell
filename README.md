@@ -16,6 +16,22 @@ OrbitShell focuses on:
 
 ---
 
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshots/welcome.png" alt="OrbitShell welcome screen" width="820" />
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/workspace.png" alt="OrbitShell workspace with sidebar, file preview, and terminal" width="820" />
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/settings.png" alt="OrbitShell settings screen" width="820" />
+</p>
+
+---
+
 ## Why OrbitShell?
 
 - **Blazing fast** UI and search thanks to Rust + GPUI
