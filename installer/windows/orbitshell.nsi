@@ -4,7 +4,7 @@
 !define APP_EXE "orbitshell.exe"
 !define APP_PUBLISHER "OrbitShell"
 !ifndef APP_VERSION
-!define APP_VERSION "0.1.0"
+!define APP_VERSION "0.1.3"
 !endif
 !ifndef OUTPUT_NAME
 !define OUTPUT_NAME "OrbitShell-Setup-${APP_VERSION}.exe"
