@@ -1,5 +1,5 @@
 use gpui::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_SIDEBAR_WIDTH: f32 = 240.0;
 const MIN_SIDEBAR_WIDTH: f32 = 180.0;
@@ -13,11 +13,19 @@ pub struct Workspace {
     tabs: Vec<Entity<views::tab_view::TabView>>,
     tab_ids: Vec<EntityId>,
     tab_paths: Vec<PathBuf>,
-    tab_is_welcome: Vec<bool>,
+    tab_kinds: Vec<TabKind>,
     active_tab: usize,
     user_menu_open: bool,
     sidebar: Entity<views::sidebar_view::SidebarView>,
     tab_bar: Entity<views::tab_bar::TabBar>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabKind {
+    Welcome,
+    BaseTerminal,
+    Project,
+    Utility,
 }
 
 pub mod views {
@@ -31,6 +39,7 @@ pub mod views {
 
 pub mod appearance;
 pub mod icons;
+pub mod launch;
 pub mod recent;
 pub mod text_edit;
 
@@ -68,7 +77,7 @@ impl Workspace {
             tabs: Vec::new(),
             tab_ids: Vec::new(),
             tab_paths: Vec::new(),
-            tab_is_welcome: Vec::new(),
+            tab_kinds: Vec::new(),
             active_tab: 0,
             user_menu_open: false,
             sidebar: cx.new(|cx| views::sidebar_view::SidebarView::new(cx)),
@@ -92,8 +101,21 @@ impl Workspace {
         workspace
     }
 
+    pub fn new_with_options(cx: &mut Context<Self>, options: launch::LaunchOptions) -> Self {
+        let mut workspace = Self::new(cx);
+        if let Some(cwd) = options.base_terminal_cwd {
+            let index = workspace.active_tab;
+            workspace.open_base_terminal_in_tab(index, Some(cwd), None, cx);
+        }
+        workspace
+    }
+
     fn clamp_sidebar_width(width: f32) -> f32 {
         width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+    }
+
+    fn should_show_sidebar_for_tab(tab_kind: TabKind, sidebar_visible: bool) -> bool {
+        sidebar_visible && matches!(tab_kind, TabKind::BaseTerminal | TabKind::Project)
     }
 
     fn on_sidebar_resize_mouse_down(
@@ -153,7 +175,7 @@ impl Workspace {
         self.tabs.push(tab);
         self.tab_ids.push(tab_id);
         self.tab_paths.push(path.clone());
-        self.tab_is_welcome.push(true);
+        self.tab_kinds.push(TabKind::Welcome);
         self.active_tab = self.tabs.len().saturating_sub(1);
         let _ = self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab("Welcome".to_string(), "~".to_string(), cx);
@@ -186,7 +208,7 @@ impl Workspace {
         self.tabs.push(tab);
         self.tab_ids.push(tab_id);
         self.tab_paths.push(path.clone());
-        self.tab_is_welcome.push(true);
+        self.tab_kinds.push(TabKind::Utility);
         self.active_tab = self.tabs.len().saturating_sub(1);
 
         let _ = self.tab_bar.update(cx, |tab_bar, cx| {
@@ -218,7 +240,7 @@ impl Workspace {
         self.tabs.push(tab);
         self.tab_ids.push(tab_id);
         self.tab_paths.push(path);
-        self.tab_is_welcome.push(true);
+        self.tab_kinds.push(TabKind::Utility);
         self.active_tab = self.tabs.len().saturating_sub(1);
 
         let _ = self.tab_bar.update(cx, |tab_bar, cx| {
@@ -278,7 +300,7 @@ impl Workspace {
                     self.tabs.remove(*index);
                     self.tab_ids.remove(*index);
                     self.tab_paths.remove(*index);
-                    self.tab_is_welcome.remove(*index);
+                    self.tab_kinds.remove(*index);
                     if self.active_tab >= self.tabs.len() {
                         self.active_tab = self.tabs.len() - 1;
                     }
@@ -304,8 +326,8 @@ impl Workspace {
                 self.tab_ids.insert(to, tab_id);
                 let tab_path = self.tab_paths.remove(from);
                 self.tab_paths.insert(to, tab_path);
-                let tab_welcome = self.tab_is_welcome.remove(from);
-                self.tab_is_welcome.insert(to, tab_welcome);
+                let tab_kind = self.tab_kinds.remove(from);
+                self.tab_kinds.insert(to, tab_kind);
 
                 self.active_tab = move_index(self.active_tab, from, to);
                 self.sync_sidebar_root(cx);
@@ -547,10 +569,123 @@ impl Workspace {
                     self.open_repository_in_tab(index, path.clone(), cx);
                 }
             }
+            views::tab_view::TabViewEvent::StartBaseTerminal { command } => {
+                if let Some(index) = self.tab_ids.iter().position(|id| *id == tab_id) {
+                    self.open_base_terminal_in_tab(index, None, Some(command.clone()), cx);
+                }
+            }
+            views::tab_view::TabViewEvent::CreateProject { prompt, parent } => {
+                if let Some(index) = self.tab_ids.iter().position(|id| *id == tab_id) {
+                    self.create_project_in_tab(index, parent.clone(), prompt.clone(), cx);
+                }
+            }
+            views::tab_view::TabViewEvent::CloneRepository { url, parent } => {
+                if let Some(index) = self.tab_ids.iter().position(|id| *id == tab_id) {
+                    self.clone_repository_in_tab(index, parent.clone(), url.clone(), cx);
+                }
+            }
         }
     }
 
+    fn open_base_terminal_in_tab(
+        &mut self,
+        index: usize,
+        path: Option<PathBuf>,
+        initial_command: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = path.unwrap_or_else(launch::default_base_terminal_cwd);
+        let tab_name = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Terminal".to_string());
+        let tab_path = cwd.to_string_lossy().to_string();
+
+        if let Some(tab) = self.tabs.get(index) {
+            let _ = tab.update(cx, |view, cx| {
+                view.start_terminal_with_path_and_command(
+                    cx,
+                    Some(cwd.clone()),
+                    initial_command.clone(),
+                );
+            });
+        }
+
+        if let Some(slot) = self.tab_paths.get_mut(index) {
+            *slot = cwd;
+        }
+        if let Some(kind) = self.tab_kinds.get_mut(index) {
+            *kind = TabKind::BaseTerminal;
+        }
+        self.active_tab = index;
+        self.sidebar_visible = false;
+
+        let _ = self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.rename_tab(index, tab_name, tab_path, cx);
+            tab_bar.set_sidebar_visible(self.sidebar_visible, cx);
+            tab_bar.set_active(index, cx);
+        });
+        self.sync_sidebar_root(cx);
+        cx.notify();
+    }
+
+    fn create_project_in_tab(
+        &mut self,
+        index: usize,
+        parent: PathBuf,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir_name) = launch::project_dir_name_from_prompt(&prompt) else {
+            return;
+        };
+        let path = Self::unique_child_dir(&parent, &dir_name);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            eprintln!(
+                "failed to create project directory '{}': {err}",
+                path.display()
+            );
+            return;
+        }
+
+        self.open_project_in_tab(index, path, None, Some(prompt), cx);
+    }
+
+    fn clone_repository_in_tab(
+        &mut self,
+        index: usize,
+        parent: PathBuf,
+        url: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir_name) = launch::clone_dir_name_from_url(&url) else {
+            return;
+        };
+        let path = Self::unique_child_dir(&parent, &dir_name);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            eprintln!(
+                "failed to create clone directory '{}': {err}",
+                path.display()
+            );
+            return;
+        }
+
+        let command = format!("git clone {} .", Self::quote_terminal_arg(&url));
+        self.open_project_in_tab(index, path, Some(command), None, cx);
+    }
+
     fn open_repository_in_tab(&mut self, index: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_project_in_tab(index, path, None, None, cx);
+    }
+
+    fn open_project_in_tab(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        initial_command: Option<String>,
+        initial_agent_prompt: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let tab_name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -559,15 +694,23 @@ impl Workspace {
 
         if let Some(tab) = self.tabs.get(index) {
             let _ = tab.update(cx, |view, cx| {
-                view.start_terminal_with_path(cx, Some(path.clone()));
+                if let Some(prompt) = initial_agent_prompt.clone() {
+                    view.start_agent_prompt_with_path(cx, Some(path.clone()), prompt);
+                } else {
+                    view.start_terminal_with_path_and_command(
+                        cx,
+                        Some(path.clone()),
+                        initial_command.clone(),
+                    );
+                }
             });
         }
 
         if let Some(slot) = self.tab_paths.get_mut(index) {
             *slot = path.clone();
         }
-        if let Some(flag) = self.tab_is_welcome.get_mut(index) {
-            *flag = false;
+        if let Some(kind) = self.tab_kinds.get_mut(index) {
+            *kind = TabKind::Project;
         }
         self.active_tab = index;
 
@@ -585,16 +728,36 @@ impl Workspace {
         self.sync_sidebar_root(cx);
         cx.notify();
     }
+
+    fn unique_child_dir(parent: &Path, dir_name: &str) -> PathBuf {
+        let base = parent.join(dir_name);
+        if !base.exists() {
+            return base;
+        }
+
+        for suffix in 2.. {
+            let candidate = parent.join(format!("{dir_name}-{suffix}"));
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+
+        unreachable!("unbounded suffix loop should always return")
+    }
+
+    fn quote_terminal_arg(value: &str) -> String {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let is_welcome = self
-            .tab_is_welcome
+        let tab_kind = self
+            .tab_kinds
             .get(self.active_tab)
             .copied()
-            .unwrap_or(false);
-        let show_sidebar = self.sidebar_visible && !is_welcome;
+            .unwrap_or(TabKind::Welcome);
+        let show_sidebar = Self::should_show_sidebar_for_tab(tab_kind, self.sidebar_visible);
         let sidebar_width = Self::clamp_sidebar_width(self.sidebar_width);
 
         let mut root = div()
@@ -685,12 +848,91 @@ impl Render for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::Workspace;
+    use super::{TabKind, Workspace};
+    use std::ffi::OsString;
 
     #[test]
     fn sidebar_width_is_clamped_to_session_limits() {
         assert_eq!(Workspace::clamp_sidebar_width(120.0), 180.0);
         assert_eq!(Workspace::clamp_sidebar_width(240.0), 240.0);
         assert_eq!(Workspace::clamp_sidebar_width(520.0), 420.0);
+    }
+
+    #[test]
+    fn launch_options_select_existing_directory_argument() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().to_path_buf();
+
+        let options = super::launch::LaunchOptions::from_args([
+            OsString::from("orbitshell"),
+            path.clone().into_os_string(),
+        ]);
+
+        assert_eq!(options.base_terminal_cwd, Some(path));
+    }
+
+    #[test]
+    fn launch_options_ignore_invalid_directory_argument() {
+        let options = super::launch::LaunchOptions::from_args([
+            OsString::from("orbitshell"),
+            OsString::from("/definitely/not/a/real/orbitshell/path"),
+        ]);
+
+        assert_eq!(options.base_terminal_cwd, None);
+    }
+
+    #[test]
+    fn base_terminal_sidebar_renders_only_when_sidebar_is_visible() {
+        assert!(!Workspace::should_show_sidebar_for_tab(
+            TabKind::BaseTerminal,
+            false
+        ));
+        assert!(Workspace::should_show_sidebar_for_tab(
+            TabKind::BaseTerminal,
+            true
+        ));
+    }
+
+    #[test]
+    fn welcome_and_utility_tabs_never_show_sidebar() {
+        assert!(!Workspace::should_show_sidebar_for_tab(
+            TabKind::Welcome,
+            true
+        ));
+        assert!(!Workspace::should_show_sidebar_for_tab(
+            TabKind::Utility,
+            true
+        ));
+    }
+
+    #[test]
+    fn project_tabs_follow_sidebar_visibility() {
+        assert!(!Workspace::should_show_sidebar_for_tab(
+            TabKind::Project,
+            false
+        ));
+        assert!(Workspace::should_show_sidebar_for_tab(
+            TabKind::Project,
+            true
+        ));
+    }
+
+    #[test]
+    fn unique_child_dir_adds_suffix_when_directory_exists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(temp.path().join("orbitshell")).expect("create existing dir");
+
+        assert_eq!(
+            Workspace::unique_child_dir(temp.path(), "orbitshell"),
+            temp.path().join("orbitshell-2")
+        );
+    }
+
+    #[test]
+    fn quote_terminal_arg_wraps_values_for_clone_command() {
+        assert_eq!(
+            Workspace::quote_terminal_arg("https://github.com/owner/my app.git"),
+            "\"https://github.com/owner/my app.git\""
+        );
     }
 }

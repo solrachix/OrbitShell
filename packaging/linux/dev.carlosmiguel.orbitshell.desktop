@@ -1,9 +1,16 @@
 [Desktop Entry]
 Name=OrbitShell
 Comment=Modern block-based terminal UI
-Exec=orbitshell
+Exec=orbitshell %F
 Icon=orbitshell
 Type=Application
 Terminal=false
 Categories=System;TerminalEmulator;
+MimeType=inode/directory;
 StartupNotify=true
+Actions=OpenDirectory;
+
+[Desktop Action OpenDirectory]
+Name=Open in OrbitShell
+Exec=orbitshell %F
+Icon=orbitshell

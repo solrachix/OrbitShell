@@ -3,7 +3,9 @@ use orbitshell::ui;
 use std::borrow::Cow;
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    let launch_options = ui::launch::LaunchOptions::from_args(std::env::args_os());
+
+    Application::new().run(move |cx: &mut App| {
         cx.text_system()
             .add_fonts(vec![Cow::Borrowed(lucide_icons::LUCIDE_FONT_BYTES)])
             .ok();
@@ -15,7 +17,10 @@ fn main() {
         });
         options.window_decorations = Some(WindowDecorations::Client);
 
-        cx.open_window(options, |_, cx| cx.new(|cx| ui::Workspace::new(cx)))
-            .expect("failed to open window");
+        let launch_options = launch_options.clone();
+        cx.open_window(options, move |_, cx| {
+            cx.new(|cx| ui::Workspace::new_with_options(cx, launch_options.clone()))
+        })
+        .expect("failed to open window");
     });
 }

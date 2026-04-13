@@ -20,10 +20,18 @@ install -m 755 "${BIN_SRC}" "${BIN_DEST}"
 cat > "${DESKTOP_FILE}" <<EOF
 [Desktop Entry]
 Name=OrbitShell
-Exec=${BIN_DEST}
+Comment=Modern block-based terminal UI
+Exec=${BIN_DEST} %F
 Type=Application
 Terminal=false
 Categories=System;TerminalEmulator;
+MimeType=inode/directory;
+StartupNotify=true
+Actions=OpenDirectory;
+
+[Desktop Action OpenDirectory]
+Name=Open in OrbitShell
+Exec=${BIN_DEST} %F
 EOF
 
 echo "Installed OrbitShell to ${BIN_DEST}"

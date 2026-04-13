@@ -30,7 +30,10 @@ use crate::ui::recent::RecentEntry;
 use crate::ui::text_edit::TextEditState;
 use crate::ui::views::agent_view::AgentView;
 use crate::ui::views::settings_view::SettingsView;
-use crate::ui::views::welcome_view::{OpenRepositoryEvent, WelcomeView};
+use crate::ui::views::welcome_view::{
+    CloneRepositoryEvent, CreateProjectEvent, OpenRepositoryEvent, StartBaseTerminalEvent,
+    WelcomeView,
+};
 
 const DEFAULT_PREVIEW_TERMINAL_HEIGHT: f32 = 260.0;
 const MIN_PREVIEW_TERMINAL_HEIGHT: f32 = 180.0;
@@ -472,6 +475,9 @@ struct SuggestionItem {
 pub enum TabViewEvent {
     CwdChanged(PathBuf),
     OpenRepository(PathBuf),
+    StartBaseTerminal { command: String },
+    CreateProject { prompt: String, parent: PathBuf },
+    CloneRepository { url: String, parent: PathBuf },
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
@@ -1556,6 +1562,29 @@ impl TabView {
         let welcome = cx.new(|cx| WelcomeView::with_recent(cx, recent));
         cx.subscribe(&welcome, |_, _welcome, event: &OpenRepositoryEvent, cx| {
             cx.emit(TabViewEvent::OpenRepository(event.path.clone()));
+        })
+        .detach();
+        cx.subscribe(
+            &welcome,
+            |_, _welcome, event: &StartBaseTerminalEvent, cx| {
+                cx.emit(TabViewEvent::StartBaseTerminal {
+                    command: event.command.clone(),
+                });
+            },
+        )
+        .detach();
+        cx.subscribe(&welcome, |_, _welcome, event: &CreateProjectEvent, cx| {
+            cx.emit(TabViewEvent::CreateProject {
+                prompt: event.prompt.clone(),
+                parent: event.parent.clone(),
+            });
+        })
+        .detach();
+        cx.subscribe(&welcome, |_, _welcome, event: &CloneRepositoryEvent, cx| {
+            cx.emit(TabViewEvent::CloneRepository {
+                url: event.url.clone(),
+                parent: event.parent.clone(),
+            });
         })
         .detach();
         view.mode = TabViewMode::Welcome(welcome);
@@ -2735,7 +2764,21 @@ impl TabView {
         }
     }
 
+    pub fn normalize_initial_terminal_command(command: Option<&str>) -> Option<String> {
+        let command = command?.trim();
+        (!command.is_empty()).then(|| command.to_string())
+    }
+
     pub fn start_terminal_with_path(&mut self, cx: &mut Context<Self>, path: Option<PathBuf>) {
+        self.start_terminal_with_path_and_command(cx, path, None);
+    }
+
+    pub fn start_terminal_with_path_and_command(
+        &mut self,
+        cx: &mut Context<Self>,
+        path: Option<PathBuf>,
+        initial_command: Option<String>,
+    ) {
         if self.pty.is_some() {
             return;
         }
@@ -2805,6 +2848,24 @@ impl TabView {
             }
         })
         .detach();
+
+        if let Some(command) = Self::normalize_initial_terminal_command(initial_command.as_deref())
+        {
+            self.run_command(command, cx);
+        }
+    }
+
+    pub fn start_agent_prompt_with_path(
+        &mut self,
+        cx: &mut Context<Self>,
+        path: Option<PathBuf>,
+        prompt: String,
+    ) {
+        self.start_terminal_with_path_and_command(cx, path, None);
+        self.input_mode = InputMode::Agent;
+        if let Some(prompt) = Self::normalize_initial_terminal_command(Some(&prompt)) {
+            self.run_agent_prompt(prompt, cx);
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -4285,6 +4346,9 @@ impl TabView {
         self.discovered_models.clear();
         let selected_key = self.agent_selected_key.clone();
         let runtime_preferences = self.runtime_preferences.clone();
+        let session_cwd = expand_tilde(&self.current_path)
+            .to_string_lossy()
+            .to_string();
 
         let (tx, mut rx) = mpsc::unbounded::<Result<Vec<AcpModelOption>, String>>();
         thread::spawn(move || {
@@ -4295,10 +4359,6 @@ impl TabView {
                 if guard.protocol_version.is_none() {
                     guard.initialize().map_err(|err| err.to_string())?;
                 }
-                let cwd = std::env::current_dir()
-                    .map_err(|err| err.to_string())?
-                    .to_string_lossy()
-                    .to_string();
                 let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
                 let persisted_default = selected_key.as_ref().and_then(|key| {
                     runtime_preferences
@@ -4307,7 +4367,7 @@ impl TabView {
                         .and_then(|prefs| prefs.default_model_for(key))
                 });
                 let bootstrap = guard
-                    .ensure_session(&cwd, &runtime_mcp, persisted_default.as_deref())
+                    .ensure_session(&session_cwd, &runtime_mcp, persisted_default.as_deref())
                     .map_err(|err| err.to_string())?;
                 Ok(bootstrap.model_options)
             })();
@@ -4670,6 +4730,9 @@ impl TabView {
         let selected_key = self.agent_selected_key.clone();
         let runtime_preferences = self.runtime_preferences.clone();
         let session_override = self.selected_model_override.clone();
+        let session_cwd = expand_tilde(&self.current_path)
+            .to_string_lossy()
+            .to_string();
 
         let (tx, mut rx) = mpsc::unbounded::<AgentPromptEvent>();
         thread::spawn(move || {
@@ -4716,17 +4779,13 @@ impl TabView {
                 let _ = tx.unbounded_send(AgentPromptEvent::Status(
                     AGENT_STARTING_SESSION_PLACEHOLDER.to_string(),
                 ));
-                let cwd = std::env::current_dir()
-                    .map_err(|err| err.to_string())?
-                    .to_string_lossy()
-                    .to_string();
                 let runtime_mcp = crate::mcp::probe::load_enabled_runtime_mcp_servers();
                 if let Some(ref key) = selected_key {
                     let mut prefs = runtime_preferences
                         .lock()
                         .map_err(|_| "runtime preferences lock poisoned".to_string())?;
                     let bootstrap = guard
-                        .ensure_session(&cwd, &runtime_mcp, session_override.as_deref())
+                        .ensure_session(&session_cwd, &runtime_mcp, session_override.as_deref())
                         .map_err(|err| err.to_string())?;
                     let catalog = bootstrap.model_options;
                     let ids = catalog
@@ -4764,7 +4823,7 @@ impl TabView {
                         .map_err(|err| err.to_string());
                 }
                 let bootstrap = guard
-                    .ensure_session(&cwd, &runtime_mcp, session_override.as_deref())
+                    .ensure_session(&session_cwd, &runtime_mcp, session_override.as_deref())
                     .map_err(|err| err.to_string())?;
                 let _ =
                     tx.unbounded_send(AgentPromptEvent::Models(bootstrap.model_options.clone()));
@@ -7667,6 +7726,19 @@ mod tests {
         assert!(!TabView::is_prompt_line("Downloads: $120"));
         assert!(!TabView::is_prompt_line("assets docs packages"));
         assert!(!TabView::is_prompt_line("error code #42"));
+    }
+
+    #[test]
+    fn normalize_initial_terminal_command_ignores_empty_values() {
+        assert_eq!(
+            TabView::normalize_initial_terminal_command(Some("  ls  ")),
+            Some("ls".to_string())
+        );
+        assert_eq!(
+            TabView::normalize_initial_terminal_command(Some("   ")),
+            None
+        );
+        assert_eq!(TabView::normalize_initial_terminal_command(None), None);
     }
 
     #[test]

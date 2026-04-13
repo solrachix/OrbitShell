@@ -42,6 +42,13 @@ Section "Install"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "Publisher" "${APP_PUBLISHER}"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell" "UninstallString" "$INSTDIR\\Uninstall.exe"
+
+  WriteRegStr HKCU "Software\\Classes\\Directory\\shell\\OrbitShell" "" "Open in OrbitShell"
+  WriteRegStr HKCU "Software\\Classes\\Directory\\shell\\OrbitShell" "Icon" "$INSTDIR\\logo.ico"
+  WriteRegStr HKCU "Software\\Classes\\Directory\\shell\\OrbitShell\\command" "" "$\"$INSTDIR\\${APP_EXE}$\" $\"%1$\""
+  WriteRegStr HKCU "Software\\Classes\\Directory\\Background\\shell\\OrbitShell" "" "Open in OrbitShell"
+  WriteRegStr HKCU "Software\\Classes\\Directory\\Background\\shell\\OrbitShell" "Icon" "$INSTDIR\\logo.ico"
+  WriteRegStr HKCU "Software\\Classes\\Directory\\Background\\shell\\OrbitShell\\command" "" "$\"$INSTDIR\\${APP_EXE}$\" $\"%V$\""
 SectionEnd
 
 Section "Uninstall"
@@ -54,6 +61,8 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\\OrbitShell\\OrbitShell.lnk"
   RMDir "$SMPROGRAMS\\OrbitShell"
   Delete "$DESKTOP\\OrbitShell.lnk"
+  DeleteRegKey HKCU "Software\\Classes\\Directory\\shell\\OrbitShell"
+  DeleteRegKey HKCU "Software\\Classes\\Directory\\Background\\shell\\OrbitShell"
   DeleteRegKey HKCU "Software\\OrbitShell"
   DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OrbitShell"
 SectionEnd

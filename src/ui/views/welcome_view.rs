@@ -8,11 +8,27 @@ pub struct OpenRepositoryEvent {
     pub path: PathBuf,
 }
 
+pub struct StartBaseTerminalEvent {
+    pub command: String,
+}
+
+pub struct CreateProjectEvent {
+    pub prompt: String,
+    pub parent: PathBuf,
+}
+
+pub struct CloneRepositoryEvent {
+    pub url: String,
+    pub parent: PathBuf,
+}
+
 pub struct WelcomeView {
     focus_handle: FocusHandle,
+    auto_focus: bool,
     recent: Vec<RecentEntry>,
     overlay: Option<WelcomeOverlay>,
     input: String,
+    terminal_input: String,
     suggest_index: usize,
 }
 
@@ -26,9 +42,11 @@ impl WelcomeView {
     pub fn with_recent(cx: &mut Context<Self>, recent: Vec<RecentEntry>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            auto_focus: true,
             recent,
             overlay: None,
             input: String::new(),
+            terminal_input: String::new(),
             suggest_index: 0,
         }
     }
@@ -102,6 +120,15 @@ impl WelcomeView {
         cx.notify();
     }
 
+    fn on_focus_welcome(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -109,6 +136,7 @@ impl WelcomeView {
         cx: &mut Context<Self>,
     ) {
         if self.overlay.is_none() {
+            self.handle_terminal_input_key_down(event, cx);
             return;
         }
 
@@ -153,14 +181,106 @@ impl WelcomeView {
         }
     }
 
+    pub(crate) fn normalize_terminal_command(input: &str) -> Option<String> {
+        let command = input.trim();
+        (!command.is_empty()).then(|| command.to_string())
+    }
+
+    fn handle_terminal_input_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "enter" | "return" | "numpadenter" => {
+                if let Some(command) = Self::normalize_terminal_command(&self.terminal_input) {
+                    self.terminal_input.clear();
+                    cx.emit(StartBaseTerminalEvent { command });
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            "backspace" => {
+                self.terminal_input.pop();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "escape" => {
+                if !self.terminal_input.is_empty() {
+                    self.terminal_input.clear();
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            "space" => {
+                self.terminal_input.push(' ');
+                cx.notify();
+                cx.stop_propagation();
+            }
+            _ => {
+                if let Some(text) = event.keystroke.key_char.as_deref() {
+                    self.terminal_input.push_str(text);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+        }
+    }
+
+    fn prompt_for_project_parent(&mut self, prompt: String, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose project location".into()),
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let selected_parent = match picker.await {
+                    Ok(Ok(Some(mut paths))) => paths.pop(),
+                    _ => None,
+                };
+
+                if let Some(parent) = selected_parent {
+                    let _ = view.update(&mut cx, |_view, cx| {
+                        cx.emit(CreateProjectEvent { prompt, parent });
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn prompt_for_clone_parent(&mut self, url: String, cx: &mut Context<Self>) {
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose clone location".into()),
+        });
+
+        cx.spawn(|view: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let selected_parent = match picker.await {
+                    Ok(Ok(Some(mut paths))) => paths.pop(),
+                    _ => None,
+                };
+
+                if let Some(parent) = selected_parent {
+                    let _ = view.update(&mut cx, |_view, cx| {
+                        cx.emit(CloneRepositoryEvent { url, parent });
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     fn commit_overlay(&mut self, cx: &mut Context<Self>) {
         match self.overlay.take() {
             Some(WelcomeOverlay::CloneRepository) => {
                 let url = self.input.trim().to_string();
                 if !url.is_empty() {
-                    println!("Cloning repository: {}", url);
-                    // In a real app, this would spawn a git process
-                    // For now, we'll just dismiss and notify
+                    self.prompt_for_clone_parent(url, cx);
                 }
             }
             Some(WelcomeOverlay::CreateProject) => {
@@ -172,7 +292,7 @@ impl WelcomeView {
                 };
 
                 if let Some(prompt) = selected {
-                    println!("Creating project with prompt: {}", prompt);
+                    self.prompt_for_project_parent(prompt, cx);
                 }
             }
             None => {}
@@ -276,7 +396,12 @@ fn format_recent_time(last_opened: i64, now: i64) -> String {
 }
 
 impl Render for WelcomeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.auto_focus {
+            window.focus(&self.focus_handle);
+            self.auto_focus = false;
+        }
+
         let recent_items = if self.recent.is_empty() {
             vec![self.render_recent_item(
                 Icon::Clock,
@@ -312,10 +437,12 @@ impl Render for WelcomeView {
             .flex_col()
             .size_full()
             .bg(rgb(0x0a0a0a))
+            .track_focus(&self.focus_handle)
             .items_center()
             .justify_center()
             .gap(px(32.0))
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_focus_welcome))
             .child(
                 // Action buttons
                 div()
@@ -349,6 +476,7 @@ impl Render for WelcomeView {
                         .cursor(CursorStyle::PointingHand),
                     ),
             )
+            .child(self.render_terminal_input())
             .child(
                 // Recent section
                 div()
@@ -370,6 +498,62 @@ impl Render for WelcomeView {
 }
 
 impl WelcomeView {
+    fn render_terminal_input(&self) -> Div {
+        let placeholder = if self.terminal_input.is_empty() {
+            "Type a command..."
+        } else {
+            ""
+        };
+
+        div()
+            .w(px(600.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded(px(8.0))
+            .bg(rgb(0x111111))
+            .border_1()
+            .border_color(rgb(0x252525))
+            .child(lucide_icon(Icon::Terminal, 16.0, 0x6b9eff).cursor(CursorStyle::IBeam))
+            .child(
+                div()
+                    .flex_1()
+                    .relative()
+                    .min_h(px(20.0))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(rgb(0x777777))
+                            .font_family("Cascadia Code")
+                            .child(placeholder),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .text_color(rgb(0xeeeeee))
+                                    .font_family("Cascadia Code")
+                                    .child(self.terminal_input.clone()),
+                            )
+                            .child(div().w(px(2.0)).h(px(16.0)).bg(rgb(0x6b9eff))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x777777))
+                    .child("Enter"),
+            )
+    }
+
     fn render_overlay(&self, cx: &Context<Self>) -> Div {
         let Some(ref overlay) = self.overlay else {
             return div().h(px(0.0));
@@ -539,3 +723,20 @@ impl Focusable for WelcomeView {
 }
 
 impl EventEmitter<OpenRepositoryEvent> for WelcomeView {}
+impl EventEmitter<StartBaseTerminalEvent> for WelcomeView {}
+impl EventEmitter<CreateProjectEvent> for WelcomeView {}
+impl EventEmitter<CloneRepositoryEvent> for WelcomeView {}
+
+#[cfg(test)]
+mod tests {
+    use super::WelcomeView;
+
+    #[test]
+    fn normalize_welcome_terminal_command_trims_and_ignores_empty_input() {
+        assert_eq!(
+            WelcomeView::normalize_terminal_command("  pwd  "),
+            Some("pwd".to_string())
+        );
+        assert_eq!(WelcomeView::normalize_terminal_command("   "), None);
+    }
+}
