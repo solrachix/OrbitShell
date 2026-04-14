@@ -26,19 +26,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ui::icons::{lucide_icon, registry_avatar};
+use crate::ui::launch;
 use crate::ui::recent::RecentEntry;
 use crate::ui::text_edit::TextEditState;
 use crate::ui::views::agent_view::AgentView;
 use crate::ui::views::settings_view::SettingsView;
 use crate::ui::views::welcome_view::{
-    CloneRepositoryEvent, CreateProjectEvent, OpenRepositoryEvent, StartBaseTerminalEvent,
-    WelcomeView,
+    CloneRepositoryEvent, CreateProjectEvent, OpenRepositoryEvent, WelcomeView,
 };
 
 const DEFAULT_PREVIEW_TERMINAL_HEIGHT: f32 = 260.0;
 const MIN_PREVIEW_TERMINAL_HEIGHT: f32 = 180.0;
 const MAX_PREVIEW_TERMINAL_HEIGHT: f32 = 520.0;
 const PREVIEW_TERMINAL_RESIZE_HANDLE_HEIGHT: f32 = 6.0;
+const INPUT_MIN_WRAP_CHARS: usize = 48;
+const INPUT_MAX_WRAP_CHARS: usize = 180;
+const INPUT_WRAP_RESERVED_WIDTH: f32 = 220.0;
+const INPUT_MONO_CHAR_WIDTH: f32 = 8.2;
+const MAX_RENDERED_INPUT_LINES: usize = 4;
+const INPUT_LINE_HEIGHT: f32 = 20.0;
+const INPUT_LINE_GAP: f32 = 2.0;
 
 pub struct TabView {
     blocks: Vec<Block>,
@@ -472,10 +479,18 @@ struct SuggestionItem {
     insert: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputVisualLine {
+    left: String,
+    right: String,
+    has_cursor: bool,
+}
+
 pub enum TabViewEvent {
     CwdChanged(PathBuf),
     OpenRepository(PathBuf),
-    StartBaseTerminal { command: String },
+    StartBaseTerminal { path: PathBuf, command: String },
+    StartBaseAgent { path: PathBuf, prompt: String },
     CreateProject { prompt: String, parent: PathBuf },
     CloneRepository { url: String, parent: PathBuf },
 }
@@ -562,6 +577,13 @@ enum FilePreviewMode {
 enum InputMode {
     Terminal,
     Agent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitInputTarget {
+    CurrentSession,
+    StartBaseTerminal,
+    StartBaseAgent,
 }
 
 enum AgentPromptEvent {
@@ -1564,15 +1586,6 @@ impl TabView {
             cx.emit(TabViewEvent::OpenRepository(event.path.clone()));
         })
         .detach();
-        cx.subscribe(
-            &welcome,
-            |_, _welcome, event: &StartBaseTerminalEvent, cx| {
-                cx.emit(TabViewEvent::StartBaseTerminal {
-                    command: event.command.clone(),
-                });
-            },
-        )
-        .detach();
         cx.subscribe(&welcome, |_, _welcome, event: &CreateProjectEvent, cx| {
             cx.emit(TabViewEvent::CreateProject {
                 prompt: event.prompt.clone(),
@@ -1608,6 +1621,7 @@ impl TabView {
     fn new_base(cx: &mut Context<Self>) -> Self {
         let (history, history_file) = Self::load_initial_history();
         let last_path_var = std::env::var("PATH").unwrap_or_default();
+        let base_terminal_cwd = launch::default_base_terminal_cwd();
         let agent_rows = load_effective_agent_rows(ConflictPolicy::LocalWins).unwrap_or_default();
         let agent_selected_key = agent_rows.first().map(|row| row.agent_key.clone());
         let model_options_loading = agent_selected_key.is_some();
@@ -1636,8 +1650,8 @@ impl TabView {
             path_commands: Self::load_path_commands(),
             last_path_scan: Instant::now(),
             last_path_var,
-            current_path: "~".to_string(),
-            git_status: None,
+            current_path: Self::format_path(&base_terminal_cwd),
+            git_status: get_git_status(&base_terminal_cwd),
             auto_focus: true,
             pending_echo: None,
             scroll_handle: ScrollHandle::new(),
@@ -3745,8 +3759,15 @@ impl TabView {
             Overlay::Path(picker) => {
                 if let Some(entry) = picker.entries.get(picker.selected) {
                     if entry.is_dir {
-                        let cmd = format!("cd \"{}\"", entry.path.to_string_lossy());
-                        self.run_command(cmd, cx);
+                        if matches!(self.mode, TabViewMode::Welcome(_)) && self.pty.is_none() {
+                            self.current_path = Self::format_path(&entry.path);
+                            self.git_status = get_git_status(&entry.path);
+                            cx.emit(TabViewEvent::CwdChanged(entry.path.clone()));
+                            cx.notify();
+                        } else {
+                            let cmd = format!("cd \"{}\"", entry.path.to_string_lossy());
+                            self.run_command(cmd, cx);
+                        }
                     } else {
                         self.overlay = None;
                         cx.notify();
@@ -3756,7 +3777,14 @@ impl TabView {
             Overlay::Branch(picker) => {
                 if let Some(branch) = picker.branches.get(picker.selected) {
                     let cmd = format!("git checkout {}", branch);
-                    self.run_command(cmd, cx);
+                    if matches!(self.mode, TabViewMode::Welcome(_)) && self.pty.is_none() {
+                        cx.emit(TabViewEvent::StartBaseTerminal {
+                            path: self.base_terminal_cwd_for_input(),
+                            command: cmd,
+                        });
+                    } else {
+                        self.run_command(cmd, cx);
+                    }
                 }
             }
             Overlay::Agent(picker) => {
@@ -3807,6 +3835,7 @@ impl TabView {
         let action_button = |icon: Icon| {
             div()
                 .flex()
+                .flex_none()
                 .items_center()
                 .justify_center()
                 .w(px(24.0))
@@ -3827,14 +3856,19 @@ impl TabView {
             .and_then(|manifest| manifest.icon.as_ref())
             .is_some();
         let model_button_state = self.current_model_button_state();
+        let input_wrap_chars = Self::input_wrap_chars(window);
+        let input_line_count = Self::rendered_input_line_count(&self.input, input_wrap_chars);
+        let input_bar_height = 84.0
+            + (input_line_count.saturating_sub(1) as f32 * (INPUT_LINE_HEIGHT + INPUT_LINE_GAP));
 
         div()
             .flex()
             .flex_col()
+            .min_w(px(0.0))
             .gap(px(8.0))
             .px(px(16.0))
             .py(px(10.0))
-            .h(px(84.0))
+            .h(px(input_bar_height))
             .bg(rgb(0x1a1a1a))
             .border_1()
             .border_color(rgb(0x2a2a2a))
@@ -3844,11 +3878,13 @@ impl TabView {
                 // Meta row (path + git)
                 div()
                     .flex()
+                    .min_w(px(0.0))
                     .items_center()
                     .gap(px(8.0))
                     .child(
                         div()
                             .flex()
+                            .min_w(px(0.0))
                             .items_center()
                             .gap(px(4.0))
                             .px(px(4.0))
@@ -3926,6 +3962,7 @@ impl TabView {
                     .child(if agent_mode {
                         div()
                             .flex()
+                            .min_w(px(0.0))
                             .items_center()
                             .gap(px(6.0))
                             .px(px(8.0))
@@ -3943,6 +3980,8 @@ impl TabView {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(rgb(0xcfcfcf))
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .child(agent_name),
                             )
                             .child(if self.agent_needs_auth {
@@ -4029,6 +4068,7 @@ impl TabView {
                     .child(
                         div()
                             .flex()
+                            .min_w(px(0.0))
                             .items_center()
                             .gap(px(8.0))
                             .px(px(10.0))
@@ -4050,12 +4090,15 @@ impl TabView {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(rgb(0xcfcfcf))
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .child(self.current_path.clone()),
                             ),
                     )
                     .child(if let Some(ref status) = self.git_status {
                         div()
                             .flex()
+                            .min_w(px(0.0))
                             .items_center()
                             .gap(px(6.0))
                             .px(px(10.0))
@@ -4077,6 +4120,8 @@ impl TabView {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(rgb(0xd7f7c7))
+                                    .min_w(px(0.0))
+                                    .truncate()
                                     .child(status.branch.clone()),
                             )
                             .child(if status.files_changed > 0 {
@@ -4122,24 +4167,36 @@ impl TabView {
                 div()
                     .flex_1()
                     .flex()
-                    .items_center()
+                    .min_w(px(0.0))
+                    .items_end()
                     .gap(px(8.0))
                     .child(
                         div()
                             .flex()
-                            .items_center()
+                            .min_w(px(0.0))
+                            .items_start()
                             .gap(px(8.0))
                             .flex_1()
                             .child(
                                 lucide_icon(Icon::ChevronRight, 16.0, 0x6b9eff)
                                     .cursor(clickable_cursor()),
                             )
-                            .child(self.render_input_text(is_focused)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .max_h(px(Self::input_text_viewport_height(
+                                        MAX_RENDERED_INPUT_LINES,
+                                    )))
+                                    .overflow_hidden()
+                                    .child(self.render_input_text(is_focused, input_wrap_chars)),
+                            ),
                     )
                     .child(
                         // Action icons
                         div()
                             .flex()
+                            .flex_none()
                             .items_center()
                             .gap(px(10.0))
                             .child(action_button(Icon::Clipboard).on_mouse_down(
@@ -4153,32 +4210,43 @@ impl TabView {
             )
     }
 
-    fn render_input_text(&self, is_focused: bool) -> Div {
+    fn render_input_text(&self, is_focused: bool, input_wrap_chars: usize) -> Div {
         let show_placeholder = self.input.is_empty();
-        let ghost = self.inline_ghost_text();
-        let has_selection = self.has_selection();
+        let input_wraps = self.input.chars().count() > input_wrap_chars;
+        let ghost = if input_wraps {
+            String::new()
+        } else {
+            self.inline_ghost_text()
+        };
+        let has_selection = !input_wraps && self.has_selection();
         let show_ghost = !ghost.is_empty() && !show_placeholder && !has_selection;
 
-        let caret = div()
-            .w(px(2.0))
-            .h(px(16.0))
-            .rounded(px(1.0))
-            .bg(if is_focused {
-                rgb(0x6b9eff)
-            } else {
-                rgb(0x2a2a2a)
-            });
+        let caret = || {
+            div()
+                .flex_none()
+                .w(px(2.0))
+                .h(px(16.0))
+                .rounded(px(1.0))
+                .bg(if is_focused {
+                    rgb(0x6b9eff)
+                } else {
+                    rgb(0x2a2a2a)
+                })
+        };
 
         let text_normal = |text: String| {
             div()
+                .min_w(px(0.0))
                 .text_size(px(15.0))
                 .text_color(rgb(0xdddddd))
                 .font_family("Cascadia Code")
+                .truncate()
                 .child(text)
         };
 
         let text_selected = |text: String| {
             div()
+                .min_w(px(0.0))
                 .px(px(2.0))
                 .py(px(1.0))
                 .rounded(px(3.0))
@@ -4188,6 +4256,7 @@ impl TabView {
                         .text_size(px(15.0))
                         .text_color(rgb(0xf0f0f0))
                         .font_family("Cascadia Code")
+                        .truncate()
                         .child(text),
                 )
         };
@@ -4200,22 +4269,57 @@ impl TabView {
         let placeholder = div()
             .text_size(px(15.0))
             .text_color(rgb(0x7c7c7c))
+            .truncate()
             .child(placeholder_text);
 
         let ghost_div = div()
+            .min_w(px(0.0))
             .text_size(px(15.0))
             .text_color(rgb(0x626262))
             .font_family("Cascadia Code")
+            .truncate()
             .child(ghost);
 
-        let mut row = div().flex().gap(px(0.0));
+        let mut row = div().flex().min_w(px(0.0)).overflow_hidden().gap(px(0.0));
 
         if show_placeholder {
-            row = row.child(caret).child(placeholder);
+            row = row.child(caret()).child(placeholder);
             return row;
         }
 
-        if let Some((a, b)) = self.normalized_selection().filter(|(a, b)| a != b) {
+        if input_wraps {
+            let lines = Self::input_visual_lines(
+                &self.input,
+                self.cursor,
+                input_wrap_chars,
+                MAX_RENDERED_INPUT_LINES,
+            );
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .gap(px(INPUT_LINE_GAP))
+                .children(lines.into_iter().map(|line| {
+                    let mut line_row = div()
+                        .flex()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .h(px(INPUT_LINE_HEIGHT))
+                        .gap(px(0.0));
+                    if line.has_cursor {
+                        line_row = line_row
+                            .child(text_normal(line.left))
+                            .child(caret())
+                            .child(text_normal(line.right));
+                    } else {
+                        line_row =
+                            line_row.child(text_normal(format!("{}{}", line.left, line.right)));
+                    }
+                    line_row
+                }));
+        } else if let Some((a, b)) = self.normalized_selection().filter(|(a, b)| a != b) {
             let (pre, rest) = Self::split_at_index(&self.input, a);
             let (sel, post) = Self::split_at_index(&rest, b.saturating_sub(a));
 
@@ -4223,7 +4327,7 @@ impl TabView {
                 let (pre_left, pre_right) = Self::split_at_index(&pre, self.cursor.min(a));
                 row = row
                     .child(text_normal(pre_left))
-                    .child(caret)
+                    .child(caret())
                     .child(text_normal(pre_right))
                     .child(text_selected(sel))
                     .child(text_normal(post));
@@ -4234,7 +4338,7 @@ impl TabView {
                     .child(text_normal(pre))
                     .child(text_selected(sel))
                     .child(text_normal(post_left))
-                    .child(caret)
+                    .child(caret())
                     .child(text_normal(post_right));
             } else {
                 let sel_cursor = self.cursor.saturating_sub(a);
@@ -4242,7 +4346,7 @@ impl TabView {
                 row = row
                     .child(text_normal(pre))
                     .child(text_selected(sel_left))
-                    .child(caret)
+                    .child(caret())
                     .child(text_selected(sel_right))
                     .child(text_normal(post));
             }
@@ -4250,7 +4354,7 @@ impl TabView {
             let (left, right) = self.split_at_cursor();
             row = row
                 .child(text_normal(left))
-                .child(caret)
+                .child(caret())
                 .child(text_normal(right));
             if show_ghost {
                 row = row.child(ghost_div);
@@ -4960,10 +5064,55 @@ impl TabView {
             return;
         }
 
-        if self.input_mode == InputMode::Agent {
-            self.run_agent_prompt(command, cx);
+        match Self::commit_input_target_for_context(
+            matches!(self.mode, TabViewMode::Welcome(_)),
+            self.pty.is_some(),
+            self.input_mode,
+        ) {
+            CommitInputTarget::StartBaseTerminal => {
+                cx.emit(TabViewEvent::StartBaseTerminal {
+                    path: self.base_terminal_cwd_for_input(),
+                    command,
+                });
+            }
+            CommitInputTarget::StartBaseAgent => {
+                cx.emit(TabViewEvent::StartBaseAgent {
+                    path: self.base_terminal_cwd_for_input(),
+                    prompt: command,
+                });
+            }
+            CommitInputTarget::CurrentSession => {
+                if self.input_mode == InputMode::Agent {
+                    self.run_agent_prompt(command, cx);
+                } else {
+                    self.run_command(command, cx);
+                }
+            }
+        }
+    }
+
+    fn commit_input_target_for_context(
+        is_welcome: bool,
+        pty_active: bool,
+        input_mode: InputMode,
+    ) -> CommitInputTarget {
+        if is_welcome && !pty_active {
+            if input_mode == InputMode::Agent {
+                CommitInputTarget::StartBaseAgent
+            } else {
+                CommitInputTarget::StartBaseTerminal
+            }
         } else {
-            self.run_command(command, cx);
+            CommitInputTarget::CurrentSession
+        }
+    }
+
+    fn base_terminal_cwd_for_input(&self) -> PathBuf {
+        let cwd = expand_tilde(&self.current_path);
+        if cwd.is_dir() {
+            cwd
+        } else {
+            launch::default_base_terminal_cwd()
         }
     }
 
@@ -5785,6 +5934,83 @@ impl TabView {
             }
         }
         (left, right)
+    }
+
+    fn input_wrap_chars(window: &Window) -> usize {
+        let viewport_width = window.viewport_size().width / px(1.0);
+        let input_width = (viewport_width - INPUT_WRAP_RESERVED_WIDTH).max(0.0);
+        (input_width / INPUT_MONO_CHAR_WIDTH)
+            .floor()
+            .max(INPUT_MIN_WRAP_CHARS as f32)
+            .min(INPUT_MAX_WRAP_CHARS as f32) as usize
+    }
+
+    fn rendered_input_line_count(input: &str, wrap_chars: usize) -> usize {
+        let count = input.chars().count();
+        if count == 0 || wrap_chars == 0 {
+            return 1;
+        }
+        let lines = (count + wrap_chars - 1) / wrap_chars;
+        lines.clamp(1, MAX_RENDERED_INPUT_LINES)
+    }
+
+    fn input_text_viewport_height(line_count: usize) -> f32 {
+        let line_count = line_count.max(1);
+        line_count as f32 * INPUT_LINE_HEIGHT + line_count.saturating_sub(1) as f32 * INPUT_LINE_GAP
+    }
+
+    fn input_visual_lines(
+        input: &str,
+        cursor: usize,
+        wrap_chars: usize,
+        max_lines: usize,
+    ) -> Vec<InputVisualLine> {
+        if input.is_empty() || wrap_chars == 0 || max_lines == 0 {
+            return vec![InputVisualLine {
+                left: String::new(),
+                right: String::new(),
+                has_cursor: true,
+            }];
+        }
+
+        let chars = input.chars().collect::<Vec<_>>();
+        let total = chars.len();
+        let cursor = cursor.min(total);
+        let total_lines = (total + wrap_chars - 1) / wrap_chars;
+        let cursor_line = (cursor / wrap_chars).min(total_lines.saturating_sub(1));
+        let start_line = if total_lines <= max_lines {
+            0
+        } else {
+            cursor_line
+                .saturating_sub(max_lines / 2)
+                .min(total_lines - max_lines)
+        };
+        let end_line = (start_line + max_lines).min(total_lines);
+
+        (start_line..end_line)
+            .map(|line_index| {
+                let start = line_index * wrap_chars;
+                let end = ((line_index + 1) * wrap_chars).min(total);
+                let is_last_line = line_index == total_lines.saturating_sub(1);
+                let has_cursor =
+                    cursor >= start && (cursor < end || (is_last_line && cursor == end));
+                if has_cursor {
+                    let left = chars[start..cursor].iter().collect::<String>();
+                    let right = chars[cursor..end].iter().collect::<String>();
+                    InputVisualLine {
+                        left,
+                        right,
+                        has_cursor,
+                    }
+                } else {
+                    InputVisualLine {
+                        left: chars[start..end].iter().collect(),
+                        right: String::new(),
+                        has_cursor,
+                    }
+                }
+            })
+            .collect()
     }
 
     fn has_selection(&self) -> bool {
@@ -6864,6 +7090,9 @@ impl Render for TabView {
             .flex_col()
             .size_full()
             .min_h(px(0.0))
+            .min_w(px(0.0))
+            .relative()
+            .overflow_hidden()
             .bg(rgb(0x0a0a0a));
 
         if matches!(self.mode, TabViewMode::Terminal) {
@@ -6873,7 +7102,33 @@ impl Render for TabView {
                 .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::on_focus_input))
                 .child(self.render_terminal_workspace(window, cx));
         } else if let TabViewMode::Welcome(ref welcome) = self.mode {
-            root = root.child(div().flex_1().min_h(px(0.0)).child(welcome.clone()));
+            root = root
+                .focusable()
+                .on_key_down(cx.listener(Self::on_key_down))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::on_focus_input))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(welcome.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(self.render_history_menu_container())
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .px(px(16.0))
+                                .pb(px(12.0))
+                                .child(self.render_input_bar(window, cx)),
+                        ),
+                )
+                .child(self.render_overlay(cx));
         } else if let TabViewMode::Agent(ref agent) = self.mode {
             root = root.child(div().flex_1().min_h(px(0.0)).child(agent.clone()));
         } else if let TabViewMode::Settings(ref settings) = self.mode {
@@ -7646,17 +7901,17 @@ impl EventEmitter<TabViewEvent> for TabView {}
 mod tests {
     use super::{
         AGENT_CONNECTING_PLACEHOLDER, AGENT_SENDING_PROMPT_PLACEHOLDER, AgentStreamOp, Block,
-        FilePreviewKind, FilePreviewState, HighlightSegment, InitialFocusTarget, MarkdownBlock,
-        MarkdownInlineSegment, ModelButtonState, PermissionDecision, PermissionRequest, PickerKind,
-        PickerQueryState, PreviewLanguage, PreviewSearchMatchSegment, TabView,
-        append_agent_stream_delta, append_output_batch_to_block, build_agent_picker_state,
-        build_model_picker_state, classify_agent_stream_op, clickable_cursor, compute_row_state,
-        compute_trigger_state, extract_compact_list_items, model_trigger_label,
-        parse_markdown_blocks, parse_markdown_inline, picker_has_search_input,
-        picker_header_is_static, picker_initial_focus_target, picker_typeahead_enabled,
-        renderable_output_window, replace_agent_stream_snapshot, streaming_snapshot_delta,
-        text_input_cursor, update_agent_placeholder_block, wrap_terminal_line,
-        wrap_terminal_text_lines,
+        CommitInputTarget, FilePreviewKind, FilePreviewState, HighlightSegment, InitialFocusTarget,
+        InputMode, InputVisualLine, MarkdownBlock, MarkdownInlineSegment, ModelButtonState,
+        PermissionDecision, PermissionRequest, PickerKind, PickerQueryState, PreviewLanguage,
+        PreviewSearchMatchSegment, TabView, append_agent_stream_delta,
+        append_output_batch_to_block, build_agent_picker_state, build_model_picker_state,
+        classify_agent_stream_op, clickable_cursor, compute_row_state, compute_trigger_state,
+        extract_compact_list_items, model_trigger_label, parse_markdown_blocks,
+        parse_markdown_inline, picker_has_search_input, picker_header_is_static,
+        picker_initial_focus_target, picker_typeahead_enabled, renderable_output_window,
+        replace_agent_stream_snapshot, streaming_snapshot_delta, text_input_cursor,
+        update_agent_placeholder_block, wrap_terminal_line, wrap_terminal_text_lines,
     };
     use crate::acp::manager::AgentSpec;
     use crate::acp::model_discovery::AcpModelOption;
@@ -7739,6 +7994,74 @@ mod tests {
             None
         );
         assert_eq!(TabView::normalize_initial_terminal_command(None), None);
+    }
+
+    #[test]
+    fn welcome_commit_uses_base_session_until_terminal_exists() {
+        assert_eq!(
+            TabView::commit_input_target_for_context(true, false, InputMode::Terminal),
+            CommitInputTarget::StartBaseTerminal
+        );
+        assert_eq!(
+            TabView::commit_input_target_for_context(true, false, InputMode::Agent),
+            CommitInputTarget::StartBaseAgent
+        );
+        assert_eq!(
+            TabView::commit_input_target_for_context(true, true, InputMode::Terminal),
+            CommitInputTarget::CurrentSession
+        );
+        assert_eq!(
+            TabView::commit_input_target_for_context(false, false, InputMode::Terminal),
+            CommitInputTarget::CurrentSession
+        );
+    }
+
+    #[test]
+    fn input_visual_lines_wrap_and_follow_cursor() {
+        let input = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+        assert_eq!(TabView::rendered_input_line_count(input, 10), 4);
+        assert_eq!(TabView::input_text_viewport_height(4), 86.0);
+        assert_eq!(
+            TabView::input_visual_lines(input, 18, 10, 3),
+            vec![
+                InputVisualLine {
+                    left: "abcdefghij".into(),
+                    right: String::new(),
+                    has_cursor: false,
+                },
+                InputVisualLine {
+                    left: "klmnopqr".into(),
+                    right: "st".into(),
+                    has_cursor: true,
+                },
+                InputVisualLine {
+                    left: "uvwxyz0123".into(),
+                    right: String::new(),
+                    has_cursor: false,
+                },
+            ]
+        );
+        assert_eq!(
+            TabView::input_visual_lines(input, 10, 10, 3),
+            vec![
+                InputVisualLine {
+                    left: "abcdefghij".into(),
+                    right: String::new(),
+                    has_cursor: false,
+                },
+                InputVisualLine {
+                    left: String::new(),
+                    right: "klmnopqrst".into(),
+                    has_cursor: true,
+                },
+                InputVisualLine {
+                    left: "uvwxyz0123".into(),
+                    right: String::new(),
+                    has_cursor: false,
+                },
+            ]
+        );
     }
 
     #[test]

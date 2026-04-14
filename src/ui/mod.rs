@@ -569,9 +569,19 @@ impl Workspace {
                     self.open_repository_in_tab(index, path.clone(), cx);
                 }
             }
-            views::tab_view::TabViewEvent::StartBaseTerminal { command } => {
+            views::tab_view::TabViewEvent::StartBaseTerminal { path, command } => {
                 if let Some(index) = self.tab_ids.iter().position(|id| *id == tab_id) {
-                    self.open_base_terminal_in_tab(index, None, Some(command.clone()), cx);
+                    self.open_base_terminal_in_tab(
+                        index,
+                        Some(path.clone()),
+                        Some(command.clone()),
+                        cx,
+                    );
+                }
+            }
+            views::tab_view::TabViewEvent::StartBaseAgent { path, prompt } => {
+                if let Some(index) = self.tab_ids.iter().position(|id| *id == tab_id) {
+                    self.open_base_agent_in_tab(index, path.clone(), prompt.clone(), cx);
                 }
             }
             views::tab_view::TabViewEvent::CreateProject { prompt, parent } => {
@@ -608,6 +618,43 @@ impl Workspace {
                     Some(cwd.clone()),
                     initial_command.clone(),
                 );
+            });
+        }
+
+        if let Some(slot) = self.tab_paths.get_mut(index) {
+            *slot = cwd;
+        }
+        if let Some(kind) = self.tab_kinds.get_mut(index) {
+            *kind = TabKind::BaseTerminal;
+        }
+        self.active_tab = index;
+        self.sidebar_visible = false;
+
+        let _ = self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.rename_tab(index, tab_name, tab_path, cx);
+            tab_bar.set_sidebar_visible(self.sidebar_visible, cx);
+            tab_bar.set_active(index, cx);
+        });
+        self.sync_sidebar_root(cx);
+        cx.notify();
+    }
+
+    fn open_base_agent_in_tab(
+        &mut self,
+        index: usize,
+        cwd: PathBuf,
+        initial_prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_name = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Terminal".to_string());
+        let tab_path = cwd.to_string_lossy().to_string();
+
+        if let Some(tab) = self.tabs.get(index) {
+            let _ = tab.update(cx, |view, cx| {
+                view.start_agent_prompt_with_path(cx, Some(cwd.clone()), initial_prompt.clone());
             });
         }
 
